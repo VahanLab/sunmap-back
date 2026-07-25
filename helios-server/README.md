@@ -150,8 +150,45 @@ Notes :
   polygone, potentiellement mi-ombre/mi-soleil. Prochaine étape :
   échantillonner 3-5 points dans un buffer côté rue et renvoyer un
   pourcentage d'ensoleillement.
-- Même limite que `/sunlit` : bâtiments approximés en rectangle (bbox de
-  l'empreinte), pas leur polygone réel.
+- Un POI dont les coordonnées OSM tombent à l'intérieur d'un bâtiment
+  (défaut de saisie fréquent) peut ressortir « à l'ombre toute la journée » —
+  piégé sous son propre toit stampé. L'altitude de l'observateur est bien
+  prise sur le relief seul (pas de faux `sunlit: true`), mais le test
+  d'obstruction utilise encore la DSM avec bâtiments y compris le sien.
+
+### `GET /sun-hours`
+
+Un point, une journée : les heures au soleil et à l'ombre. Pensé pour
+l'appui long sur la carte côté app — statut immédiat + timeline complète.
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `lat`, `lng` | f64 | oui | Coordonnées du point |
+| `t` | string | non | N'importe quel instant DANS la journée voulue (RFC3339 ou secondes Unix). La journée = jour calendaire **UTC** contenant `t`. Défaut : maintenant |
+| `observer_height` | f64 | non | Défaut **1.5** (terrasse/personne assise) |
+
+```bash
+curl "http://localhost:8080/sun-hours?lat=48.8566&lng=2.3522&t=2026-07-25T17:00:00Z"
+```
+
+Réponse `200` :
+
+```json
+{
+  "lat": 48.8566, "lng": 2.3522, "elevation_m": 34.9,
+  "t_unix": 1784998800.0, "sunlit_now": true,
+  "day_start_unix": 1784937600.0, "day_end_unix": 1785024000.0,
+  "total_sunlit_minutes": 355, "total_shadow_minutes": 1085,
+  "intervals": [
+    {"start_unix": 1784937600.0, "end_unix": 1784980500.0, "sunlit": false},
+    {"start_unix": 1784980500.0, "end_unix": 1785001500.0, "sunlit": true}
+  ]
+}
+```
+
+`intervals` : segments contigus (échantillonnage toutes les 5 min, regroupé),
+`start_unix`/`end_unix` en secondes Unix UTC — le client formate en heure
+locale. Même limites que `/sunlit` (relief + bâtiments, cf. ci-dessus).
 
 ### Erreurs
 
