@@ -630,7 +630,11 @@ async fn overpass_buildings(
     n: f64,
     e: f64,
 ) -> Result<Arc<Vec<Building>>, (StatusCode, String)> {
-    let key = format!("{s:.4},{w:.4},{n:.4},{e:.4}");
+    // DEBUG : même principe que overpass_terraces — clé fixe, un seul fetch
+    // pour toute la durée de vie du process. Seul le calcul soleil/ombre
+    // (dépendant de `t`) doit varier entre requêtes ; la géométrie
+    // (bâtiments, relief) est figée sur la zone du premier appel.
+    let key = "DEBUG_ALL".to_string();
     if let Some(hit) = state.buildings.read().await.get(&key) {
         return Ok(hit.clone());
     }
