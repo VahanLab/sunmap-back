@@ -555,7 +555,13 @@ async fn overpass_terraces(
     n: f64,
     e: f64,
 ) -> Result<Arc<Vec<OverpassPoi>>, (StatusCode, String)> {
-    let key = format!("{s:.4},{w:.4},{n:.4},{e:.4}");
+    // DEBUG : clé fixe, un seul fetch Overpass pour toute la durée de vie du
+    // process, peu importe la bbox demandée — évite de re-solliciter
+    // Overpass à chaque test iOS sur la même zone. Le premier appel fait
+    // foi pour la zone couverte ; à retirer avant tout usage au-delà du dev
+    // local (des points hors de cette zone n'auront jamais leurs propres
+    // terrasses tant que le process tourne).
+    let key = "DEBUG_ALL".to_string();
     if let Some(hit) = state.pois.read().await.get(&key) {
         return Ok(hit.clone());
     }
