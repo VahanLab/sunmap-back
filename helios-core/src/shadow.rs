@@ -44,6 +44,27 @@ pub fn is_shadowed(dsm: &Dsm, sun: &SunPosition, px: f64, py: f64, params: &Shad
     let Some(ground) = dsm.sample(px, py) else {
         return false;
     };
+    is_shadowed_from_ground(dsm, sun, px, py, ground, params)
+}
+
+/// Variante de [`is_shadowed`] avec une altitude de sol fournie explicitement
+/// plutôt qu'échantillonnée dans `dsm`. Utile quand la DSM d'obstacles
+/// (relief + bâtiments) ne doit pas servir à définir la position de
+/// l'observateur lui-même — cas d'un POI dont les coordonnées tombent par
+/// erreur à l'intérieur d'un bâtiment dans la donnée source (OSM) : sans
+/// cette séparation, le point hérite à tort de l'altitude du toit et
+/// « voit par-dessus » des obstacles qui devraient le masquer.
+pub fn is_shadowed_from_ground(
+    dsm: &Dsm,
+    sun: &SunPosition,
+    px: f64,
+    py: f64,
+    ground: f32,
+    params: &ShadowParams,
+) -> bool {
+    if !sun.is_up() {
+        return true;
+    }
     let z0 = ground as f64 + params.observer_height_m;
 
     let rad = std::f64::consts::PI / 180.0;

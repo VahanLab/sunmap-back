@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use helios_core::dsm::Dsm;
-use helios_core::shadow::{is_shadowed, ShadowParams};
+use helios_core::shadow::{is_shadowed_from_ground, ShadowParams};
 use helios_core::sun::sun_position;
 
 const TILE_SIZE: usize = 512;
@@ -305,18 +305,23 @@ async fn classify(
         lat,
     )
     .await?;
-    add_buildings(state, &mut dsm, origin_x, origin_y).await?;
 
     let px = wx - origin_x;
     let py = wy - origin_y;
+    // Sol de l'observateur pris sur le relief SEUL, avant stamping des
+    // bâtiments : un POI dont les coordonnées OSM tombent par erreur à
+    // l'intérieur d'un immeuble ne doit pas hériter de l'altitude du toit
+    // (cf. is_shadowed_from_ground). Les bâtiments restent pris en compte
+    // comme obstacles pour les VOISINS via la DSM stampée ci-dessous.
     let elevation_m = dsm.sample(px, py).unwrap_or(0.0);
+    add_buildings(state, &mut dsm, origin_x, origin_y).await?;
 
     let params = ShadowParams {
         max_distance_m: 5_000.0, // relief : ombres longues possibles
         observer_height_m,
         step_px: 1.0,
     };
-    let shadowed = is_shadowed(&dsm, &sun, px, py, &params);
+    let shadowed = is_shadowed_from_ground(&dsm, &sun, px, py, elevation_m, &params);
 
     Ok(SunlitResponse {
         sunlit: !shadowed,
@@ -468,6 +473,10 @@ async fn terraces(
 
     let pois = overpass_terraces(&state, s, w, n, e).await?;
     let (mut dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
+    // Relief seul, avant stamping des bâtiments : sert de sol pour chaque
+    // terrasse (cf. commentaire dans classify() — un POI mal placé dans un
+    // bâtiment côté OSM ne doit pas hériter de l'altitude du toit).
+    let terrain_only = dsm.clone();
     add_buildings(&state, &mut dsm, origin_x, origin_y).await?;
 
     let mid_lat = (s + n) / 2.0;
@@ -485,14 +494,15 @@ async fn terraces(
             let (wx, wy) = world_px(p.lat, p.lng);
             let px = wx - origin_x;
             let py = wy - origin_y;
+            let ground = terrain_only.sample(px, py).unwrap_or(0.0);
             Terrace {
                 id: p.id.clone(),
                 name: p.name.clone(),
                 amenity: p.amenity.clone(),
                 lat: p.lat,
                 lng: p.lng,
-                sunlit: sun.is_up() && !is_shadowed(&dsm, &sun, px, py, &params),
-                elevation_m: dsm.sample(px, py).unwrap_or(0.0),
+                sunlit: sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, ground, &params),
+                elevation_m: ground,
                 website: p.website.clone(),
                 phone: p.phone.clone(),
                 opening_hours: p.opening_hours.clone(),
