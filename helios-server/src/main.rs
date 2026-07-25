@@ -193,6 +193,108 @@ async fn assemble_grid(
     ))
 }
 
+/// Un point est-il à l'intérieur d'un bâtiment ? (règle pair-impair,
+/// standard). Sert à détecter les POI dont les coordonnées OSM tombent par
+/// erreur à l'intérieur d'un immeuble — cf. `terraces()`/`assemble_point()`.
+fn point_in_building(b: &Building, lat: f64, lon: f64) -> bool {
+    let mut inside = false;
+    let n = b.ring.len();
+    if n < 3 {
+        return false;
+    }
+    let mut j = n - 1;
+    for i in 0..n {
+        let (yi, xi) = b.ring[i];
+        let (yj, xj) = b.ring[j];
+        if (yi > lat) != (yj > lat) && lon < (xj - xi) * (lat - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Indices de pixels (flat, row-major) couverts par l'emprise d'un
+/// bâtiment — même rasterisation scanline (pair-impair) que
+/// `stamp_buildings`, factorisée pour être réutilisée à l'envers (retirer
+/// temporairement un bâtiment précis de la DSM, cf. `terraces()`).
+fn building_pixel_indices(dsm: &Dsm, origin_x: f64, origin_y: f64, b: &Building) -> Vec<usize> {
+    let mut out = Vec::new();
+    if b.ring.len() < 3 {
+        return out;
+    }
+    let pixels: Vec<(f64, f64)> = b
+        .ring
+        .iter()
+        .map(|&(lat, lon)| {
+            let (wx, wy) = world_px(lat, lon);
+            (wx - origin_x, wy - origin_y)
+        })
+        .collect();
+
+    let min_y = pixels.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+    let max_y = pixels.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+    let min_x = pixels.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+    let max_x = pixels.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+    if max_x < 0.0 || max_y < 0.0 || min_x >= dsm.width as f64 || min_y >= dsm.height as f64 {
+        return out; // entièrement hors grille
+    }
+
+    let y0 = min_y.max(0.0).floor() as usize;
+    let y1 = (max_y.min(dsm.height as f64 - 1.0).ceil() as usize).min(dsm.height - 1);
+    for y in y0..=y1 {
+        let scan_y = y as f64 + 0.5;
+        let mut xs: Vec<f64> = Vec::new();
+        for i in 0..pixels.len() {
+            let (x1, y1p) = pixels[i];
+            let (x2, y2p) = pixels[(i + 1) % pixels.len()];
+            if (y1p <= scan_y && y2p > scan_y) || (y2p <= scan_y && y1p > scan_y) {
+                let t = (scan_y - y1p) / (y2p - y1p);
+                xs.push(x1 + t * (x2 - x1));
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let mut i = 0;
+        while i + 1 < xs.len() {
+            let x_start = xs[i].round().max(0.0) as usize;
+            let x_end = xs[i + 1].round().min(dsm.width as f64 - 1.0);
+            if x_end >= 0.0 && x_end as usize >= x_start {
+                for x in x_start..=(x_end as usize).min(dsm.width - 1) {
+                    out.push(y * dsm.width + x);
+                }
+            }
+            i += 2;
+        }
+    }
+    out
+}
+
+/// Rasterise un bâtiment dans la DSM (scanline pair-impair) : sol de
+/// référence pris au centre de son emprise, hauteur stampée en gardant le
+/// max (un bâtiment ne fait jamais redescendre une DSM déjà plus haute).
+fn stamp_one_building(dsm: &mut Dsm, origin_x: f64, origin_y: f64, b: &Building) {
+    let idxs = building_pixel_indices(dsm, origin_x, origin_y, b);
+    if idxs.is_empty() {
+        return;
+    }
+    // Sol de référence : centre du polygone — un bâtiment n'a généralement
+    // pas de dénivelé notable sous son emprise.
+    let (sum_x, sum_y) = b.ring.iter().fold((0.0, 0.0), |(sx, sy), &(lat, lon)| {
+        let (wx, wy) = world_px(lat, lon);
+        (sx + wx - origin_x, sy + wy - origin_y)
+    });
+    let n = b.ring.len() as f64;
+    let cx = (sum_x / n).clamp(0.0, dsm.width as f64 - 1.0);
+    let cy = (sum_y / n).clamp(0.0, dsm.height as f64 - 1.0);
+    let target = dsm.sample(cx, cy).unwrap_or(0.0) + b.height_m;
+    for idx in idxs {
+        if dsm.data[idx] < target {
+            dsm.data[idx] = target;
+        }
+    }
+}
+
 /// Rasterise les bâtiments dans la DSM par vraie rasterisation polygone
 /// (scanline, règle pair-impair). L'approximation bbox-rectangle testée
 /// initialement s'est révélée fausser des points hors du bâtiment : un
@@ -200,81 +302,45 @@ async fn assemble_grid(
 /// sur le trottoir voisin, stampant à tort des terrasses qui n'y sont pas
 /// (observé : terrasse à +20 m d'altitude alors qu'elle est au niveau rue,
 /// simplement parce que son point tombait dans la bbox d'un immeuble en L).
-fn stamp_buildings(dsm: &mut Dsm, origin_x: f64, origin_y: f64, buildings: &[Building]) {
+///
+/// `exclude` : bâtiment à ne PAS stamper (typiquement celui qui contient le
+/// point interrogé lui-même — cf. `assemble_point`).
+fn stamp_buildings(dsm: &mut Dsm, origin_x: f64, origin_y: f64, buildings: &[Building], exclude: Option<&Building>) {
     for b in buildings {
-        if b.ring.len() < 3 {
-            continue;
-        }
-        let pixels: Vec<(f64, f64)> = b
-            .ring
-            .iter()
-            .map(|&(lat, lon)| {
-                let (wx, wy) = world_px(lat, lon);
-                (wx - origin_x, wy - origin_y)
-            })
-            .collect();
-
-        let min_y = pixels.iter().map(|p| p.1).fold(f64::MAX, f64::min);
-        let max_y = pixels.iter().map(|p| p.1).fold(f64::MIN, f64::max);
-        let min_x = pixels.iter().map(|p| p.0).fold(f64::MAX, f64::min);
-        let max_x = pixels.iter().map(|p| p.0).fold(f64::MIN, f64::max);
-        if max_x < 0.0 || max_y < 0.0 || min_x >= dsm.width as f64 || min_y >= dsm.height as f64 {
-            continue; // entièrement hors grille
-        }
-
-        // Sol de référence : centre du polygone (bbox center, approximation
-        // suffisante pour l'altitude de départ — un bâtiment n'a
-        // généralement pas de dénivelé notable sous son emprise).
-        let cx = ((min_x + max_x) / 2.0).clamp(0.0, dsm.width as f64 - 1.0);
-        let cy = ((min_y + max_y) / 2.0).clamp(0.0, dsm.height as f64 - 1.0);
-        let target = dsm.sample(cx, cy).unwrap_or(0.0) + b.height_m;
-
-        let y0 = min_y.max(0.0).floor() as usize;
-        let y1 = max_y.min(dsm.height as f64 - 1.0).ceil() as usize;
-        for y in y0..=y1.min(dsm.height - 1) {
-            let scan_y = y as f64 + 0.5;
-            let mut xs: Vec<f64> = Vec::new();
-            for i in 0..pixels.len() {
-                let (x1, y1p) = pixels[i];
-                let (x2, y2p) = pixels[(i + 1) % pixels.len()];
-                if (y1p <= scan_y && y2p > scan_y) || (y2p <= scan_y && y1p > scan_y) {
-                    let t = (scan_y - y1p) / (y2p - y1p);
-                    xs.push(x1 + t * (x2 - x1));
-                }
-            }
-            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-            let mut i = 0;
-            while i + 1 < xs.len() {
-                let x_start = xs[i].round().max(0.0) as usize;
-                let x_end = xs[i + 1].round().min(dsm.width as f64 - 1.0);
-                if x_end >= 0.0 && x_end as usize >= x_start {
-                    for x in x_start..=(x_end as usize).min(dsm.width - 1) {
-                        let idx = y * dsm.width + x;
-                        if dsm.data[idx] < target {
-                            dsm.data[idx] = target;
-                        }
-                    }
-                }
-                i += 2;
+        if let Some(ex) = exclude {
+            if std::ptr::eq(b, ex) {
+                continue;
             }
         }
+        stamp_one_building(dsm, origin_x, origin_y, b);
     }
 }
 
 /// Récupère les bâtiments couvrant l'emprise de la DSM et les rasterise
 /// dedans. Bounds calculées depuis l'origine + la taille de la grille
 /// (même étendue que les tuiles Mapterhorn assemblées).
+///
+/// `exclude_point` : si fourni, le bâtiment contenant ce point (lat, lon)
+/// n'est pas stampé — évite qu'un POI dont les coordonnées OSM tombent par
+/// erreur à l'intérieur d'un immeuble hérite d'un obstacle qui est en
+/// réalité SON PROPRE bâtiment (observé : "toujours à l'ombre" à midi car le
+/// rayon reste piégé sous son propre toit, ou au contraire faussement
+/// "au soleil" au soleil rasant car le rayon ressort du polygone avant
+/// d'avoir grimpé assez haut pour être bloqué).
 async fn add_buildings(
     state: &AppState,
     dsm: &mut Dsm,
     origin_x: f64,
     origin_y: f64,
+    exclude_point: Option<(f64, f64)>,
 ) -> Result<(), (StatusCode, String)> {
     let (north, west) = latlon_of_world_px(origin_x, origin_y);
     let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
     let buildings = overpass_buildings(state, south, west, north, east).await?;
-    stamp_buildings(dsm, origin_x, origin_y, &buildings);
+    let exclude = exclude_point.and_then(|(lat, lon)| {
+        buildings.iter().find(|b| point_in_building(b, lat, lon))
+    });
+    stamp_buildings(dsm, origin_x, origin_y, &buildings, exclude);
     Ok(())
 }
 
@@ -311,7 +377,7 @@ async fn assemble_point(
     let px = wx - origin_x;
     let py = wy - origin_y;
     let ground = dsm.sample(px, py).unwrap_or(0.0);
-    add_buildings(state, &mut dsm, origin_x, origin_y).await?;
+    add_buildings(state, &mut dsm, origin_x, origin_y, Some((lat, lng))).await?;
 
     Ok((dsm, px, py, ground))
 }
@@ -595,7 +661,10 @@ async fn terraces(
     // terrasse (cf. commentaire dans classify() — un POI mal placé dans un
     // bâtiment côté OSM ne doit pas hériter de l'altitude du toit).
     let terrain_only = dsm.clone();
-    add_buildings(&state, &mut dsm, origin_x, origin_y).await?;
+    let (north, west) = latlon_of_world_px(origin_x, origin_y);
+    let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
+    let buildings = overpass_buildings(&state, south, west, north, east).await?;
+    stamp_buildings(&mut dsm, origin_x, origin_y, &buildings, None);
 
     let mid_lat = (s + n) / 2.0;
     let mid_lng = (w + e) / 2.0;
@@ -606,29 +675,51 @@ async fn terraces(
         step_px: 1.0,
     };
 
-    let terraces: Vec<Terrace> = pois
-        .iter()
-        .map(|p| {
-            let (wx, wy) = world_px(p.lat, p.lng);
-            let px = wx - origin_x;
-            let py = wy - origin_y;
-            let ground = terrain_only.sample(px, py).unwrap_or(0.0);
-            Terrace {
-                id: p.id.clone(),
-                name: p.name.clone(),
-                amenity: p.amenity.clone(),
-                lat: p.lat,
-                lng: p.lng,
-                sunlit: sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, ground, &params),
-                elevation_m: ground,
-                website: p.website.clone(),
-                phone: p.phone.clone(),
-                opening_hours: p.opening_hours.clone(),
-                cuisine: p.cuisine.clone(),
-                wikidata: p.wikidata.clone(),
+    let mut terraces: Vec<Terrace> = Vec::with_capacity(pois.len());
+    for p in pois.iter() {
+        let (wx, wy) = world_px(p.lat, p.lng);
+        let px = wx - origin_x;
+        let py = wy - origin_y;
+        let ground = terrain_only.sample(px, py).unwrap_or(0.0);
+
+        // Si ce POI est lui-même à l'intérieur d'un bâtiment (défaut de
+        // placement OSM fréquent), retire temporairement CE bâtiment précis
+        // de la DSM pour son propre test d'obstacle — sinon le rayon reste
+        // piégé sous son propre toit (toujours "ombre") ou au contraire en
+        // ressort avant d'avoir grimpé assez haut au soleil rasant (faux
+        // "soleil"). Restauré juste après pour les POI suivants, pour qui ce
+        // même bâtiment reste un obstacle légitime.
+        let containing = buildings.iter().find(|b| point_in_building(b, p.lat, p.lng));
+        let sunlit = if let Some(b) = containing {
+            let idxs = building_pixel_indices(&dsm, origin_x, origin_y, b);
+            let saved: Vec<f32> = idxs.iter().map(|&i| dsm.data[i]).collect();
+            for &i in &idxs {
+                dsm.data[i] = terrain_only.data[i];
             }
-        })
-        .collect();
+            let result = sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, ground, &params);
+            for (k, &i) in idxs.iter().enumerate() {
+                dsm.data[i] = saved[k];
+            }
+            result
+        } else {
+            sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, ground, &params)
+        };
+
+        terraces.push(Terrace {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            amenity: p.amenity.clone(),
+            lat: p.lat,
+            lng: p.lng,
+            sunlit,
+            elevation_m: ground,
+            website: p.website.clone(),
+            phone: p.phone.clone(),
+            opening_hours: p.opening_hours.clone(),
+            cuisine: p.cuisine.clone(),
+            wikidata: p.wikidata.clone(),
+        });
+    }
 
     Ok(Json(TerracesResponse {
         t_unix: t,
