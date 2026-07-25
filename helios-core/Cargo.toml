@@ -1,0 +1,18 @@
+[package]
+name = "helios-core"
+version = "0.1.0"
+edition = "2021"
+description = "Moteur soleil/ombre : position solaire NOAA, DSM (terrain + bâtiments), ray marching."
+
+# Volontairement zéro dépendance pour le cœur : portable serveur (axum/actix),
+# mobile (UniFFI) et WASM sans friction. À ajouter quand on branchera le service :
+#
+# [dependencies]
+# rayon = "1"        # parallélisation du rendu de tuiles (par lignes)
+# image = "0.25"     # décodage PNG des tuiles Terrarium + encodage des masques
+# tokio = { version = "1", features = ["full"] }
+# axum = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1

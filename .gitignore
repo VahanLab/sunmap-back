@@ -1,0 +1,8 @@
+# Rust
+target/
+
+# macOS
+.DS_Store
+
+# App iOS : repo séparé (sunmap-ios)
+ios/
