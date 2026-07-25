@@ -1,8 +1,8 @@
 # helios-server — API de query ensoleillement
 
 Serveur axum répondant à la question : **« ce point GPS est-il au soleil à
-l'instant t ? »** en tenant compte du relief (ray marching sur DSM, moteur
-`helios-core`).
+l'instant t ? »** en tenant compte du relief **et des bâtiments** (ray
+marching sur DSM, moteur `helios-core`).
 
 ## Lancer
 
@@ -16,6 +16,7 @@ cargo run -p helios-server --release  # prod
 | Capacité | Détail |
 |---|---|
 | Relief | Tuiles DEM Mapterhorn z15 (~2,4 m/px à 45° lat), webp 512 px, encodage Terrarium |
+| Bâtiments | Overpass `building=*`, rasterisés en emprise **rectangulaire** (bbox de l'empreinte, pas le polygone réel — cf. limites) dans la même DSM que le relief. Hauteur : tag `height`, sinon `building:levels × 3 m`, sinon 9 m par défaut |
 | Marge de casters | Assemblage 3×3 tuiles autour du point → les ombres portées venant jusqu'à ~1,2 km hors de la tuile centrale sont prises en compte |
 | Distance de recherche | 5 km max le long du rayon (borne recoupée avec l'altitude max de la grille — early exit) |
 | Hauteur d'observateur | Paramètre `observer_height` (m) : 0 = sol, 1.5 ≈ personne attablée (cas « tête au soleil, pieds à l'ombre ») |
@@ -24,9 +25,16 @@ cargo run -p helios-server --release  # prod
 | Couverture | Monde (bounds Mapterhorn ±85°) |
 
 **Limites actuelles :**
-- **Bâtiments et arbres non inclus** : DSM = relief seul. Un point en ville à
-  l'ombre d'un immeuble sera renvoyé `sunlit: true` si le terrain ne le masque
-  pas. (Roadmap : stamping des emprises bâtiments dans la DSM.)
+- **Bâtiments approximés en rectangle** : chaque bâtiment est rasterisé sur
+  la bbox de son empreinte, pas son polygone réel — sous-estime les coins
+  d'un bâtiment en L ou aux formes très irrégulières (l'ombre portée déborde
+  légèrement moins ou plus que la réalité selon la forme). Prochaine étape :
+  vraie rasterisation polygone (scanline).
+- **Arbres non inclus** : canopée absente de la DSM (backlog, cf. CLAUDE.md
+  racine — atténuation saisonnière, Meta/WRI CHM).
+- Deux requêtes Overpass par appel (POI + bâtiments) : latence à froid plus
+  élevée qu'avant (cache par bbox partagé, donc amorti sur les requêtes
+  suivantes).
 - Ombres venant de plus de ~1,2 km hors tuile centrale ignorées (soleil très
   rasant en haute montagne : rare mais possible).
 - Cache RAM non borné, pas de persistance (redémarrage = cache vide).
@@ -142,8 +150,8 @@ Notes :
   polygone, potentiellement mi-ombre/mi-soleil. Prochaine étape :
   échantillonner 3-5 points dans un buffer côté rue et renvoyer un
   pourcentage d'ensoleillement.
-- Même limite que `/sunlit` : relief seul, ombres de bâtiments non prises en
-  compte (en ville dense, surestime le soleil).
+- Même limite que `/sunlit` : bâtiments approximés en rectangle (bbox de
+  l'empreinte), pas leur polygone réel.
 
 ### Erreurs
 

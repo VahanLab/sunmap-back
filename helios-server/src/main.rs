@@ -31,11 +31,18 @@ const TILE_URL: &str = "https://tiles.mapterhorn.com";
 
 type TileCache = RwLock<HashMap<(u32, u32, u32), Arc<Vec<f32>>>>;
 type PoiCache = RwLock<HashMap<String, Arc<Vec<OverpassPoi>>>>;
+type BuildingCache = RwLock<HashMap<String, Arc<Vec<Building>>>>;
+
+/// Hauteur par défaut quand ni `height` ni `building:levels` ne sont taggés
+/// sur OSM (fréquent) — ~3 étages, prudent en zone dense plutôt que de sous-
+/// estimer les ombres portées.
+const DEFAULT_BUILDING_HEIGHT_M: f32 = 9.0;
 
 struct AppState {
     http: reqwest::Client,
     tiles: TileCache,
     pois: PoiCache,
+    buildings: BuildingCache,
 }
 
 #[tokio::main]
@@ -49,6 +56,7 @@ async fn main() {
             .expect("client HTTP"),
         tiles: RwLock::new(HashMap::new()),
         pois: RwLock::new(HashMap::new()),
+        buildings: RwLock::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -129,6 +137,17 @@ fn world_px(lat: f64, lng: f64) -> (f64, f64) {
     (wx, wy)
 }
 
+/// Inverse de `world_px` : pixel monde → coordonnée géographique.
+fn latlon_of_world_px(wx: f64, wy: f64) -> (f64, f64) {
+    let n = (TILE_SIZE as f64) * f64::powi(2.0, ZOOM as i32);
+    let lon = wx / n * 360.0 - 180.0;
+    let lat = (std::f64::consts::PI * (1.0 - 2.0 * wy / n))
+        .sinh()
+        .atan()
+        .to_degrees();
+    (lat, lon)
+}
+
 /// Assemble une DSM couvrant l'intervalle de tuiles `[x0..=x1] × [y0..=y1]`.
 /// Renvoie la grille + l'origine (coin nord-ouest) en pixels monde.
 async fn assemble_grid(
@@ -173,6 +192,52 @@ async fn assemble_grid(
     ))
 }
 
+/// Rasterise les bâtiments dans la DSM (piste "quick win" : emprise
+/// rectangulaire par bâtiment, pas la vraie polygone/scanline — cf.
+/// `Dsm::stamp_max`). Suffisant pour capter l'essentiel des ombres portées
+/// par les immeubles ; sous-estime un peu les bâtiments non rectangulaires
+/// (coins arrondis, formes en L) qui débordent légèrement leur bbox réelle.
+fn stamp_buildings(dsm: &mut Dsm, origin_x: f64, origin_y: f64, buildings: &[Building]) {
+    for b in buildings {
+        let (wx0, wy0) = world_px(b.max_lat, b.min_lon); // coin nord-ouest
+        let (wx1, wy1) = world_px(b.min_lat, b.max_lon); // coin sud-est
+        let x0f = wx0 - origin_x;
+        let y0f = wy0 - origin_y;
+        let x1f = wx1 - origin_x;
+        let y1f = wy1 - origin_y;
+        if x1f < 0.0 || y1f < 0.0 || x0f >= dsm.width as f64 || y0f >= dsm.height as f64 {
+            continue; // entièrement hors grille
+        }
+        let x0 = x0f.max(0.0) as usize;
+        let y0 = y0f.max(0.0) as usize;
+        let x1 = (x1f.max(0.0) as usize).min(dsm.width - 1);
+        let y1 = (y1f.max(0.0) as usize).min(dsm.height - 1);
+        if x1 < x0 || y1 < y0 {
+            continue;
+        }
+        let ground = dsm
+            .sample(((x0 + x1) / 2) as f64, ((y0 + y1) / 2) as f64)
+            .unwrap_or(0.0);
+        dsm.stamp_max(x0, y0, x1, y1, ground + b.height_m);
+    }
+}
+
+/// Récupère les bâtiments couvrant l'emprise de la DSM et les rasterise
+/// dedans. Bounds calculées depuis l'origine + la taille de la grille
+/// (même étendue que les tuiles Mapterhorn assemblées).
+async fn add_buildings(
+    state: &AppState,
+    dsm: &mut Dsm,
+    origin_x: f64,
+    origin_y: f64,
+) -> Result<(), (StatusCode, String)> {
+    let (north, west) = latlon_of_world_px(origin_x, origin_y);
+    let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
+    let buildings = overpass_buildings(state, south, west, north, east).await?;
+    stamp_buildings(dsm, origin_x, origin_y, &buildings);
+    Ok(())
+}
+
 /// Assemble la DSM 3×3 tuiles autour du point et interroge helios-core.
 async fn classify(
     state: &AppState,
@@ -192,7 +257,7 @@ async fn classify(
     let tx = (wx / TILE_SIZE as f64) as u32;
     let ty = (wy / TILE_SIZE as f64) as u32;
     let max_tile = (1u32 << ZOOM) - 1;
-    let (dsm, origin_x, origin_y) = assemble_grid(
+    let (mut dsm, origin_x, origin_y) = assemble_grid(
         state,
         tx.saturating_sub(1),
         ty.saturating_sub(1),
@@ -201,6 +266,7 @@ async fn classify(
         lat,
     )
     .await?;
+    add_buildings(state, &mut dsm, origin_x, origin_y).await?;
 
     let px = wx - origin_x;
     let py = wy - origin_y;
@@ -292,6 +358,15 @@ struct Terrace {
     lng: f64,
     sunlit: bool,
     elevation_m: f32,
+    /// Champs OSM optionnels — couverture très inégale selon les POI.
+    website: Option<String>,
+    phone: Option<String>,
+    opening_hours: Option<String>,
+    cuisine: Option<String>,
+    /// Identifiant Wikidata (ex. "Q123456") : présent sur ~15% des POI,
+    /// utilisable côté client pour aller chercher une photo (propriété P18)
+    /// via l'API Wikidata/Commons — OSM ne stocke pas de photos lui-même.
+    wikidata: Option<String>,
 }
 
 /// POI brut issu d'Overpass (centroïde pour les ways/relations).
@@ -302,6 +377,11 @@ struct OverpassPoi {
     amenity: Option<String>,
     lat: f64,
     lng: f64,
+    website: Option<String>,
+    phone: Option<String>,
+    opening_hours: Option<String>,
+    cuisine: Option<String>,
+    wikidata: Option<String>,
 }
 
 /// Bars/restaurants/cafés avec terrasse dans la bbox, classés soleil/ombre.
@@ -348,7 +428,8 @@ async fn terraces(
     }
 
     let pois = overpass_terraces(&state, s, w, n, e).await?;
-    let (dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
+    let (mut dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
+    add_buildings(&state, &mut dsm, origin_x, origin_y).await?;
 
     let mid_lat = (s + n) / 2.0;
     let mid_lng = (w + e) / 2.0;
@@ -373,6 +454,11 @@ async fn terraces(
                 lng: p.lng,
                 sunlit: sun.is_up() && !is_shadowed(&dsm, &sun, px, py, &params),
                 elevation_m: dsm.sample(px, py).unwrap_or(0.0),
+                website: p.website.clone(),
+                phone: p.phone.clone(),
+                opening_hours: p.opening_hours.clone(),
+                cuisine: p.cuisine.clone(),
+                wikidata: p.wikidata.clone(),
             }
         })
         .collect();
@@ -394,6 +480,32 @@ const OVERPASS_MIRRORS: &[&str] = &[
     "https://overpass.private.coffee/api/interpreter",
 ];
 
+/// Requête Overpass générique : essaie chaque miroir dans l'ordre, renvoie
+/// le premier succès. Partagé par POI terrasses et emprises bâtiments.
+async fn overpass_query<T: serde::de::DeserializeOwned>(
+    state: &AppState,
+    query: &str,
+) -> Result<T, (StatusCode, String)> {
+    let mut last_err = String::new();
+    for mirror in OVERPASS_MIRRORS {
+        match state
+            .http
+            .post(*mirror)
+            .form(&[("data", query)])
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json::<T>().await {
+                Ok(parsed) => return Ok(parsed),
+                Err(e) => last_err = format!("{mirror} (JSON) : {e}"),
+            },
+            Err(e) => last_err = format!("{mirror} : {e}"),
+        }
+    }
+    Err((StatusCode::BAD_GATEWAY, format!("Overpass : {last_err}")))
+}
+
 /// Fetch Overpass des POI terrasse (cache mémoire par bbox arrondie —
 /// les POI bougent rarement, l'API publique est lente/instable : on
 /// essaie plusieurs miroirs avant d'abandonner).
@@ -414,29 +526,7 @@ async fn overpass_terraces(
 nwr["amenity"~"^(bar|restaurant|cafe)$"]["outdoor_seating"="yes"]({s},{w},{n},{e});
 out center 500;"#
     );
-
-    let mut last_err = String::new();
-    let mut raw: Option<OverpassResponse> = None;
-    for mirror in OVERPASS_MIRRORS {
-        match state
-            .http
-            .post(*mirror)
-            .form(&[("data", query.as_str())])
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            Ok(resp) => match resp.json::<OverpassResponse>().await {
-                Ok(parsed) => {
-                    raw = Some(parsed);
-                    break;
-                }
-                Err(e) => last_err = format!("{mirror} (JSON) : {e}"),
-            },
-            Err(e) => last_err = format!("{mirror} : {e}"),
-        }
-    }
-    let raw = raw.ok_or((StatusCode::BAD_GATEWAY, format!("Overpass : {last_err}")))?;
+    let raw: OverpassResponse = overpass_query(state, &query).await?;
 
     let pois: Vec<OverpassPoi> = raw
         .elements
@@ -448,12 +538,26 @@ out center 500;"#
                 _ => return None,
             };
             let tags = el.tags.unwrap_or_default();
+            // Website/téléphone : "contact:*" en repli si le tag simple est absent.
+            let website = tags
+                .get("website")
+                .or_else(|| tags.get("contact:website"))
+                .cloned();
+            let phone = tags
+                .get("phone")
+                .or_else(|| tags.get("contact:phone"))
+                .cloned();
             Some(OverpassPoi {
                 id: format!("{}/{}", el.element_type, el.id),
                 name: tags.get("name").cloned(),
                 amenity: tags.get("amenity").cloned(),
                 lat,
                 lng,
+                website,
+                phone,
+                opening_hours: tags.get("opening_hours").cloned(),
+                cuisine: tags.get("cuisine").cloned(),
+                wikidata: tags.get("wikidata").cloned(),
             })
         })
         .collect();
@@ -461,6 +565,98 @@ out center 500;"#
     let arc = Arc::new(pois);
     state.pois.write().await.insert(key, arc.clone());
     Ok(arc)
+}
+
+/// Emprise rectangulaire d'un bâtiment (bbox de son empreinte OSM) + hauteur.
+#[derive(Clone)]
+struct Building {
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+    height_m: f32,
+}
+
+/// Fetch Overpass des bâtiments (`building=*`) de la zone, cache mémoire par
+/// bbox arrondie. `out geom` renvoie directement la géométrie (liste de
+/// nœuds) sans second aller-retour pour résoudre les ways.
+async fn overpass_buildings(
+    state: &AppState,
+    s: f64,
+    w: f64,
+    n: f64,
+    e: f64,
+) -> Result<Arc<Vec<Building>>, (StatusCode, String)> {
+    let key = format!("{s:.4},{w:.4},{n:.4},{e:.4}");
+    if let Some(hit) = state.buildings.read().await.get(&key) {
+        return Ok(hit.clone());
+    }
+
+    let query = format!(
+        r#"[out:json][timeout:25];
+way["building"]({s},{w},{n},{e});
+out geom 5000;"#
+    );
+    let raw: BuildingsResponse = overpass_query(state, &query).await?;
+
+    let buildings: Vec<Building> = raw
+        .elements
+        .into_iter()
+        .filter_map(|el| {
+            let geometry = el.geometry?;
+            if geometry.is_empty() {
+                return None;
+            }
+            let mut min_lat = f64::MAX;
+            let mut max_lat = f64::MIN;
+            let mut min_lon = f64::MAX;
+            let mut max_lon = f64::MIN;
+            for node in &geometry {
+                min_lat = min_lat.min(node.lat);
+                max_lat = max_lat.max(node.lat);
+                min_lon = min_lon.min(node.lon);
+                max_lon = max_lon.max(node.lon);
+            }
+            let tags = el.tags.unwrap_or_default();
+            let height_m = tags
+                .get("height")
+                .and_then(|h| h.trim_end_matches(" m").parse::<f32>().ok())
+                .or_else(|| {
+                    tags.get("building:levels")
+                        .and_then(|l| l.parse::<f32>().ok())
+                        .map(|levels| levels * 3.0)
+                })
+                .unwrap_or(DEFAULT_BUILDING_HEIGHT_M);
+            Some(Building {
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon,
+                height_m,
+            })
+        })
+        .collect();
+
+    let arc = Arc::new(buildings);
+    state.buildings.write().await.insert(key, arc.clone());
+    Ok(arc)
+}
+
+#[derive(Deserialize)]
+struct BuildingsResponse {
+    elements: Vec<BuildingElement>,
+}
+
+#[derive(Deserialize)]
+struct BuildingElement {
+    tags: Option<HashMap<String, String>>,
+    geometry: Option<Vec<GeomNode>>,
+}
+
+#[derive(Deserialize)]
+struct GeomNode {
+    lat: f64,
+    lon: f64,
 }
 
 #[derive(Deserialize)]
