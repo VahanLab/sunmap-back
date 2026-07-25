@@ -63,6 +63,7 @@ async fn main() {
         .route("/sunlit", get(sunlit))
         .route("/sunlit/batch", post(sunlit_batch))
         .route("/terraces", get(terraces))
+        .route("/sun-hours", get(sun_hours))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";
@@ -277,19 +278,20 @@ async fn add_buildings(
     Ok(())
 }
 
-/// Assemble la DSM 3×3 tuiles autour du point et interroge helios-core.
-async fn classify(
+/// Assemble la DSM 3×3 tuiles autour d'un point + bâtiments, et renvoie tout
+/// ce qu'il faut pour classer ce point à n'importe quel instant : la DSM
+/// stampée (obstacles), ses coordonnées pixel locales, et son altitude de
+/// sol sur le relief SEUL (avant bâtiments — cf. `is_shadowed_from_ground` :
+/// un POI dont les coordonnées OSM tombent par erreur à l'intérieur d'un
+/// immeuble ne doit pas hériter de l'altitude du toit).
+async fn assemble_point(
     state: &AppState,
     lat: f64,
     lng: f64,
-    t_unix: f64,
-    observer_height_m: f64,
-) -> Result<SunlitResponse, (StatusCode, String)> {
+) -> Result<(Dsm, f64, f64, f32), (StatusCode, String)> {
     if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
         return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
     }
-
-    let sun = sun_position(t_unix, lat, lng);
 
     // Tuile centrale + marge d'une tuile ≈ 1,2 km de casters à z15.
     let (wx, wy) = world_px(lat, lng);
@@ -308,13 +310,21 @@ async fn classify(
 
     let px = wx - origin_x;
     let py = wy - origin_y;
-    // Sol de l'observateur pris sur le relief SEUL, avant stamping des
-    // bâtiments : un POI dont les coordonnées OSM tombent par erreur à
-    // l'intérieur d'un immeuble ne doit pas hériter de l'altitude du toit
-    // (cf. is_shadowed_from_ground). Les bâtiments restent pris en compte
-    // comme obstacles pour les VOISINS via la DSM stampée ci-dessous.
-    let elevation_m = dsm.sample(px, py).unwrap_or(0.0);
+    let ground = dsm.sample(px, py).unwrap_or(0.0);
     add_buildings(state, &mut dsm, origin_x, origin_y).await?;
+
+    Ok((dsm, px, py, ground))
+}
+
+async fn classify(
+    state: &AppState,
+    lat: f64,
+    lng: f64,
+    t_unix: f64,
+    observer_height_m: f64,
+) -> Result<SunlitResponse, (StatusCode, String)> {
+    let sun = sun_position(t_unix, lat, lng);
+    let (dsm, px, py, elevation_m) = assemble_point(state, lat, lng).await?;
 
     let params = ShadowParams {
         max_distance_m: 5_000.0, // relief : ombres longues possibles
@@ -330,6 +340,114 @@ async fn classify(
         sun_elevation_deg: sun.elevation_deg,
         t_unix,
     })
+}
+
+// ------------------------------------------------------------ sun-hours
+
+#[derive(Deserialize)]
+struct SunHoursQuery {
+    lat: f64,
+    lng: f64,
+    /// N'importe quel instant DANS la journée voulue (RFC3339 ou secondes
+    /// Unix). La journée est le jour calendaire UTC contenant `t`. Défaut :
+    /// maintenant.
+    t: Option<String>,
+    /// Défaut 1,5 m : usage principal = "est-ce que je peux m'asseoir là".
+    observer_height: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct SunHoursResponse {
+    lat: f64,
+    lng: f64,
+    elevation_m: f32,
+    /// Instant demandé et sa classification, pour un statut "maintenant"
+    /// immédiat sans avoir à chercher dans `intervals`.
+    t_unix: f64,
+    sunlit_now: bool,
+    day_start_unix: f64,
+    day_end_unix: f64,
+    total_sunlit_minutes: u32,
+    total_shadow_minutes: u32,
+    intervals: Vec<SunInterval>,
+}
+
+#[derive(Serialize)]
+struct SunInterval {
+    start_unix: f64,
+    end_unix: f64,
+    sunlit: bool,
+}
+
+/// Journée calendaire UTC (00:00 → 24:00) contenant l'instant donné.
+fn day_bounds_utc(t_unix: f64) -> (f64, f64) {
+    let dt = chrono::DateTime::from_timestamp(t_unix as i64, 0).unwrap_or_default();
+    let start = dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let start_unix = start.timestamp() as f64;
+    (start_unix, start_unix + 86_400.0)
+}
+
+/// Un point, une journée : les heures au soleil et à l'ombre. Échantillonne
+/// toutes les 5 min (pas du slider iOS) et regroupe en intervalles
+/// contigus — plus léger à consommer côté client qu'une valeur par tick.
+async fn sun_hours(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SunHoursQuery>,
+) -> Result<Json<SunHoursResponse>, (StatusCode, String)> {
+    let t = parse_time(q.t.as_deref())?;
+    let h = q.observer_height.unwrap_or(1.5);
+    let (day_start, day_end) = day_bounds_utc(t);
+
+    let (dsm, px, py, elevation_m) = assemble_point(&state, q.lat, q.lng).await?;
+    let params = ShadowParams {
+        max_distance_m: 5_000.0,
+        observer_height_m: h,
+        step_px: 1.0,
+    };
+
+    const STEP_S: f64 = 300.0; // 5 min
+    let steps = (86_400.0 / STEP_S) as usize;
+
+    let mut intervals: Vec<SunInterval> = Vec::new();
+    let mut sunlit_now = false;
+    let mut total_sunlit_steps: u32 = 0;
+
+    for i in 0..steps {
+        let step_t = day_start + i as f64 * STEP_S;
+        let sun = sun_position(step_t, q.lat, q.lng);
+        let sunlit = sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, elevation_m, &params);
+        if sunlit {
+            total_sunlit_steps += 1;
+        }
+        if step_t <= t && t < step_t + STEP_S {
+            sunlit_now = sunlit;
+        }
+
+        match intervals.last_mut() {
+            Some(last) if last.sunlit == sunlit => last.end_unix = step_t + STEP_S,
+            _ => intervals.push(SunInterval {
+                start_unix: step_t,
+                end_unix: step_t + STEP_S,
+                sunlit,
+            }),
+        }
+    }
+
+    let total_sunlit_minutes = total_sunlit_steps * 5;
+    let total_shadow_minutes = (steps as u32 - total_sunlit_steps) * 5;
+
+    Ok(Json(SunHoursResponse {
+        lat: q.lat,
+        lng: q.lng,
+        elevation_m,
+        t_unix: t,
+        sunlit_now,
+        day_start_unix: day_start,
+        day_end_unix: day_end,
+        total_sunlit_minutes,
+        total_shadow_minutes,
+        intervals,
+    }))
 }
 
 /// Tuile Mapterhorn décodée en altitudes (cache mémoire).
