@@ -44,6 +44,7 @@ async fn main() {
         // User-Agent identifiable : requis par Overpass (406 sinon).
         http: reqwest::Client::builder()
             .user_agent("sunmap-helios/0.1 (+https://github.com/VahanLab/sunmap-back)")
+            .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("client HTTP"),
         tiles: RwLock::new(HashMap::new()),
@@ -385,8 +386,17 @@ async fn terraces(
     }))
 }
 
+/// Miroirs Overpass, essayés dans l'ordre. L'instance officielle
+/// (overpass-api.de) sature souvent (504) aux heures de pointe.
+const OVERPASS_MIRRORS: &[&str] = &[
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+];
+
 /// Fetch Overpass des POI terrasse (cache mémoire par bbox arrondie —
-/// les POI bougent rarement, l'API publique est lente).
+/// les POI bougent rarement, l'API publique est lente/instable : on
+/// essaie plusieurs miroirs avant d'abandonner).
 async fn overpass_terraces(
     state: &AppState,
     s: f64,
@@ -404,17 +414,29 @@ async fn overpass_terraces(
 nwr["amenity"~"^(bar|restaurant|cafe)$"]["outdoor_seating"="yes"]({s},{w},{n},{e});
 out center 500;"#
     );
-    let raw: OverpassResponse = state
-        .http
-        .post("https://overpass-api.de/api/interpreter")
-        .form(&[("data", query.as_str())])
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Overpass : {e}")))?
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Overpass JSON : {e}")))?;
+
+    let mut last_err = String::new();
+    let mut raw: Option<OverpassResponse> = None;
+    for mirror in OVERPASS_MIRRORS {
+        match state
+            .http
+            .post(*mirror)
+            .form(&[("data", query.as_str())])
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+        {
+            Ok(resp) => match resp.json::<OverpassResponse>().await {
+                Ok(parsed) => {
+                    raw = Some(parsed);
+                    break;
+                }
+                Err(e) => last_err = format!("{mirror} (JSON) : {e}"),
+            },
+            Err(e) => last_err = format!("{mirror} : {e}"),
+        }
+    }
+    let raw = raw.ok_or((StatusCode::BAD_GATEWAY, format!("Overpass : {last_err}")))?;
 
     let pois: Vec<OverpassPoi> = raw
         .elements
