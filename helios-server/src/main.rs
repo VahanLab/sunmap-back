@@ -192,33 +192,72 @@ async fn assemble_grid(
     ))
 }
 
-/// Rasterise les bâtiments dans la DSM (piste "quick win" : emprise
-/// rectangulaire par bâtiment, pas la vraie polygone/scanline — cf.
-/// `Dsm::stamp_max`). Suffisant pour capter l'essentiel des ombres portées
-/// par les immeubles ; sous-estime un peu les bâtiments non rectangulaires
-/// (coins arrondis, formes en L) qui débordent légèrement leur bbox réelle.
+/// Rasterise les bâtiments dans la DSM par vraie rasterisation polygone
+/// (scanline, règle pair-impair). L'approximation bbox-rectangle testée
+/// initialement s'est révélée fausser des points hors du bâtiment : un
+/// bâtiment en L ou avec cour intérieure a une bbox qui déborde largement
+/// sur le trottoir voisin, stampant à tort des terrasses qui n'y sont pas
+/// (observé : terrasse à +20 m d'altitude alors qu'elle est au niveau rue,
+/// simplement parce que son point tombait dans la bbox d'un immeuble en L).
 fn stamp_buildings(dsm: &mut Dsm, origin_x: f64, origin_y: f64, buildings: &[Building]) {
     for b in buildings {
-        let (wx0, wy0) = world_px(b.max_lat, b.min_lon); // coin nord-ouest
-        let (wx1, wy1) = world_px(b.min_lat, b.max_lon); // coin sud-est
-        let x0f = wx0 - origin_x;
-        let y0f = wy0 - origin_y;
-        let x1f = wx1 - origin_x;
-        let y1f = wy1 - origin_y;
-        if x1f < 0.0 || y1f < 0.0 || x0f >= dsm.width as f64 || y0f >= dsm.height as f64 {
-            continue; // entièrement hors grille
-        }
-        let x0 = x0f.max(0.0) as usize;
-        let y0 = y0f.max(0.0) as usize;
-        let x1 = (x1f.max(0.0) as usize).min(dsm.width - 1);
-        let y1 = (y1f.max(0.0) as usize).min(dsm.height - 1);
-        if x1 < x0 || y1 < y0 {
+        if b.ring.len() < 3 {
             continue;
         }
-        let ground = dsm
-            .sample(((x0 + x1) / 2) as f64, ((y0 + y1) / 2) as f64)
-            .unwrap_or(0.0);
-        dsm.stamp_max(x0, y0, x1, y1, ground + b.height_m);
+        let pixels: Vec<(f64, f64)> = b
+            .ring
+            .iter()
+            .map(|&(lat, lon)| {
+                let (wx, wy) = world_px(lat, lon);
+                (wx - origin_x, wy - origin_y)
+            })
+            .collect();
+
+        let min_y = pixels.iter().map(|p| p.1).fold(f64::MAX, f64::min);
+        let max_y = pixels.iter().map(|p| p.1).fold(f64::MIN, f64::max);
+        let min_x = pixels.iter().map(|p| p.0).fold(f64::MAX, f64::min);
+        let max_x = pixels.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+        if max_x < 0.0 || max_y < 0.0 || min_x >= dsm.width as f64 || min_y >= dsm.height as f64 {
+            continue; // entièrement hors grille
+        }
+
+        // Sol de référence : centre du polygone (bbox center, approximation
+        // suffisante pour l'altitude de départ — un bâtiment n'a
+        // généralement pas de dénivelé notable sous son emprise).
+        let cx = ((min_x + max_x) / 2.0).clamp(0.0, dsm.width as f64 - 1.0);
+        let cy = ((min_y + max_y) / 2.0).clamp(0.0, dsm.height as f64 - 1.0);
+        let target = dsm.sample(cx, cy).unwrap_or(0.0) + b.height_m;
+
+        let y0 = min_y.max(0.0).floor() as usize;
+        let y1 = max_y.min(dsm.height as f64 - 1.0).ceil() as usize;
+        for y in y0..=y1.min(dsm.height - 1) {
+            let scan_y = y as f64 + 0.5;
+            let mut xs: Vec<f64> = Vec::new();
+            for i in 0..pixels.len() {
+                let (x1, y1p) = pixels[i];
+                let (x2, y2p) = pixels[(i + 1) % pixels.len()];
+                if (y1p <= scan_y && y2p > scan_y) || (y2p <= scan_y && y1p > scan_y) {
+                    let t = (scan_y - y1p) / (y2p - y1p);
+                    xs.push(x1 + t * (x2 - x1));
+                }
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+            let mut i = 0;
+            while i + 1 < xs.len() {
+                let x_start = xs[i].round().max(0.0) as usize;
+                let x_end = xs[i + 1].round().min(dsm.width as f64 - 1.0);
+                if x_end >= 0.0 && x_end as usize >= x_start {
+                    for x in x_start..=(x_end as usize).min(dsm.width - 1) {
+                        let idx = y * dsm.width + x;
+                        if dsm.data[idx] < target {
+                            dsm.data[idx] = target;
+                        }
+                    }
+                }
+                i += 2;
+            }
+        }
     }
 }
 
@@ -570,10 +609,8 @@ out center 500;"#
 /// Emprise rectangulaire d'un bâtiment (bbox de son empreinte OSM) + hauteur.
 #[derive(Clone)]
 struct Building {
-    min_lat: f64,
-    max_lat: f64,
-    min_lon: f64,
-    max_lon: f64,
+    /// Anneau extérieur du polygone (lat, lon), tel que renvoyé par Overpass.
+    ring: Vec<(f64, f64)>,
     height_m: f32,
 }
 
@@ -604,19 +641,10 @@ out geom 5000;"#
         .into_iter()
         .filter_map(|el| {
             let geometry = el.geometry?;
-            if geometry.is_empty() {
+            if geometry.len() < 3 {
                 return None;
             }
-            let mut min_lat = f64::MAX;
-            let mut max_lat = f64::MIN;
-            let mut min_lon = f64::MAX;
-            let mut max_lon = f64::MIN;
-            for node in &geometry {
-                min_lat = min_lat.min(node.lat);
-                max_lat = max_lat.max(node.lat);
-                min_lon = min_lon.min(node.lon);
-                max_lon = max_lon.max(node.lon);
-            }
+            let ring: Vec<(f64, f64)> = geometry.iter().map(|n| (n.lat, n.lon)).collect();
             let tags = el.tags.unwrap_or_default();
             let height_m = tags
                 .get("height")
@@ -627,13 +655,7 @@ out geom 5000;"#
                         .map(|levels| levels * 3.0)
                 })
                 .unwrap_or(DEFAULT_BUILDING_HEIGHT_M);
-            Some(Building {
-                min_lat,
-                max_lat,
-                min_lon,
-                max_lon,
-                height_m,
-            })
+            Some(Building { ring, height_m })
         })
         .collect();
 
