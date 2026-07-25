@@ -95,12 +95,62 @@ curl -X POST http://localhost:8080/sunlit/batch \
 Réponse `200` : tableau de réponses au même format que le GET, dans l'ordre
 des points d'entrée.
 
+### `GET /terraces`
+
+Bars/restaurants/cafés avec terrasse (OSM `outdoor_seating=yes` via Overpass)
+dans une bounding box, classés soleil/ombre à l'instant t. Pensé pour le
+front : une requête par viewport, le switch soleil/ombre filtre côté client
+sur le champ `sunlit`.
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `bbox` | string | oui | `min_lon,min_lat,max_lon,max_lat` (max ~3 km de côté) |
+| `t` | string | non | RFC3339 ou secondes Unix. Défaut : maintenant |
+| `observer_height` | f64 | non | Défaut : **1.5** (personne attablée) |
+
+```bash
+curl "http://localhost:8080/terraces?bbox=6.860,45.917,6.880,45.930&t=2026-07-25T18:30:00Z"
+```
+
+Réponse `200` :
+
+```json
+{
+  "t_unix": 1785004200.0,
+  "sun_azimuth_deg": 292.5,
+  "sun_elevation_deg": 5.5,
+  "count": 16,
+  "terraces": [
+    {
+      "id": "node/2298691508",
+      "name": "Le Chamonix",
+      "amenity": "bar",
+      "lat": 45.9235,
+      "lng": 6.8697,
+      "sunlit": false,
+      "elevation_m": 1037.0
+    }
+  ]
+}
+```
+
+Notes :
+- Source POI : Overpass (`amenity=bar|restaurant|cafe` + `outdoor_seating=yes`),
+  centroïde pour les bâtiments (ways). Cache mémoire par bbox — première
+  requête sur une zone : 1-5 s (Overpass), suivantes : tuiles + POI en cache.
+- **Classification binaire au centroïde** (limite POC) : une terrasse est un
+  polygone, potentiellement mi-ombre/mi-soleil. Prochaine étape :
+  échantillonner 3-5 points dans un buffer côté rue et renvoyer un
+  pourcentage d'ensoleillement.
+- Même limite que `/sunlit` : relief seul, ombres de bâtiments non prises en
+  compte (en ville dense, surestime le soleil).
+
 ### Erreurs
 
 | Code | Cause |
 |---|---|
-| `400` | `lat`/`lng` hors bornes, ou `t` invalide |
-| `502` | Tuile Mapterhorn inaccessible ou indécodable |
+| `400` | `lat`/`lng` hors bornes, `bbox` invalide ou trop grande, `t` invalide |
+| `502` | Tuile Mapterhorn inaccessible/indécodable, ou Overpass en erreur |
 
 ## Roadmap (cf. CLAUDE.md racine)
 
