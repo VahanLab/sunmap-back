@@ -54,9 +54,11 @@ CREATE TABLE IF NOT EXISTS places (
     osm_id           text PRIMARY KEY,
     name             text,
     amenity          text,
-    -- `true` = terrasse explicitement taggée. `false` = tag absent OU négatif,
-    -- les deux étant indiscernables et fréquents.
-    outdoor_seating  boolean NOT NULL DEFAULT false,
+    -- Trois états : true = terrasse, false = refus explicite (`no`),
+    -- NULL = non renseigné. Ce dernier cas couvre ~79 % des établissements
+    -- parisiens et ne veut PAS dire qu'il n'y a pas de terrasse — le client
+    -- doit donc s'abstenir plutôt que d'afficher « pas de terrasse ».
+    outdoor_seating  boolean,
     website          text,
     phone            text,
     opening_hours    text,

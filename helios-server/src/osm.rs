@@ -69,9 +69,12 @@ pub struct Place {
     pub osm_id: String,
     pub name: Option<String>,
     pub amenity: Option<String>,
-    /// `outdoor_seating=yes` dans OSM. Une absence ne veut PAS dire qu'il n'y a
-    /// pas de terrasse — le tag est souvent simplement non renseigné.
-    pub outdoor_seating: bool,
+    /// Tag `outdoor_seating` d'OSM, en trois états. `None` = non renseigné,
+    /// ce qui est le cas de ~79 % des établissements parisiens et ne veut
+    /// surtout pas dire « pas de terrasse » — d'où le `Option` plutôt qu'un
+    /// booléen, qui confondait l'absence d'information avec une absence de
+    /// terrasse.
+    pub outdoor_seating: Option<bool>,
     pub lat: f64,
     pub lng: f64,
     pub website: Option<String>,
@@ -228,7 +231,11 @@ pub fn place_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, Str
         osm_id,
         name: tags.get("name").cloned(),
         amenity: tags.get("amenity").cloned(),
-        outdoor_seating: tags.get("outdoor_seating").map(String::as_str) == Some("yes"),
+        // "no" est le seul refus explicite ; "seasonal", "sidewalk",
+        // "garden"… décrivent une terrasse et valent donc oui.
+        outdoor_seating: tags
+            .get("outdoor_seating")
+            .map(|v| v.as_str() != "no"),
         lat,
         lng,
         // Website/téléphone : "contact:*" en repli si le tag simple manque.

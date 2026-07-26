@@ -158,9 +158,10 @@ et les filtres de catégorie s'appliquent côté client, sans nouvel appel.
 
 Catégories retenues (`osm::AMENITIES`) : `bar`, `pub`, `restaurant`, `cafe`,
 `fast_food`, `biergarten`. **Aucun filtre sur `outdoor_seating`** : le tag
-manque sur ~79 % des établissements parisiens, donc filtrer dessus en écartait
-la majorité. Il est renvoyé tel quel, à charge du client d'en faire un filtre
-optionnel.
+manque sur ~64 % des établissements parisiens, donc filtrer dessus en écartait
+la majorité. Il est renvoyé en trois états — `true`, `false`, ou **absent de la
+réponse** quand OSM ne renseigne rien. Un client ne doit rien affirmer dans ce
+dernier cas : l'absence d'information n'est pas une absence de terrasse.
 
 | Paramètre | Type | Obligatoire | Description |
 |---|---|---|---|

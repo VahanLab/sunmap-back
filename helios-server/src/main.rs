@@ -848,9 +848,11 @@ struct Place {
     id: String,
     name: Option<String>,
     amenity: Option<String>,
-    /// `outdoor_seating=yes` dans OSM. Un `false` ne signifie PAS qu'il n'y a
-    /// pas de terrasse : le tag est souvent simplement absent.
-    outdoor_seating: bool,
+    /// Tag `outdoor_seating` d'OSM. **Absent de la réponse si non renseigné** —
+    /// ce qui est le cas le plus fréquent, et ne signifie pas « pas de
+    /// terrasse ». Le client ne doit rien afficher dans ce cas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outdoor_seating: Option<bool>,
     lat: f64,
     lng: f64,
     sunlit: bool,
