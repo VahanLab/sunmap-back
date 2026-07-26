@@ -6,4 +6,5 @@
 //! le serveur ne lit plus que la base (`db`).
 
 pub mod db;
+pub mod dem;
 pub mod osm;

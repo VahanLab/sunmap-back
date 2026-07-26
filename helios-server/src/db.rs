@@ -128,21 +128,41 @@ pub async fn terraces_in_bbox(
 /// Upsert : une tuile d'ingestion recouvre ses voisines, et un même bâtiment
 /// revient donc plusieurs fois. `ON CONFLICT DO UPDATE` garde la dernière
 /// version plutôt que d'échouer.
+/// ST_CollectionExtract(..., 3) avant ST_Multi : une emprise OSM
+/// auto-intersectée (fréquent) fait sortir `ST_MakeValid` en
+/// GeometryCollection — les polygones plus les lignes de découpe — que
+/// `ST_Multi` ne convertit pas. L'extraction ne garde que les polygones.
+const INSERT_BUILDING: &str =
+    "INSERT INTO buildings (osm_id, name, height_m, height_from_osm, geom) \
+     VALUES ($1, $2, $3, $4, \
+       ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromText($5, 4326)), 3))) \
+     ON CONFLICT (osm_id) DO UPDATE SET \
+       name = EXCLUDED.name, height_m = EXCLUDED.height_m, \
+       height_from_osm = EXCLUDED.height_from_osm, geom = EXCLUDED.geom";
+
 pub async fn upsert_buildings(pool: &PgPool, buildings: &[Building]) -> Result<u64, sqlx::Error> {
     let mut written = 0u64;
     // Par paquets : une transaction unique sur 200 000 emprises ferait gonfler
     // le WAL sans bénéfice, et un échec perdrait toute la tuile.
     for chunk in buildings.chunks(500) {
-        let mut tx = pool.begin().await?;
-        for b in chunk {
-            let Some(wkt) = multipolygon_wkt(&b.rings) else { continue };
-            let n = sqlx::query(
-                "INSERT INTO buildings (osm_id, name, height_m, height_from_osm, geom) \
-                 VALUES ($1, $2, $3, $4, ST_Multi(ST_MakeValid(ST_GeomFromText($5, 4326)))) \
-                 ON CONFLICT (osm_id) DO UPDATE SET \
-                   name = EXCLUDED.name, height_m = EXCLUDED.height_m, \
-                   height_from_osm = EXCLUDED.height_from_osm, geom = EXCLUDED.geom",
-            )
+        match insert_chunk(pool, chunk).await {
+            Ok(n) => written += n,
+            // Une géométrie irrécupérable empoisonne la transaction et
+            // ferait perdre les 499 autres. On rejoue le paquet ligne à
+            // ligne, hors transaction, en sautant les fautives : une emprise
+            // aberrante ne doit pas coûter une tuile entière.
+            Err(_) => written += insert_one_by_one(pool, chunk).await,
+        }
+    }
+    Ok(written)
+}
+
+async fn insert_chunk(pool: &PgPool, chunk: &[Building]) -> Result<u64, sqlx::Error> {
+    let mut written = 0u64;
+    let mut tx = pool.begin().await?;
+    for b in chunk {
+        let Some(wkt) = multipolygon_wkt(&b.rings) else { continue };
+        written += sqlx::query(INSERT_BUILDING)
             .bind(&b.osm_id)
             .bind(&b.name)
             .bind(b.height_m)
@@ -151,11 +171,29 @@ pub async fn upsert_buildings(pool: &PgPool, buildings: &[Building]) -> Result<u
             .execute(&mut *tx)
             .await?
             .rows_affected();
-            written += n;
-        }
-        tx.commit().await?;
     }
+    tx.commit().await?;
     Ok(written)
+}
+
+async fn insert_one_by_one(pool: &PgPool, chunk: &[Building]) -> u64 {
+    let mut written = 0u64;
+    for b in chunk {
+        let Some(wkt) = multipolygon_wkt(&b.rings) else { continue };
+        match sqlx::query(INSERT_BUILDING)
+            .bind(&b.osm_id)
+            .bind(&b.name)
+            .bind(b.height_m)
+            .bind(b.height_from_osm)
+            .bind(&wkt)
+            .execute(pool)
+            .await
+        {
+            Ok(r) => written += r.rows_affected(),
+            Err(e) => eprintln!("  emprise ignorée {} : {e}", b.osm_id),
+        }
+    }
+    written
 }
 
 pub async fn upsert_trees(pool: &PgPool, trees: &[Tree]) -> Result<u64, sqlx::Error> {

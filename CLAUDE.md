@@ -62,6 +62,13 @@ Fonctionnalités cibles :
 
 ## Sources de données (toutes open data)
 
+> État de l'art des données d'élévation, alternatives évaluées et résultats de
+> mesure : **`docs/recherche-donnees-elevation.md`**. À lire avant d'envisager
+> de changer de source. Conclusion courte : aucun DSM public mondial n'est
+> assez fin (le meilleur gratuit est à 30 m), notre assemblage DEM + emprises
+> est l'état de l'art, mais **Mapterhorn s'arrête à z12 hors pays à LiDAR
+> ouvert** — le serveur y tombe en 502 aujourd'hui.
+
 - **Terrain (monde)** : tuiles DEM **Mapterhorn**
   (`https://tiles.mapterhorn.com/{z}/{x}/{y}.webp`, webp 512 px, encodage
   Terrarium `alt = r*256 + g + b/256 − 32768`, maxzoom 16 vérifié France,

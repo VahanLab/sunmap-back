@@ -23,15 +23,9 @@ use helios_core::dsm::Dsm;
 use helios_core::shadow::{shadow_hit_from_ground, ShadowHit, ShadowParams};
 use helios_core::sun::sun_position;
 use helios_server::db;
+use helios_server::dem::{self, latlon_of_world_px, world_px, TileCache, TILE_SIZE, ZOOM};
 use helios_server::osm::Building;
 
-const TILE_SIZE: usize = 512;
-/// z15 ≈ 2,4 m/pixel à 45° de latitude : suffisant pour du relief et des
-/// terrasses. (z16 dispo si besoin de plus fin, 4× plus de données.)
-const ZOOM: u32 = 15;
-const TILE_URL: &str = "https://tiles.mapterhorn.com";
-
-type TileCache = RwLock<HashMap<(u32, u32, u32), Arc<Vec<f32>>>>;
 /// Emprises déjà lues en base pour une bbox de tuiles donnée. PostGIS répond
 /// en quelques ms, mais la même fenêtre est redemandée à chaque tick du slider
 /// et le cache évite surtout de refaire le parsing WKT.
@@ -169,25 +163,6 @@ async fn sunlit_batch(
 }
 
 // ------------------------------------------------------------ cœur métier
-
-/// Pixel monde Web Mercator au zoom de travail.
-fn world_px(lat: f64, lng: f64) -> (f64, f64) {
-    let n = (TILE_SIZE as f64) * f64::powi(2.0, ZOOM as i32);
-    let wx = (lng + 180.0) / 360.0 * n;
-    let wy = (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n;
-    (wx, wy)
-}
-
-/// Inverse de `world_px` : pixel monde → coordonnée géographique.
-fn latlon_of_world_px(wx: f64, wy: f64) -> (f64, f64) {
-    let n = (TILE_SIZE as f64) * f64::powi(2.0, ZOOM as i32);
-    let lon = wx / n * 360.0 - 180.0;
-    let lat = (std::f64::consts::PI * (1.0 - 2.0 * wy / n))
-        .sinh()
-        .atan()
-        .to_degrees();
-    (lat, lon)
-}
 
 /// Assemble une DSM couvrant l'intervalle de tuiles `[x0..=x1] × [y0..=y1]`.
 /// Renvoie la grille + l'origine (coin nord-ouest) en pixels monde.
@@ -932,44 +907,16 @@ async fn debug_ray(
     }))
 }
 
-/// Tuile Mapterhorn décodée en altitudes (cache mémoire).
+/// Tuile Mapterhorn décodée, via le cache partagé du process.
 async fn fetch_tile(
     state: &AppState,
     z: u32,
     x: u32,
     y: u32,
 ) -> Result<Arc<Vec<f32>>, (StatusCode, String)> {
-    if let Some(hit) = state.tiles.read().await.get(&(z, x, y)) {
-        return Ok(hit.clone());
-    }
-
-    let url = format!("{TILE_URL}/{z}/{x}/{y}.webp");
-    let bytes = state
-        .http
-        .get(&url)
-        .send()
+    dem::fetch_tile(&state.http, &state.tiles, z, x, y)
         .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tuile {url} : {e}")))?
-        .bytes()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("tuile {url} : {e}")))?;
-
-    let img = image::load_from_memory(&bytes)
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("décodage {url} : {e}")))?
-        .to_rgb8();
-    if img.width() as usize != TILE_SIZE || img.height() as usize != TILE_SIZE {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("tuile {url} : taille inattendue {}×{}", img.width(), img.height()),
-        ));
-    }
-
-    // Même décodage que Dsm::from_terrarium_rgb (on ne garde que les floats).
-    let floats = Dsm::from_terrarium_rgb(img.as_raw(), TILE_SIZE, TILE_SIZE, 1.0).data;
-    let arc = Arc::new(floats);
-    state.tiles.write().await.insert((z, x, y), arc.clone());
-    Ok(arc)
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
 // ------------------------------------------------------------- terrasses
