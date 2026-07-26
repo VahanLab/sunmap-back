@@ -33,6 +33,24 @@ impl Default for ShadowParams {
     }
 }
 
+/// Obstacle rencontré par le rayon : de quoi remonter à *ce qui* fait l'ombre.
+///
+/// L'appelant sait quelle entité occupe la cellule `(x, y)` (grille de
+/// propriétaires côté serveur), et peut donc nommer le bâtiment fautif.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowHit {
+    /// Cellule DSM (arrondie) où le rayon a été bloqué.
+    pub x: usize,
+    pub y: usize,
+    /// Distance horizontale parcourue depuis le point testé, en mètres.
+    pub distance_m: f64,
+    /// Altitude de l'obstacle à cette cellule.
+    pub obstacle_elevation_m: f32,
+    /// Altitude du rayon à cette distance (l'écart avec l'obstacle dit de
+    /// combien il manque de soleil).
+    pub ray_elevation_m: f64,
+}
+
 /// Le point `(px, py)` (coordonnées pixel de la DSM) est-il à l'ombre ?
 ///
 /// Retourne aussi `true` hors grille si le soleil est couché ; un point de
@@ -62,8 +80,26 @@ pub fn is_shadowed_from_ground(
     ground: f32,
     params: &ShadowParams,
 ) -> bool {
+    !sun.is_up() || shadow_hit_from_ground(dsm, sun, px, py, ground, params).is_some()
+}
+
+/// Variante instrumentée de [`is_shadowed_from_ground`] : renvoie l'obstacle
+/// qui bloque le rayon (`None` = au soleil). Même marche, même résultat —
+/// c'est l'implémentation de référence, le prédicat booléen n'en est qu'un
+/// raccourci.
+///
+/// Note : soleil couché renvoie `None` (aucun obstacle) alors que le point est
+/// bien à l'ombre — d'où le test `is_up()` séparé chez l'appelant.
+pub fn shadow_hit_from_ground(
+    dsm: &Dsm,
+    sun: &SunPosition,
+    px: f64,
+    py: f64,
+    ground: f32,
+    params: &ShadowParams,
+) -> Option<ShadowHit> {
     if !sun.is_up() {
-        return true;
+        return None;
     }
     let z0 = ground as f64 + params.observer_height_m;
 
@@ -91,14 +127,20 @@ pub fn is_shadowed_from_ground(
         let Some(h) = dsm.sample(x, y) else {
             // Sorti de la grille sans obstacle : réputé au soleil.
             // (En production : charger la DSM avec une marge — cf. serveur.)
-            return false;
+            return None;
         };
         let ray_z = z0 + (i as f64) * step_m * tan_elev;
         if (h as f64) > ray_z {
-            return true;
+            return Some(ShadowHit {
+                x: x.round().clamp(0.0, (dsm.width - 1) as f64) as usize,
+                y: y.round().clamp(0.0, (dsm.height - 1) as f64) as usize,
+                distance_m: (i as f64) * step_m,
+                obstacle_elevation_m: h,
+                ray_elevation_m: ray_z,
+            });
         }
     }
-    false
+    None
 }
 
 /// Rend le masque d'ombre de toute la grille : `255` = ombre, `0` = soleil.

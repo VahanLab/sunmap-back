@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use helios_core::dsm::Dsm;
-use helios_core::shadow::{is_shadowed_from_ground, ShadowParams};
+use helios_core::shadow::{shadow_hit_from_ground, ShadowHit, ShadowParams};
 use helios_core::sun::sun_position;
 
 const TILE_SIZE: usize = 512;
@@ -38,10 +38,12 @@ type TreeCache = RwLock<HashMap<String, Arc<Vec<Tree>>>>;
 /// marching quand la même requête (même minute, même zone) revient.
 type TerracesResultCache = RwLock<HashMap<String, Arc<TerracesResponse>>>;
 
-/// Hauteur par défaut quand ni `height` ni `building:levels` ne sont taggés
-/// sur OSM (fréquent) — ~3 étages, prudent en zone dense plutôt que de sous-
-/// estimer les ombres portées.
+/// Hauteur de repli ultime, si *aucun* bâtiment de la zone n'a de tag de
+/// hauteur. Sinon on utilise la médiane locale (cf. `overpass_buildings`).
 const DEFAULT_BUILDING_HEIGHT_M: f32 = 9.0;
+
+/// Valeur de la grille `owner` pour « aucun bâtiment ici » (relief nu).
+const OWNER_TERRAIN: u32 = u32::MAX;
 
 struct AppState {
     http: reqwest::Client,
@@ -74,6 +76,8 @@ async fn main() {
         .route("/terraces", get(terraces))
         .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
+        .route("/debug/ray", get(debug_ray))
+        .route("/building", get(building_at))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";
@@ -101,6 +105,9 @@ struct SunlitResponse {
     sun_azimuth_deg: f64,
     sun_elevation_deg: f64,
     t_unix: f64,
+    /// Absent si le point est au soleil (ou le soleil couché) : ce qui bloque.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<Blocker>,
 }
 
 async fn sunlit(
@@ -210,8 +217,18 @@ async fn assemble_grid(
 /// sur le trottoir voisin, stampant à tort des terrasses qui n'y sont pas
 /// (observé : terrasse à +20 m d'altitude alors qu'elle est au niveau rue,
 /// simplement parce que son point tombait dans la bbox d'un immeuble en L).
-fn stamp_buildings(dsm: &mut Dsm, origin_x: f64, origin_y: f64, buildings: &[Building]) {
-    for b in buildings {
+///
+/// `owner` (même dimensions que la DSM) reçoit l'index du bâtiment qui a fixé
+/// l'altitude de chaque cellule — c'est ce qui permet de répondre « quel
+/// immeuble fait cette ombre » après le ray marching.
+fn stamp_buildings(
+    dsm: &mut Dsm,
+    owner: &mut [u32],
+    origin_x: f64,
+    origin_y: f64,
+    buildings: &[Building],
+) {
+    for (bi, b) in buildings.iter().enumerate() {
         if b.ring.len() < 3 {
             continue;
         }
@@ -263,6 +280,7 @@ fn stamp_buildings(dsm: &mut Dsm, origin_x: f64, origin_y: f64, buildings: &[Bui
                         let idx = y * dsm.width + x;
                         if dsm.data[idx] < target {
                             dsm.data[idx] = target;
+                            owner[idx] = bi as u32;
                         }
                     }
                 }
@@ -280,12 +298,64 @@ async fn add_buildings(
     dsm: &mut Dsm,
     origin_x: f64,
     origin_y: f64,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(Arc<Vec<Building>>, Vec<u32>), (StatusCode, String)> {
     let (north, west) = latlon_of_world_px(origin_x, origin_y);
     let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
     let buildings = overpass_buildings(state, south, west, north, east).await?;
-    stamp_buildings(dsm, origin_x, origin_y, &buildings);
-    Ok(())
+    let mut owner = vec![OWNER_TERRAIN; dsm.width * dsm.height];
+    stamp_buildings(dsm, &mut owner, origin_x, origin_y, &buildings);
+    Ok((buildings, owner))
+}
+
+/// Ce qui bloque le soleil sur un point donné, tel que renvoyé aux clients.
+#[derive(Serialize, Clone)]
+struct Blocker {
+    /// "way/123456" si c'est un bâtiment OSM, "terrain" si c'est le relief.
+    id: String,
+    /// Nom OSM du bâtiment s'il en a un.
+    name: Option<String>,
+    /// Hauteur retenue pour le bâtiment, et si elle vient d'un tag OSM ou du
+    /// défaut (`DEFAULT_BUILDING_HEIGHT_M`) — un `false` ici explique la
+    /// plupart des désaccords visuels avec la réalité.
+    height_m: Option<f32>,
+    height_from_osm: bool,
+    /// Position (centre de la cellule DSM) et distance depuis le point testé.
+    lat: f64,
+    lng: f64,
+    distance_m: f64,
+    /// Altitude de l'obstacle vs altitude du rayon à cet endroit : l'écart dit
+    /// de combien il manque au point pour voir le soleil.
+    obstacle_elevation_m: f32,
+    ray_elevation_m: f64,
+}
+
+/// Traduit un `ShadowHit` (cellule DSM) en `Blocker` nommé.
+fn describe_blocker(
+    hit: &ShadowHit,
+    dsm: &Dsm,
+    owner: &[u32],
+    buildings: &[Building],
+    origin_x: f64,
+    origin_y: f64,
+) -> Blocker {
+    let (lat, lng) = latlon_of_world_px(origin_x + hit.x as f64 + 0.5, origin_y + hit.y as f64 + 0.5);
+    let b = owner
+        .get(hit.y * dsm.width + hit.x)
+        .copied()
+        .filter(|&o| o != OWNER_TERRAIN)
+        .and_then(|o| buildings.get(o as usize));
+
+    Blocker {
+        id: b.map_or_else(|| "terrain".to_string(), |b| format!("way/{}", b.id)),
+        name: b.and_then(|b| b.name.clone()),
+        height_m: b.map(|b| b.height_m),
+        height_from_osm: b.is_some_and(|b| b.height_from_osm),
+        lat,
+        lng,
+        distance_m: hit.distance_m,
+        obstacle_elevation_m: hit.obstacle_elevation_m,
+        ray_elevation_m: hit.ray_elevation_m,
+    }
 }
 
 /// Assemble la DSM 3×3 tuiles autour d'un point + bâtiments, et renvoie tout
@@ -298,7 +368,7 @@ async fn assemble_point(
     state: &AppState,
     lat: f64,
     lng: f64,
-) -> Result<(Dsm, f64, f64, f32), (StatusCode, String)> {
+) -> Result<PointCtx, (StatusCode, String)> {
     if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
         return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
     }
@@ -321,9 +391,55 @@ async fn assemble_point(
     let px = wx - origin_x;
     let py = wy - origin_y;
     let ground = dsm.sample(px, py).unwrap_or(0.0);
-    add_buildings(state, &mut dsm, origin_x, origin_y).await?;
+    let (buildings, owner) = add_buildings(state, &mut dsm, origin_x, origin_y).await?;
 
-    Ok((dsm, px, py, ground))
+    Ok(PointCtx {
+        dsm,
+        owner,
+        buildings,
+        origin_x,
+        origin_y,
+        px,
+        py,
+        ground,
+    })
+}
+
+/// Tout ce qu'il faut pour classer un point à n'importe quel instant, plus de
+/// quoi nommer l'obstacle rencontré.
+struct PointCtx {
+    dsm: Dsm,
+    owner: Vec<u32>,
+    buildings: Arc<Vec<Building>>,
+    origin_x: f64,
+    origin_y: f64,
+    px: f64,
+    py: f64,
+    /// Altitude du relief SEUL sous le point (avant stamping des bâtiments).
+    ground: f32,
+}
+
+impl PointCtx {
+    /// Le point est-il à l'ombre à cet instant, et si oui à cause de quoi ?
+    fn classify_at(&self, sun: &helios_core::sun::SunPosition, params: &ShadowParams) -> (bool, Option<Blocker>) {
+        if !sun.is_up() {
+            return (false, None);
+        }
+        match shadow_hit_from_ground(&self.dsm, sun, self.px, self.py, self.ground, params) {
+            None => (true, None),
+            Some(hit) => (
+                false,
+                Some(describe_blocker(
+                    &hit,
+                    &self.dsm,
+                    &self.owner,
+                    &self.buildings,
+                    self.origin_x,
+                    self.origin_y,
+                )),
+            ),
+        }
+    }
 }
 
 async fn classify(
@@ -334,21 +450,22 @@ async fn classify(
     observer_height_m: f64,
 ) -> Result<SunlitResponse, (StatusCode, String)> {
     let sun = sun_position(t_unix, lat, lng);
-    let (dsm, px, py, elevation_m) = assemble_point(state, lat, lng).await?;
+    let ctx = assemble_point(state, lat, lng).await?;
 
     let params = ShadowParams {
         max_distance_m: 5_000.0, // relief : ombres longues possibles
         observer_height_m,
         step_px: 1.0,
     };
-    let shadowed = is_shadowed_from_ground(&dsm, &sun, px, py, elevation_m, &params);
+    let (sunlit, blocker) = ctx.classify_at(&sun, &params);
 
     Ok(SunlitResponse {
-        sunlit: !shadowed,
-        elevation_m,
+        sunlit,
+        elevation_m: ctx.ground,
         sun_azimuth_deg: sun.azimuth_deg,
         sun_elevation_deg: sun.elevation_deg,
         t_unix,
+        blocker,
     })
 }
 
@@ -375,6 +492,9 @@ struct SunHoursResponse {
     /// immédiat sans avoir à chercher dans `intervals`.
     t_unix: f64,
     sunlit_now: bool,
+    /// Ce qui bloque le soleil à `t_unix` (absent si au soleil).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker_now: Option<Blocker>,
     day_start_unix: f64,
     day_end_unix: f64,
     total_sunlit_minutes: u32,
@@ -408,7 +528,7 @@ async fn sun_hours(
     let h = q.observer_height.unwrap_or(1.5);
     let (day_start, day_end) = day_bounds_utc(t);
 
-    let (dsm, px, py, elevation_m) = assemble_point(&state, q.lat, q.lng).await?;
+    let ctx = assemble_point(&state, q.lat, q.lng).await?;
     let params = ShadowParams {
         max_distance_m: 5_000.0,
         observer_height_m: h,
@@ -420,17 +540,19 @@ async fn sun_hours(
 
     let mut intervals: Vec<SunInterval> = Vec::new();
     let mut sunlit_now = false;
+    let mut blocker_now = None;
     let mut total_sunlit_steps: u32 = 0;
 
     for i in 0..steps {
         let step_t = day_start + i as f64 * STEP_S;
         let sun = sun_position(step_t, q.lat, q.lng);
-        let sunlit = sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, elevation_m, &params);
+        let (sunlit, blocker) = ctx.classify_at(&sun, &params);
         if sunlit {
             total_sunlit_steps += 1;
         }
         if step_t <= t && t < step_t + STEP_S {
             sunlit_now = sunlit;
+            blocker_now = blocker;
         }
 
         match intervals.last_mut() {
@@ -449,14 +571,159 @@ async fn sun_hours(
     Ok(Json(SunHoursResponse {
         lat: q.lat,
         lng: q.lng,
-        elevation_m,
+        elevation_m: ctx.ground,
         t_unix: t,
         sunlit_now,
+        blocker_now,
         day_start_unix: day_start,
         day_end_unix: day_end,
         total_sunlit_minutes,
         total_shadow_minutes,
         intervals,
+    }))
+}
+
+// ------------------------------------------------------------- bâtiment
+
+#[derive(Deserialize)]
+struct BuildingAtQuery {
+    lat: f64,
+    lng: f64,
+}
+
+/// Le bâtiment *tel que le moteur d'ombre le voit* à cette coordonnée.
+/// Permet de confronter ce qu'on rend (Mapbox) à ce qu'on calcule (OSM+DSM) :
+/// si l'app affiche un immeuble ici et que ça répond `null`, la DSM ne l'a pas.
+#[derive(Serialize)]
+struct BuildingAtResponse {
+    found: bool,
+    id: Option<String>,
+    name: Option<String>,
+    height_m: Option<f32>,
+    height_from_osm: bool,
+    /// Altitude du toit dans la DSM (relief + hauteur), et du relief seul.
+    roof_elevation_m: f32,
+    terrain_elevation_m: f32,
+}
+
+async fn building_at(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<BuildingAtQuery>,
+) -> Result<Json<BuildingAtResponse>, (StatusCode, String)> {
+    let ctx = assemble_point(&state, q.lat, q.lng).await?;
+    let (xi, yi) = (
+        ctx.px.round().clamp(0.0, (ctx.dsm.width - 1) as f64) as usize,
+        ctx.py.round().clamp(0.0, (ctx.dsm.height - 1) as f64) as usize,
+    );
+    let idx = yi * ctx.dsm.width + xi;
+    let b = ctx
+        .owner
+        .get(idx)
+        .copied()
+        .filter(|&o| o != OWNER_TERRAIN)
+        .and_then(|o| ctx.buildings.get(o as usize));
+
+    Ok(Json(BuildingAtResponse {
+        found: b.is_some(),
+        id: b.map(|b| format!("way/{}", b.id)),
+        name: b.and_then(|b| b.name.clone()),
+        height_m: b.map(|b| b.height_m),
+        height_from_osm: b.is_some_and(|b| b.height_from_osm),
+        roof_elevation_m: ctx.dsm.data[idx],
+        terrain_elevation_m: ctx.ground,
+    }))
+}
+
+// ---------------------------------------------------------------- debug
+
+/// Profil de la DSM le long du rayon solaire : altitude du terrain+bâtiments
+/// contre altitude du rayon, pas à pas. Sert à voir *pourquoi* un point est
+/// classé comme il l'est — bâtiment manquant, trop bas, mal placé, etc.
+#[derive(Serialize)]
+struct RayStep {
+    distance_m: f64,
+    lat: f64,
+    lng: f64,
+    /// Altitude de la DSM (relief + bâtiments stampés) à ce pas.
+    dsm_m: f32,
+    /// Altitude du rayon solaire à ce pas.
+    ray_m: f64,
+    /// Bâtiment occupant la cellule, s'il y en a un.
+    building: Option<String>,
+    building_height_m: Option<f32>,
+    /// `true` sur le pas qui bloque le rayon.
+    blocks: bool,
+}
+
+#[derive(Serialize)]
+struct DebugRayResponse {
+    sun_azimuth_deg: f64,
+    sun_elevation_deg: f64,
+    ground_m: f32,
+    observer_m: f64,
+    meters_per_pixel: f64,
+    /// Bâtiments chargés dans la fenêtre DSM — un nombre anormalement bas
+    /// signale une troncature Overpass.
+    buildings_loaded: usize,
+    sunlit: bool,
+    steps: Vec<RayStep>,
+}
+
+async fn debug_ray(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SunlitQuery>,
+) -> Result<Json<DebugRayResponse>, (StatusCode, String)> {
+    let t = parse_time(q.t.as_deref())?;
+    let h = q.observer_height.unwrap_or(1.5);
+    let sun = sun_position(t, q.lat, q.lng);
+    let ctx = assemble_point(&state, q.lat, q.lng).await?;
+
+    let rad = std::f64::consts::PI / 180.0;
+    let (dx, dy) = ((sun.azimuth_deg * rad).sin(), -(sun.azimuth_deg * rad).cos());
+    let tan_elev = (sun.elevation_deg * rad).tan();
+    let step_m = ctx.dsm.meters_per_pixel;
+    let z0 = ctx.ground as f64 + h;
+
+    // 200 pas ≈ 315 m : largement de quoi couvrir les casters urbains.
+    let mut steps = Vec::new();
+    let mut blocked = false;
+    for i in 1..=200usize {
+        let (x, y) = (ctx.px + dx * i as f64, ctx.py + dy * i as f64);
+        let Some(dsm_m) = ctx.dsm.sample(x, y) else { break };
+        let ray_m = z0 + i as f64 * step_m * tan_elev;
+        let blocks = !blocked && (dsm_m as f64) > ray_m;
+        if blocks {
+            blocked = true;
+        }
+        let (xi, yi) = (x.round().max(0.0) as usize, y.round().max(0.0) as usize);
+        let b = ctx
+            .owner
+            .get(yi * ctx.dsm.width + xi)
+            .copied()
+            .filter(|&o| o != OWNER_TERRAIN)
+            .and_then(|o| ctx.buildings.get(o as usize));
+        let (lat, lng) = latlon_of_world_px(ctx.origin_x + x, ctx.origin_y + y);
+        steps.push(RayStep {
+            distance_m: i as f64 * step_m,
+            lat,
+            lng,
+            dsm_m,
+            ray_m,
+            building: b.map(|b| format!("way/{}", b.id)),
+            building_height_m: b.map(|b| b.height_m),
+            blocks,
+        });
+    }
+
+    Ok(Json(DebugRayResponse {
+        sun_azimuth_deg: sun.azimuth_deg,
+        sun_elevation_deg: sun.elevation_deg,
+        ground_m: ctx.ground,
+        observer_m: z0,
+        meters_per_pixel: ctx.dsm.meters_per_pixel,
+        buildings_loaded: ctx.buildings.len(),
+        sunlit: !blocked && sun.is_up(),
+        steps,
     }))
 }
 
@@ -529,6 +796,10 @@ struct Terrace {
     lat: f64,
     lng: f64,
     sunlit: bool,
+    /// Ce qui bloque le soleil (absent si `sunlit`) — sert au debug visuel
+    /// côté client : « c'est cet immeuble-là qui te met à l'ombre ».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<Blocker>,
     elevation_m: f32,
     /// Champs OSM optionnels — couverture très inégale selon les POI.
     website: Option<String>,
@@ -614,7 +885,7 @@ async fn terraces(
     // terrasse (cf. commentaire dans classify() — un POI mal placé dans un
     // bâtiment côté OSM ne doit pas hériter de l'altitude du toit).
     let terrain_only = dsm.clone();
-    add_buildings(&state, &mut dsm, origin_x, origin_y).await?;
+    let (buildings, owner) = add_buildings(&state, &mut dsm, origin_x, origin_y).await?;
 
     let mid_lat = (s + n) / 2.0;
     let mid_lng = (w + e) / 2.0;
@@ -632,13 +903,19 @@ async fn terraces(
             let px = wx - origin_x;
             let py = wy - origin_y;
             let ground = terrain_only.sample(px, py).unwrap_or(0.0);
+            let hit = sun
+                .is_up()
+                .then(|| shadow_hit_from_ground(&dsm, &sun, px, py, ground, &params))
+                .flatten();
             Terrace {
                 id: p.id.clone(),
                 name: p.name.clone(),
                 amenity: p.amenity.clone(),
                 lat: p.lat,
                 lng: p.lng,
-                sunlit: sun.is_up() && !is_shadowed_from_ground(&dsm, &sun, px, py, ground, &params),
+                sunlit: sun.is_up() && hit.is_none(),
+                blocker: hit
+                    .map(|h| describe_blocker(&h, &dsm, &owner, &buildings, origin_x, origin_y)),
                 elevation_m: ground,
                 website: p.website.clone(),
                 phone: p.phone.clone(),
@@ -867,12 +1144,17 @@ out center 500;"#
     Ok(arc)
 }
 
-/// Emprise rectangulaire d'un bâtiment (bbox de son empreinte OSM) + hauteur.
+/// Emprise d'un bâtiment OSM (anneau extérieur) + hauteur retenue.
 #[derive(Clone)]
 struct Building {
+    /// Identifiant OSM du way, pour pouvoir désigner le coupable côté client.
+    id: u64,
+    name: Option<String>,
     /// Anneau extérieur du polygone (lat, lon), tel que renvoyé par Overpass.
     ring: Vec<(f64, f64)>,
     height_m: f32,
+    /// `false` = hauteur devinée (`DEFAULT_BUILDING_HEIGHT_M`), pas taggée.
+    height_from_osm: bool,
 }
 
 /// Fetch Overpass des bâtiments (`building=*`) de la zone, cache mémoire par
@@ -885,23 +1167,27 @@ async fn overpass_buildings(
     n: f64,
     e: f64,
 ) -> Result<Arc<Vec<Building>>, (StatusCode, String)> {
-    // DEBUG : même principe que overpass_terraces — clé fixe, un seul fetch
-    // pour toute la durée de vie du process. Seul le calcul soleil/ombre
-    // (dépendant de `t`) doit varier entre requêtes ; la géométrie
-    // (bâtiments, relief) est figée sur la zone du premier appel.
-    let key = "DEBUG_ALL".to_string();
+    // Clé = bbox arrondie. Contrairement aux POI/arbres, les bâtiments ne sont
+    // PAS mis en cache global "DEBUG_ALL" : ils définissent la géométrie des
+    // ombres, et réutiliser ceux d'une autre zone donne des résultats faux.
+    // Les bbox demandées sont de toute façon alignées sur les tuiles, donc la
+    // clé est stable et le cache efficace.
+    let key = format!("{s:.5},{w:.5},{n:.5},{e:.5}");
     if let Some(hit) = state.buildings.read().await.get(&key) {
         return Ok(hit.clone());
     }
 
+    // Pas de plafond sur `out geom` : une bbox de 3×3 tuiles au cœur de Paris
+    // contient ~7 700 bâtiments, un `out geom 5000` en perdait un tiers — donc
+    // autant de casters d'ombre absents de la DSM.
     let query = format!(
-        r#"[out:json][timeout:25];
+        r#"[out:json][timeout:60];
 way["building"]({s},{w},{n},{e});
-out geom 5000;"#
+out geom;"#
     );
     let raw: BuildingsResponse = overpass_query(state, &query).await?;
 
-    let buildings: Vec<Building> = raw
+    let mut buildings: Vec<Building> = raw
         .elements
         .into_iter()
         .filter_map(|el| {
@@ -911,18 +1197,51 @@ out geom 5000;"#
             }
             let ring: Vec<(f64, f64)> = geometry.iter().map(|n| (n.lat, n.lon)).collect();
             let tags = el.tags.unwrap_or_default();
-            let height_m = tags
+            let tagged = tags
                 .get("height")
-                .and_then(|h| h.trim_end_matches(" m").parse::<f32>().ok())
+                .and_then(|h| parse_meters(Some(h)).map(|v| v as f32))
                 .or_else(|| {
                     tags.get("building:levels")
-                        .and_then(|l| l.parse::<f32>().ok())
-                        .map(|levels| levels * 3.0)
-                })
-                .unwrap_or(DEFAULT_BUILDING_HEIGHT_M);
-            Some(Building { ring, height_m })
+                        .and_then(|l| l.trim().parse::<f32>().ok())
+                        // 3 m par niveau + ~3 m de comble/toiture, sinon les
+                        // immeubles haussmanniens sortent trop bas.
+                        .map(|levels| levels * 3.0 + 3.0)
+                });
+            Some(Building {
+                id: el.id,
+                name: tags.get("name").cloned(),
+                ring,
+                height_m: tagged.unwrap_or(f32::NAN), // comblé juste après
+                height_from_osm: tagged.is_some(),
+            })
         })
         .collect();
+
+    // Défaut local plutôt que global : ~30 % des bâtiments parisiens n'ont
+    // aucun tag de hauteur, et 9 m (3 étages) sous-estime largement un tissu
+    // haussmannien à 20 m — leurs ombres portées disparaissaient. On prend la
+    // médiane des hauteurs connues de la zone, qui s'adapte au quartier.
+    let mut known: Vec<f32> = buildings
+        .iter()
+        .filter(|b| b.height_from_osm)
+        .map(|b| b.height_m)
+        .collect();
+    known.sort_by(f32::total_cmp);
+    let fallback = if known.is_empty() {
+        DEFAULT_BUILDING_HEIGHT_M
+    } else {
+        known[known.len() / 2].clamp(6.0, 40.0)
+    };
+    for b in buildings.iter_mut().filter(|b| !b.height_from_osm) {
+        b.height_m = fallback;
+    }
+
+    println!(
+        "[buildings] {key} → {} bâtiments ({} avec hauteur OSM, {} au défaut local {fallback:.1} m)",
+        buildings.len(),
+        known.len(),
+        buildings.len() - known.len()
+    );
 
     let arc = Arc::new(buildings);
     state.buildings.write().await.insert(key, arc.clone());
@@ -936,6 +1255,7 @@ struct BuildingsResponse {
 
 #[derive(Deserialize)]
 struct BuildingElement {
+    id: u64,
     tags: Option<HashMap<String, String>>,
     geometry: Option<Vec<GeomNode>>,
 }
