@@ -121,23 +121,118 @@ out geom;"#
     Ok(parse_buildings(raw))
 }
 
+/// Hauteur d'un bâtiment d'après ses tags. `None` = non taggé, à combler par
+/// [`fill_missing_heights`].
+///
+/// **Règle métier partagée** : ce sont les mêmes tags quelle que soit la
+/// provenance de la donnée (Overpass ou extrait PBF), donc la règle vit ici et
+/// nulle part ailleurs. Elle a coûté assez de mises au point pour ne pas être
+/// réécrite en double.
+pub fn height_from_tags(tags: &HashMap<String, String>) -> Option<f32> {
+    tags.get("height")
+        .and_then(|h| parse_meters(Some(h)).map(|v| v as f32))
+        .or_else(|| {
+            tags.get("building:levels")
+                .and_then(|l| l.trim().parse::<f32>().ok())
+                // 3 m par niveau + ~3 m de comble/toiture, sinon les immeubles
+                // haussmanniens sortent trop bas.
+                .map(|levels| levels * 3.0 + 3.0)
+        })
+        .filter(|h| h.is_finite() && *h > 0.0)
+}
+
+/// Comble les hauteurs manquantes par la médiane locale du lot.
+///
+/// Défaut local plutôt que global : ~30 % des bâtiments parisiens n'ont aucun
+/// tag de hauteur, et 9 m (3 étages) sous-estime largement un tissu
+/// haussmannien à 20 m — leurs ombres portées disparaissaient. La médiane des
+/// hauteurs connues du lot s'adapte au quartier.
+///
+/// Les bâtiments sans hauteur doivent arriver avec `height_m` à `NaN` et
+/// `height_from_osm` à `false`.
+pub fn fill_missing_heights(buildings: &mut [Building]) -> f32 {
+    let mut known: Vec<f32> = buildings
+        .iter()
+        .filter(|b| b.height_from_osm)
+        .map(|b| b.height_m)
+        .collect();
+    known.sort_by(f32::total_cmp);
+    let fallback = if known.is_empty() {
+        DEFAULT_BUILDING_HEIGHT_M
+    } else {
+        known[known.len() / 2].clamp(6.0, 40.0)
+    };
+    for b in buildings.iter_mut().filter(|b| !b.height_from_osm) {
+        b.height_m = fallback;
+    }
+    fallback
+}
+
+/// Assemble un bâtiment à partir de ses tags et de ses anneaux déjà résolus.
+/// `height_m` reste `NaN` si rien n'est taggé — cf. [`fill_missing_heights`].
+pub fn building_from(
+    osm_id: String,
+    tags: &HashMap<String, String>,
+    rings: Vec<Vec<(f64, f64)>>,
+) -> Option<Building> {
+    let rings: Vec<Vec<(f64, f64)>> = rings.into_iter().filter(|r| r.len() >= 3).collect();
+    if rings.is_empty() {
+        return None;
+    }
+    let tagged = height_from_tags(tags);
+    Some(Building {
+        osm_id,
+        name: tags.get("name").cloned(),
+        rings,
+        height_m: tagged.unwrap_or(f32::NAN),
+        height_from_osm: tagged.is_some(),
+    })
+}
+
+/// Arbre à partir de ses tags. Mêmes replis quelle que soit la source.
+pub fn tree_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, String>) -> Tree {
+    let height_m = parse_meters(tags.get("height")).unwrap_or(10.0).min(40.0);
+    let crown_radius_m = parse_meters(tags.get("diameter_crown"))
+        .map(|d| d / 2.0)
+        .unwrap_or_else(|| (height_m * 0.3).clamp(2.0, 6.0));
+    Tree {
+        osm_id,
+        lat,
+        lng,
+        height_m,
+        crown_radius_m,
+    }
+}
+
+/// POI terrasse à partir de ses tags.
+pub fn poi_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, String>) -> Poi {
+    Poi {
+        osm_id,
+        name: tags.get("name").cloned(),
+        amenity: tags.get("amenity").cloned(),
+        lat,
+        lng,
+        // Website/téléphone : "contact:*" en repli si le tag simple manque.
+        website: tags
+            .get("website")
+            .or_else(|| tags.get("contact:website"))
+            .cloned(),
+        phone: tags
+            .get("phone")
+            .or_else(|| tags.get("contact:phone"))
+            .cloned(),
+        opening_hours: tags.get("opening_hours").cloned(),
+        cuisine: tags.get("cuisine").cloned(),
+        wikidata: tags.get("wikidata").cloned(),
+    }
+}
+
 fn parse_buildings(raw: BuildingsResponse) -> Vec<Building> {
     let mut buildings: Vec<Building> = raw
         .elements
         .into_iter()
         .filter_map(|el| {
             let tags = el.tags.unwrap_or_default();
-            let tagged = tags
-                .get("height")
-                .and_then(|h| parse_meters(Some(h)).map(|v| v as f32))
-                .or_else(|| {
-                    tags.get("building:levels")
-                        .and_then(|l| l.trim().parse::<f32>().ok())
-                        // 3 m par niveau + ~3 m de comble/toiture, sinon les
-                        // immeubles haussmanniens sortent trop bas.
-                        .map(|levels| levels * 3.0 + 3.0)
-                })
-                .filter(|h| h.is_finite() && *h > 0.0);
 
             // Un way donne un anneau. Une relation en donne plusieurs, et on
             // garde AUSSI les "inner" : la rasterisation pair-impair s'en sert
@@ -154,41 +249,14 @@ fn parse_buildings(raw: BuildingsResponse) -> Vec<Building> {
                 _ => Vec::new(),
             }
             .into_iter()
-            .filter(|r| r.len() >= 3)
             .map(|r| r.iter().map(|node| (node.lat, node.lon)).collect())
             .collect();
 
-            if rings.is_empty() {
-                return None;
-            }
-            Some(Building {
-                osm_id: format!("{}/{}", el.element_type, el.id),
-                name: tags.get("name").cloned(),
-                rings,
-                height_m: tagged.unwrap_or(f32::NAN), // comblé juste après
-                height_from_osm: tagged.is_some(),
-            })
+            building_from(format!("{}/{}", el.element_type, el.id), &tags, rings)
         })
         .collect();
 
-    // Défaut local plutôt que global : ~30 % des bâtiments parisiens n'ont
-    // aucun tag de hauteur, et 9 m (3 étages) sous-estime largement un tissu
-    // haussmannien à 20 m — leurs ombres portées disparaissaient. La médiane
-    // des hauteurs connues de la zone s'adapte au quartier.
-    let mut known: Vec<f32> = buildings
-        .iter()
-        .filter(|b| b.height_from_osm)
-        .map(|b| b.height_m)
-        .collect();
-    known.sort_by(f32::total_cmp);
-    let fallback = if known.is_empty() {
-        DEFAULT_BUILDING_HEIGHT_M
-    } else {
-        known[known.len() / 2].clamp(6.0, 40.0)
-    };
-    for b in buildings.iter_mut().filter(|b| !b.height_from_osm) {
-        b.height_m = fallback;
-    }
+    fill_missing_heights(&mut buildings);
     buildings
 }
 
@@ -214,17 +282,12 @@ out;"#
         .filter_map(|el| {
             let (lat, lng) = (el.lat?, el.lon?);
             let tags = el.tags.unwrap_or_default();
-            let height_m = parse_meters(tags.get("height")).unwrap_or(10.0).min(40.0);
-            let crown_radius_m = parse_meters(tags.get("diameter_crown"))
-                .map(|d| d / 2.0)
-                .unwrap_or_else(|| (height_m * 0.3).clamp(2.0, 6.0));
-            Some(Tree {
-                osm_id: format!("{}/{}", el.element_type, el.id),
+            Some(tree_from(
+                format!("{}/{}", el.element_type, el.id),
                 lat,
                 lng,
-                height_m,
-                crown_radius_m,
-            })
+                &tags,
+            ))
         })
         .collect())
 }
@@ -255,25 +318,12 @@ out center;"#
                 _ => return None,
             };
             let tags = el.tags.unwrap_or_default();
-            // Website/téléphone : "contact:*" en repli si le tag simple manque.
-            Some(Poi {
-                osm_id: format!("{}/{}", el.element_type, el.id),
-                name: tags.get("name").cloned(),
-                amenity: tags.get("amenity").cloned(),
+            Some(poi_from(
+                format!("{}/{}", el.element_type, el.id),
                 lat,
                 lng,
-                website: tags
-                    .get("website")
-                    .or_else(|| tags.get("contact:website"))
-                    .cloned(),
-                phone: tags
-                    .get("phone")
-                    .or_else(|| tags.get("contact:phone"))
-                    .cloned(),
-                opening_hours: tags.get("opening_hours").cloned(),
-                cuisine: tags.get("cuisine").cloned(),
-                wikidata: tags.get("wikidata").cloned(),
-            })
+                &tags,
+            ))
         })
         .collect())
 }

@@ -8,3 +8,4 @@
 pub mod db;
 pub mod dem;
 pub mod osm;
+pub mod pbf;

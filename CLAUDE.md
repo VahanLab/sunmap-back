@@ -48,9 +48,17 @@ Fonctionnalités cibles :
 6. **Géométrie OSM en PostgreSQL/PostGIS**, plus d'Overpass au runtime.
    Overpass met 5-20 s par bbox dense, répond 504 aux heures de pointe et
    impose une politesse incompatible avec une requête par déplacement de
-   carte. Il ne sert plus qu'au binaire `ingest`, qui remplit la base par
-   tuiles (reprenable via `ingest_log`). Requêtes par bbox servies par index
-   GIST. Schéma : `helios-server/schema.sql`.
+   carte. Requêtes par bbox servies par index GIST. Schéma :
+   `helios-server/schema.sql`.
+7. **Remplissage de la base par extrait PBF + osmium** (`scripts/osm-extract.sh`
+   puis `bin/import`), pas par Overpass. Overpass par tuiles demandait 192
+   requêtes et ~45 min pour Paris seul, avec 27 échecs au premier essai —
+   irréaliste à l'échelle de la France, et abusif envers un service gratuit
+   partagé. L'extrait Geofabrik se traite en local en ~1 min. `bin/ingest`
+   (Overpass) est conservé pour rafraîchir une petite zone. Les deux écrivent
+   les mêmes identifiants et partagent les mêmes règles tags → hauteur
+   (`osm::building_from`, `osm::height_from_tags`) : ne jamais dupliquer ces
+   règles, elles ont coûté cher à mettre au point.
 6. Animation fluide du slider (préoccupation UX forte) — options par ordre :
    1. Cross-fade de rasters préfetchés (pas de 10 min) — MVP, drapé auto sur
       terrain Mapbox.

@@ -16,8 +16,10 @@ Overpass ne sert plus qu'à remplir la base, hors du chemin de requête.
 createdb sunmap
 psql -d sunmap -f helios-server/schema.sql
 
-# 2. Ingestion de la géométrie (Paris par défaut, ~15 min, reprenable)
-cargo run --release --bin ingest
+# 2. Géométrie : extrait Geofabrik + osmium (cf. « Ingestion » ci-dessous)
+curl -O https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf
+scripts/osm-extract.sh ile-de-france-latest.osm.pbf extrait.geojsonl
+cargo run --release --bin import -- extrait.geojsonl
 
 # 3. Serveur
 cargo run --release --bin helios-server   # port 8080
@@ -25,7 +27,29 @@ cargo run --release --bin helios-server   # port 8080
 
 `DATABASE_URL` surcharge la connexion (défaut `postgres://localhost/sunmap`).
 
-### Ingestion
+### Ingestion : deux chemins
+
+**`import` (extrait PBF) — la voie normale.** Un extrait
+[Geofabrik](https://download.geofabrik.de/europe/france.html) est filtré et
+converti par `osmium`, puis chargé en base. Déterministe, reproductible,
+versionnable, et sans solliciter de service tiers.
+
+```bash
+scripts/osm-extract.sh <entrée.osm.pbf> [sortie.geojsonl]
+cargo run --release --bin import -- sortie.geojsonl
+# ou en flux, sans fichier intermédiaire :
+osmium export ... -f geojsonseq | cargo run --release --bin import
+```
+
+Mesuré sur l'emprise Paris (extrait Île-de-France, 336 Mo) : **45 s**
+d'extraction osmium, **50 s** d'import, **181 Mo** de RSS crête, pour 357 498
+emprises, 212 973 arbres et 3 931 terrasses.
+
+**`ingest` (Overpass par tuiles) — dépannage seulement.** Utile pour
+rafraîchir une petite zone sans re-télécharger un extrait. Ne pas l'utiliser
+au-delà d'une ville : l'ingestion de Paris demandait 192 requêtes réseau et
+~45 min, avec 27 échecs au premier essai — et c'est un abus d'une ressource
+gratuite partagée.
 
 ```bash
 cargo run --release --bin ingest                 # Paris, les 3 couches
@@ -34,13 +58,17 @@ cargo run --release --bin ingest -- --force      # réingère tout
 INGEST_BBOX="48.5,2.0,49.0,2.7" cargo run --release --bin ingest
 ```
 
-La zone est découpée en 8×8 tuiles traitées une par une, chaque tuile réussie
-étant tracée dans `ingest_log`. Une interruption (504, coupure, Ctrl-C) se
-reprend en relançant la commande : les tuiles déjà absorbées sont sautées.
+La zone est découpée en 8×8 tuiles, chaque tuile réussie étant tracée dans
+`ingest_log` : une interruption se reprend en relançant la commande.
 
-La bbox Paris par défaut déborde d'environ 1,5 km. Ce n'est pas cosmétique :
-un immeuble hors zone porte quand même ombre à l'intérieur — au soleil rasant
-(5°), 20 m de haut projettent 230 m.
+Les deux chemins écrivent les **mêmes identifiants** (`way/123`,
+`relation/456`) et partagent les mêmes règles tags → hauteur, donc ils se
+dédoublonnent : vérifié sur 206 103 emprises ingérées par Overpass puis
+réécrites par `import`, 99,98 % ont été reconnues.
+
+Penser à prendre une emprise plus large que la zone servie : un immeuble hors
+zone porte quand même ombre à l'intérieur — au soleil rasant (5°), 20 m de
+haut projettent 230 m.
 
 ## Capacités et limites
 
