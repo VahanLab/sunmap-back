@@ -4,41 +4,75 @@ Serveur axum répondant à la question : **« ce point GPS est-il au soleil à
 l'instant t ? »** en tenant compte du relief **et des bâtiments** (ray
 marching sur DSM, moteur `helios-core`).
 
-## Lancer
+## Mise en route
+
+La géométrie OSM vit dans PostgreSQL/PostGIS, pas dans Overpass : l'API
+publique met 5 à 20 s par bbox dense, répond 504 aux heures de pointe et
+impose une politesse incompatible avec une requête par déplacement de carte.
+Overpass ne sert plus qu'à remplir la base, hors du chemin de requête.
 
 ```bash
-cargo run -p helios-server            # debug, port 8080
-cargo run -p helios-server --release  # prod
+# 1. Base + schéma (PostGIS requis)
+createdb sunmap
+psql -d sunmap -f helios-server/schema.sql
+
+# 2. Ingestion de la géométrie (Paris par défaut, ~15 min, reprenable)
+cargo run --release --bin ingest
+
+# 3. Serveur
+cargo run --release --bin helios-server   # port 8080
 ```
+
+`DATABASE_URL` surcharge la connexion (défaut `postgres://localhost/sunmap`).
+
+### Ingestion
+
+```bash
+cargo run --release --bin ingest                 # Paris, les 3 couches
+cargo run --release --bin ingest -- buildings    # une seule couche
+cargo run --release --bin ingest -- --force      # réingère tout
+INGEST_BBOX="48.5,2.0,49.0,2.7" cargo run --release --bin ingest
+```
+
+La zone est découpée en 8×8 tuiles traitées une par une, chaque tuile réussie
+étant tracée dans `ingest_log`. Une interruption (504, coupure, Ctrl-C) se
+reprend en relançant la commande : les tuiles déjà absorbées sont sautées.
+
+La bbox Paris par défaut déborde d'environ 1,5 km. Ce n'est pas cosmétique :
+un immeuble hors zone porte quand même ombre à l'intérieur — au soleil rasant
+(5°), 20 m de haut projettent 230 m.
 
 ## Capacités et limites
 
 | Capacité | Détail |
 |---|---|
-| Relief | Tuiles DEM Mapterhorn z15 (~2,4 m/px à 45° lat), webp 512 px, encodage Terrarium |
-| Bâtiments | Overpass `building=*`, rasterisés en emprise **rectangulaire** (bbox de l'empreinte, pas le polygone réel — cf. limites) dans la même DSM que le relief. Hauteur : tag `height`, sinon `building:levels × 3 m`, sinon 9 m par défaut |
-| Marge de casters | Assemblage 3×3 tuiles autour du point → les ombres portées venant jusqu'à ~1,2 km hors de la tuile centrale sont prises en compte |
-| Distance de recherche | 5 km max le long du rayon (borne recoupée avec l'altitude max de la grille — early exit) |
-| Hauteur d'observateur | Paramètre `observer_height` (m) : 0 = sol, 1.5 ≈ personne attablée (cas « tête au soleil, pieds à l'ombre ») |
+| Relief | Tuiles DEM Mapterhorn z15 (~1,57 m/px à Paris), webp 512 px, encodage Terrarium — même source que le rendu iOS |
+| Bâtiments | PostGIS. `way[building]`, `way[building:part]` et `relation[building]` (multipolygones), rasterisés en **vrai polygone** (scanline, règle pair-impair) — les cours intérieures restent creuses. Hauteur : tag `height`, sinon `building:levels × 3 m + 3 m` de toiture, sinon **médiane locale** du quartier |
+| Marge de casters | Assemblage 3×3 tuiles autour du point → ombres portées venant jusqu'à ~1,2 km hors tuile centrale |
+| Distance de recherche | 5 km max le long du rayon (recoupée avec l'altitude max de la grille — early exit) |
+| Hauteur d'observateur | `observer_height` (m) : 0 = sol, 1.5 ≈ personne attablée (« tête au soleil, pieds à l'ombre ») |
 | Position solaire | Algorithme NOAA (~0,01°), UTC |
-| Cache | Tuiles décodées gardées en RAM (clé z/x/y) — première requête sur une zone ≈ 1-2 s (fetch 9 tuiles), suivantes < 50 ms |
-| Couverture | Monde (bounds Mapterhorn ±85°) |
+| Traçage | Toute réponse « à l'ombre » nomme l'obstacle (`blocker`) : id OSM, hauteur, distance, de combien il dépasse le rayon |
+| Cache | Tuiles DEM et emprises en RAM ; résultats `/terraces` par (bbox, tranche de 5 min, hauteur) |
 
 **Limites actuelles :**
-- **Bâtiments approximés en rectangle** : chaque bâtiment est rasterisé sur
-  la bbox de son empreinte, pas son polygone réel — sous-estime les coins
-  d'un bâtiment en L ou aux formes très irrégulières (l'ombre portée déborde
-  légèrement moins ou plus que la réalité selon la forme). Prochaine étape :
-  vraie rasterisation polygone (scanline).
-- **Arbres non inclus** : canopée absente de la DSM (backlog, cf. CLAUDE.md
-  racine — atténuation saisonnière, Meta/WRI CHM).
-- Deux requêtes Overpass par appel (POI + bâtiments) : latence à froid plus
-  élevée qu'avant (cache par bbox partagé, donc amorti sur les requêtes
-  suivantes).
-- Ombres venant de plus de ~1,2 km hors tuile centrale ignorées (soleil très
-  rasant en haute montagne : rare mais possible).
-- Cache RAM non borné, pas de persistance (redémarrage = cache vide).
-- Pas d'auth, pas de rate limiting : usage interne/dev.
+
+- **Résolution z15 = 1,57 m/px.** Limite pour les cours et les ruelles : une
+  cour de 6 m ne fait que 4 pixels. z16 réglerait ça au prix de 4× les données.
+- **Classification binaire au point** : une terrasse est un polygone,
+  potentiellement mi-ombre/mi-soleil. Prochaine étape prévue : échantillonner
+  3-5 points dans un buffer côté rue et renvoyer un pourcentage.
+- **Déport aveugle à la rue.** Les nœuds OSM d'un bar sont posés sur le
+  bâtiment et non sur sa terrasse (419 POI sur 422 dans une zone test) : le
+  serveur ressort donc le point sur le sol libre le plus proche avant de
+  calculer, et l'expose en `snapped_*`. Mais il ne sait pas de quel côté est
+  la rue — pour une terrasse en angle il peut sortir du mauvais côté.
+- **Arbres absents de la DSM** : la canopée ne porte pas ombre (backlog, cf.
+  CLAUDE.md racine).
+- Le DEM Mapterhorn n'est pas parfaitement bare-earth partout : quelques
+  bloqueurs ressortent en `terrain` à très courte distance.
+- Cache RAM non borné, pas de persistance. Pas d'auth ni de rate limiting :
+  usage interne/dev.
 
 ## Endpoints
 
@@ -50,156 +84,194 @@ Un seul point.
 |---|---|---|---|
 | `lat` | f64 | oui | Latitude WGS84 (−85…85) |
 | `lng` | f64 | oui | Longitude WGS84 (−180…180) |
-| `t` | string | non | Instant : RFC3339 (`2026-07-25T18:30:00Z`) ou secondes Unix (`1785004200`). Défaut : maintenant |
+| `t` | string | non | RFC3339 (`2026-07-25T18:30:00Z`) ou secondes Unix. Défaut : maintenant |
 | `observer_height` | f64 | non | Hauteur de l'observateur en mètres. Défaut : 0 |
 
 ```bash
-curl "http://localhost:8080/sunlit?lat=45.9237&lng=6.8694&t=2026-07-25T18:30:00Z"
+curl "http://localhost:8080/sunlit?lat=48.8611&lng=2.3493&t=2026-07-26T13:00:00Z&observer_height=1.5"
 ```
-
-Réponse `200` :
 
 ```json
 {
   "sunlit": false,
-  "elevation_m": 1035.6,
-  "sun_azimuth_deg": 292.5,
-  "sun_elevation_deg": 5.5,
-  "t_unix": 1785004200.0
+  "elevation_m": 35.56,
+  "sun_azimuth_deg": 208.7,
+  "sun_elevation_deg": 57.9,
+  "t_unix": 1785070800.0,
+  "blocker": {
+    "id": "way/206810022",
+    "name": null,
+    "height_m": 27.0,
+    "height_from_osm": true,
+    "lat": 48.860995, "lng": 2.349240,
+    "distance_m": 12.57,
+    "obstacle_elevation_m": 62.55,
+    "ray_elevation_m": 57.10
+  }
 }
 ```
 
 | Champ | Description |
 |---|---|
 | `sunlit` | `true` = au soleil, `false` = à l'ombre (ou nuit si `sun_elevation_deg` ≤ 0) |
-| `elevation_m` | Altitude du point d'après la DSM |
-| `sun_azimuth_deg` | Azimut du soleil, degrés depuis le nord, sens horaire |
-| `sun_elevation_deg` | Élévation du soleil au-dessus de l'horizon (négatif = nuit) |
-| `t_unix` | Instant évalué, secondes Unix |
+| `elevation_m` | Altitude du point sur le **relief seul** (jamais un toit) |
+| `blocker` | Absent si au soleil. `id` = `way/…`, `relation/…` ou `"terrain"` ; `height_from_osm: false` = hauteur estimée, première cause d'écart avec la réalité |
 
 ### `POST /sunlit/batch`
 
-Plusieurs points au même instant (classification de terrasses). Corps JSON :
-
-| Champ | Type | Obligatoire | Description |
-|---|---|---|---|
-| `points` | `[{lat, lng}]` | oui | Liste de points |
-| `t` | string | non | Comme pour GET |
-| `observer_height` | f64 | non | Commun à tous les points |
-
-```bash
-curl -X POST http://localhost:8080/sunlit/batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "points": [
-      {"lat": 45.9237, "lng": 6.8694},
-      {"lat": 45.8790, "lng": 6.8878}
-    ],
-    "t": "2026-07-25T18:30:00Z",
-    "observer_height": 1.5
-  }'
-```
-
-Réponse `200` : tableau de réponses au même format que le GET, dans l'ordre
-des points d'entrée.
+Plusieurs points au même instant. Corps JSON : `points` (`[{lat, lng}]`), `t`,
+`observer_height`. Réponse : tableau au format du GET, dans l'ordre d'entrée.
 
 ### `GET /terraces`
 
-Bars/restaurants/cafés avec terrasse (OSM `outdoor_seating=yes` via Overpass)
-dans une bounding box, classés soleil/ombre à l'instant t. Pensé pour le
-front : une requête par viewport, le switch soleil/ombre filtre côté client
-sur le champ `sunlit`.
+Bars/restaurants/cafés avec terrasse dans une bounding box, classés
+soleil/ombre à l'instant t. Une requête par viewport ; le switch soleil/ombre
+filtre côté client sur `sunlit`.
 
 | Paramètre | Type | Obligatoire | Description |
 |---|---|---|---|
 | `bbox` | string | oui | `min_lon,min_lat,max_lon,max_lat` (max ~3 km de côté) |
-| `t` | string | non | RFC3339 ou secondes Unix. Défaut : maintenant |
-| `observer_height` | f64 | non | Défaut : **1.5** (personne attablée) |
-
-```bash
-curl "http://localhost:8080/terraces?bbox=6.860,45.917,6.880,45.930&t=2026-07-25T18:30:00Z"
-```
-
-Réponse `200` :
+| `t` | string | non | Défaut : maintenant |
+| `observer_height` | f64 | non | Défaut : **1.5** |
 
 ```json
 {
-  "t_unix": 1785004200.0,
-  "sun_azimuth_deg": 292.5,
-  "sun_elevation_deg": 5.5,
-  "count": 16,
+  "t_unix": 1785070800.0,
+  "sun_azimuth_deg": 208.7, "sun_elevation_deg": 57.9,
+  "count": 422,
   "terraces": [
     {
-      "id": "node/2298691508",
-      "name": "Le Chamonix",
-      "amenity": "bar",
-      "lat": 45.9235,
-      "lng": 6.8697,
-      "sunlit": false,
-      "elevation_m": 1037.0
+      "id": "node/2298691508", "name": "Les Acrobates", "amenity": "bar",
+      "lat": 48.8575, "lng": 2.3496,
+      "sunlit": true,
+      "snapped_lat": 48.85750, "snapped_lng": 2.34947, "snapped_distance_m": 6.3,
+      "elevation_m": 35.6,
+      "website": null, "phone": null, "opening_hours": null,
+      "cuisine": null, "wikidata": null
     }
   ]
 }
 ```
 
-Notes :
-- Source POI : Overpass (`amenity=bar|restaurant|cafe` + `outdoor_seating=yes`),
-  centroïde pour les bâtiments (ways). Cache mémoire par bbox — première
-  requête sur une zone : 1-5 s (Overpass), suivantes : tuiles + POI en cache.
-- **Classification binaire au centroïde** (limite POC) : une terrasse est un
-  polygone, potentiellement mi-ombre/mi-soleil. Prochaine étape :
-  échantillonner 3-5 points dans un buffer côté rue et renvoyer un
-  pourcentage d'ensoleillement.
-- Un POI dont les coordonnées OSM tombent à l'intérieur d'un bâtiment
-  (défaut de saisie fréquent) peut ressortir « à l'ombre toute la journée » —
-  piégé sous son propre toit stampé. L'altitude de l'observateur est bien
-  prise sur le relief seul (pas de faux `sunlit: true`), mais le test
-  d'obstruction utilise encore la DSM avec bâtiments y compris le sien.
+Les champs `snapped_*` sont absents si le nœud OSM était déjà sur du sol
+libre. Sinon ils donnent le point **réellement classé** : c'est ce qui permet
+au client d'afficher le déport et de distinguer « le calcul est faux » de « le
+calcul porte sur un autre endroit ».
 
 ### `GET /sun-hours`
 
-Un point, une journée : les heures au soleil et à l'ombre. Pensé pour
-l'appui long sur la carte côté app — statut immédiat + timeline complète.
+Un point, une journée : heures au soleil et à l'ombre. Pensé pour l'appui long
+sur la carte — statut immédiat + timeline.
 
 | Paramètre | Type | Obligatoire | Description |
 |---|---|---|---|
-| `lat`, `lng` | f64 | oui | Coordonnées du point |
-| `t` | string | non | N'importe quel instant DANS la journée voulue (RFC3339 ou secondes Unix). La journée = jour calendaire **UTC** contenant `t`. Défaut : maintenant |
-| `observer_height` | f64 | non | Défaut **1.5** (terrasse/personne assise) |
-
-```bash
-curl "http://localhost:8080/sun-hours?lat=48.8566&lng=2.3522&t=2026-07-25T17:00:00Z"
-```
-
-Réponse `200` :
+| `lat`, `lng` | f64 | oui | Coordonnées |
+| `t` | string | non | N'importe quel instant DANS la journée voulue. La journée = jour calendaire **UTC** contenant `t` |
+| `observer_height` | f64 | non | Défaut **1.5** |
 
 ```json
 {
   "lat": 48.8566, "lng": 2.3522, "elevation_m": 34.9,
-  "t_unix": 1784998800.0, "sunlit_now": true,
+  "t_unix": 1784998800.0,
+  "sunlit_now": true,
   "day_start_unix": 1784937600.0, "day_end_unix": 1785024000.0,
   "total_sunlit_minutes": 355, "total_shadow_minutes": 1085,
   "intervals": [
-    {"start_unix": 1784937600.0, "end_unix": 1784980500.0, "sunlit": false},
-    {"start_unix": 1784980500.0, "end_unix": 1785001500.0, "sunlit": true}
+    {"start_unix": 1784937600.0, "end_unix": 1784980500.0, "sunlit": false}
   ]
 }
 ```
 
-`intervals` : segments contigus (échantillonnage toutes les 5 min, regroupé),
-`start_unix`/`end_unix` en secondes Unix UTC — le client formate en heure
-locale. Même limites que `/sunlit` (relief + bâtiments, cf. ci-dessus).
+`blocker_now` apparaît quand le point est à l'ombre à `t_unix`, au format de
+`/sunlit`. `intervals` : segments contigus (échantillonnage 5 min, regroupé)
+en secondes Unix UTC — le client formate en heure locale.
+
+### `GET /trees`
+
+Arbres OSM (`natural=tree`) de la bbox — géométrie seule, aucun calcul
+soleil/ombre (le rendu et l'extrusion restent côté client, et la canopée n'est
+pas encore dans la DSM).
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `bbox` | string | oui | `min_lon,min_lat,max_lon,max_lat` |
+
+```json
+{"count": 1284, "trees": [{"lat": 48.8571, "lng": 2.3494, "height_m": 12.0, "crown_radius_m": 3.6}]}
+```
+
+### `GET /building`
+
+Le bâtiment **tel que le moteur d'ombre le voit** à une coordonnée. Sert à
+confronter le rendu (tuiles Mapbox, qui ne portent pas d'identifiant OSM) au
+calcul.
+
+| Paramètre | Type | Obligatoire |
+|---|---|---|
+| `lat`, `lng` | f64 | oui |
+
+```json
+{
+  "found": false,
+  "id": null, "name": null, "height_m": null, "height_from_osm": false,
+  "roof_elevation_m": 35.55, "terrain_elevation_m": 35.56,
+  "nearest": {
+    "id": "relation/2779974", "name": null, "height_m": 18.0,
+    "distance_m": 5.19, "lat": 48.861055, "lng": 2.349284
+  }
+}
+```
+
+`nearest` n'apparaît que si rien n'a été trouvé sous le point. Un immeuble
+bien visible à l'écran mais à 30 m de la coordonnée reçue signale une
+**parallaxe de tap** (le point tapé est déprojeté sur le sol, pas sur le
+volume 3D — à `pitch` élevé l'écart atteint des dizaines de mètres) plutôt
+qu'un trou dans la donnée.
+
+### `GET /debug/ray`
+
+Profil de la DSM le long du rayon solaire, pas à pas : altitude du terrain +
+bâtiments contre altitude du rayon, avec le bâtiment occupant chaque cellule.
+Mêmes paramètres que `/sunlit`. C'est l'outil pour comprendre *pourquoi* un
+point est classé comme il l'est — bâtiment manquant, trop bas, mal placé.
+
+```json
+{
+  "sun_azimuth_deg": 107.7, "sun_elevation_deg": 40.1,
+  "ground_m": 35.56, "observer_m": 37.06, "meters_per_pixel": 1.57,
+  "buildings_loaded": 10826,
+  "sunlit": true,
+  "steps": [
+    {"distance_m": 39.3, "lat": 48.8610, "lng": 2.3497,
+     "dsm_m": 56.9, "ray_m": 70.2,
+     "building": "way/55489269", "building_height_m": 21.0, "blocks": false}
+  ]
+}
+```
 
 ### Erreurs
 
 | Code | Cause |
 |---|---|
 | `400` | `lat`/`lng` hors bornes, `bbox` invalide ou trop grande, `t` invalide |
-| `502` | Tuile Mapterhorn inaccessible/indécodable, ou Overpass en erreur |
+| `500` | Requête PostGIS en erreur (base absente ou non ingérée ?) |
+| `502` | Tuile Mapterhorn inaccessible ou indécodable |
+
+## Schéma PostGIS
+
+Trois tables, une par couche, plus `ingest_log` pour la reprise. Géométries en
+EPSG:4326, index GIST sur chacune. Cf. `schema.sql`, commenté.
+
+| Table | Géométrie | Contenu |
+|---|---|---|
+| `buildings` | `MultiPolygon` | Emprises + hauteur + provenance de la hauteur. Les relations gardent leurs anneaux intérieurs (cours) |
+| `trees` | `Point` | Hauteur et rayon de couronne |
+| `terraces` | `Point` | POI et leurs tags, position OSM **non corrigée** — le déport côté rue dépend de la DSM et se calcule au runtime |
 
 ## Roadmap (cf. CLAUDE.md racine)
 
-- `GET /sun-hours?lat&lng&date` : cumuls (« au soleil jusqu'à 18h40 »)
-- Stamping bâtiments (Overture/OSM) dans la DSM
+- Échantillonnage multi-points par terrasse → pourcentage d'ensoleillement
+  plutôt qu'un booléen, et déport orienté vers la rue
+- Canopée dans la DSM (Meta/WRI CHM + IGN MNS), atténuation saisonnière
 - Tuiles d'ombre raster `GET /shadow/{z}/{x}/{y}.png?t=` si besoin web
 - Cache CDN clé `(z,x,y,jour,tranche 5-10 min)`

@@ -40,11 +40,17 @@ Fonctionnalités cibles :
      relief inclus, cohérence parfaite rendu/query.
    - Si la piste A suffit visuellement, le serveur Rust ne sert **que** les
      queries terrasses (batch + cumuls).
-5. Serveur : Rust (axum prévu), endpoints cibles :
-   - `GET /shadow/{z}/{x}/{y}.png?t=` (tuile d'ombre raster, si piste B/web)
-   - `GET /sunlit?lat&lng&t` + endpoint batch (classification terrasses)
-   - `GET /sun-hours?lat&lng&date` (cumuls, "au soleil jusqu'à…")
-   - Cache CDN : clé `(z,x,y,jour,tranche de 5-10 min)`.
+5. Serveur : Rust/axum, **en place** (cf. `helios-server/README.md`) :
+   - `GET /sunlit` + `POST /sunlit/batch`, `GET /terraces`, `GET /sun-hours`,
+     `GET /trees`, `GET /building`, `GET /debug/ray`.
+   - Reste à faire : `GET /shadow/{z}/{x}/{y}.png?t=` (tuile raster, si piste
+     B/web) et le cache CDN clé `(z,x,y,jour,tranche de 5-10 min)`.
+6. **Géométrie OSM en PostgreSQL/PostGIS**, plus d'Overpass au runtime.
+   Overpass met 5-20 s par bbox dense, répond 504 aux heures de pointe et
+   impose une politesse incompatible avec une requête par déplacement de
+   carte. Il ne sert plus qu'au binaire `ingest`, qui remplit la base par
+   tuiles (reprenable via `ingest_log`). Requêtes par bbox servies par index
+   GIST. Schéma : `helios-server/schema.sql`.
 6. Animation fluide du slider (préoccupation UX forte) — options par ordre :
    1. Cross-fade de rasters préfetchés (pas de 10 min) — MVP, drapé auto sur
       terrain Mapbox.
@@ -62,9 +68,14 @@ Fonctionnalités cibles :
   z17 partiel, attribution « © Mapterhorn »). Remplace l'ancien duo
   AWS `elevation-tiles-prod` (compute) + `mapbox-terrain-dem-v1` (rendu iOS) :
   une seule source pour rendu ET query.
-- **Bâtiments (monde)** : Overture Buildings (GeoParquet, hauteurs ML) ou
-  tuiles vectorielles schéma OpenMapTiles (`render_height`) ; fallback
-  `building:levels × 3 m`.
+- **Bâtiments (en place)** : OSM via Overpass à l'ingestion — `way[building]`,
+  `way[building:part]` (Simple 3D Buildings) ET `relation[building]` (les
+  multipolygones à cour, majoritaires à Paris ; les oublier retirait 41 % des
+  casters). Hauteur : `height`, sinon `building:levels × 3 m + 3 m` de
+  toiture, sinon **médiane locale** du quartier (~30 % des bâtiments
+  parisiens n'ont aucun tag ; un défaut global de 9 m les sous-estimait de
+  moitié). Alternatives non retenues pour l'instant : Overture Buildings
+  (GeoParquet, hauteurs ML), tuiles OpenMapTiles (`render_height`).
 - **France (arme absolue)** : IGN LiDAR HD open data — MNS/MNT/MNH, dalles
   GeoTIFF 1 km × 1 km au pas de 50 cm. Le MNS = terrain + bâtiments +
   végétation → DSM directe sans fusion. Couverture ~80 % fin 2025, complète

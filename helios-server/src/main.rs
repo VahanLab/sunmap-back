@@ -22,6 +22,8 @@ use tokio::sync::RwLock;
 use helios_core::dsm::Dsm;
 use helios_core::shadow::{shadow_hit_from_ground, ShadowHit, ShadowParams};
 use helios_core::sun::sun_position;
+use helios_server::db;
+use helios_server::osm::Building;
 
 const TILE_SIZE: usize = 512;
 /// z15 ≈ 2,4 m/pixel à 45° de latitude : suffisant pour du relief et des
@@ -30,43 +32,64 @@ const ZOOM: u32 = 15;
 const TILE_URL: &str = "https://tiles.mapterhorn.com";
 
 type TileCache = RwLock<HashMap<(u32, u32, u32), Arc<Vec<f32>>>>;
-type PoiCache = RwLock<HashMap<String, Arc<Vec<OverpassPoi>>>>;
+/// Emprises déjà lues en base pour une bbox de tuiles donnée. PostGIS répond
+/// en quelques ms, mais la même fenêtre est redemandée à chaque tick du slider
+/// et le cache évite surtout de refaire le parsing WKT.
 type BuildingCache = RwLock<HashMap<String, Arc<Vec<Building>>>>;
-type TreeCache = RwLock<HashMap<String, Arc<Vec<Tree>>>>;
 /// Résultat déjà calculé de `/terraces` (classification soleil/ombre), par
 /// clé bbox+instant+hauteur d'observateur — évite de refaire tout le ray
 /// marching quand la même requête (même minute, même zone) revient.
 type TerracesResultCache = RwLock<HashMap<String, Arc<TerracesResponse>>>;
-
-/// Hauteur de repli ultime, si *aucun* bâtiment de la zone n'a de tag de
-/// hauteur. Sinon on utilise la médiane locale (cf. `overpass_buildings`).
-const DEFAULT_BUILDING_HEIGHT_M: f32 = 9.0;
 
 /// Valeur de la grille `owner` pour « aucun bâtiment ici » (relief nu).
 const OWNER_TERRAIN: u32 = u32::MAX;
 
 struct AppState {
     http: reqwest::Client,
+    pool: sqlx::PgPool,
     tiles: TileCache,
-    pois: PoiCache,
     buildings: BuildingCache,
-    trees: TreeCache,
     terraces_results: TerracesResultCache,
 }
 
 #[tokio::main]
 async fn main() {
+    let pool = match db::connect().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Connexion PostgreSQL impossible : {e}");
+            eprintln!(
+                "Attendu : {}. Créer avec `createdb sunmap`, appliquer \
+                 `helios-server/schema.sql`, puis remplir avec `cargo run --bin ingest`.",
+                db::DEFAULT_URL
+            );
+            std::process::exit(1);
+        }
+    };
+
+    for (table, label) in [
+        ("buildings", "bâtiments"),
+        ("trees", "arbres"),
+        ("terraces", "terrasses"),
+    ] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(-1);
+        println!("base : {n} {label}");
+    }
+
     let state = Arc::new(AppState {
-        // User-Agent identifiable : requis par Overpass (406 sinon).
+        // Ne sert plus qu'aux tuiles DEM Mapterhorn — la géométrie OSM vient
+        // de PostGIS, plus d'Overpass au runtime.
         http: reqwest::Client::builder()
             .user_agent("sunmap-helios/0.1 (+https://github.com/VahanLab/sunmap-back)")
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("client HTTP"),
+        pool,
         tiles: RwLock::new(HashMap::new()),
-        pois: RwLock::new(HashMap::new()),
         buildings: RwLock::new(HashMap::new()),
-        trees: RwLock::new(HashMap::new()),
         terraces_results: RwLock::new(HashMap::new()),
     });
 
@@ -324,11 +347,37 @@ async fn add_buildings(
 ) -> Result<(Arc<Vec<Building>>, Vec<u32>), (StatusCode, String)> {
     let (north, west) = latlon_of_world_px(origin_x, origin_y);
     let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
-    let buildings = overpass_buildings(state, south, west, north, east).await?;
+    let buildings = load_buildings(state, south, west, north, east).await?;
     let mut owner = vec![OWNER_TERRAIN; dsm.width * dsm.height];
     let terrain = dsm.clone();
     stamp_buildings(dsm, &terrain, &mut owner, origin_x, origin_y, &buildings);
     Ok((buildings, owner))
+}
+
+/// Emprises de la zone, depuis PostGIS. Mémoïsé par bbox : celle-ci est
+/// alignée sur les tuiles DEM, donc la même fenêtre revient à chaque tick du
+/// slider — le cache évite surtout de refaire le parsing WKT, la requête
+/// spatiale elle-même étant servie par l'index GIST en quelques ms.
+async fn load_buildings(
+    state: &AppState,
+    s: f64,
+    w: f64,
+    n: f64,
+    e: f64,
+) -> Result<Arc<Vec<Building>>, (StatusCode, String)> {
+    let key = format!("{s:.5},{w:.5},{n:.5},{e:.5}");
+    if let Some(hit) = state.buildings.read().await.get(&key) {
+        return Ok(hit.clone());
+    }
+
+    let buildings = db::buildings_in_bbox(&state.pool, s, w, n, e)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+    println!("[buildings] {key} → {} emprises", buildings.len());
+
+    let arc = Arc::new(buildings);
+    state.buildings.write().await.insert(key, arc.clone());
+    Ok(arc)
 }
 
 /// Ce qui bloque le soleil sur un point donné, tel que renvoyé aux clients.
@@ -977,21 +1026,6 @@ struct Terrace {
     wikidata: Option<String>,
 }
 
-/// POI brut issu d'Overpass (centroïde pour les ways/relations).
-#[derive(Clone)]
-struct OverpassPoi {
-    id: String,
-    name: Option<String>,
-    amenity: Option<String>,
-    lat: f64,
-    lng: f64,
-    website: Option<String>,
-    phone: Option<String>,
-    opening_hours: Option<String>,
-    cuisine: Option<String>,
-    wikidata: Option<String>,
-}
-
 /// Bars/restaurants/cafés avec terrasse dans la bbox, classés soleil/ombre.
 ///
 /// Limite assumée (POC) : classification binaire au centroïde — une terrasse
@@ -1044,7 +1078,9 @@ async fn terraces(
         ));
     }
 
-    let pois = overpass_terraces(&state, s, w, n, e).await?;
+    let pois = db::terraces_in_bbox(&state.pool, s, w, n, e)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
     let (mut dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
     // Relief seul, avant stamping des bâtiments : sert de sol pour chaque
     // terrasse (cf. commentaire dans classify() — un POI mal placé dans un
@@ -1077,7 +1113,7 @@ async fn terraces(
             let (snapped_lat, snapped_lng) =
                 latlon_of_world_px(origin_x + px, origin_y + py);
             Terrace {
-                id: p.id.clone(),
+                id: p.osm_id.clone(),
                 name: p.name.clone(),
                 amenity: p.amenity.clone(),
                 lat: p.lat,
@@ -1136,9 +1172,8 @@ struct Tree {
 }
 
 /// Arbres OSM (`natural=tree`) de la zone — aucun calcul soleil/ombre ici
-/// (le rendu/l'extrusion restent côté client), juste la géométrie. Cache
-/// global comme `/terraces` : un seul fetch Overpass pour toute la durée de
-/// vie du process, peu importe la bbox demandée.
+/// (le rendu/l'extrusion restent côté client), juste la géométrie servie
+/// depuis PostGIS.
 async fn trees(
     State(state): State<Arc<AppState>>,
     Query(q): Query<TreesQuery>,
@@ -1158,355 +1193,24 @@ async fn trees(
         return Err((StatusCode::BAD_REQUEST, "bbox invalide".into()));
     }
 
-    let trees = overpass_trees(&state, s, w, n, e).await?;
+    let trees: Vec<Tree> = db::trees_in_bbox(&state.pool, s, w, n, e)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?
+        .into_iter()
+        .map(|t| Tree {
+            lat: t.lat,
+            lng: t.lng,
+            height_m: t.height_m,
+            crown_radius_m: t.crown_radius_m,
+        })
+        .collect();
     Ok(Json(TreesResponse {
         count: trees.len(),
-        trees: (*trees).clone(),
+        trees,
     }))
 }
 
-/// "12", "12 m", "12,5" → mètres (tags OSM laxistes).
-fn parse_meters(raw: Option<&String>) -> Option<f64> {
-    let raw = raw?;
-    raw.replace(',', ".")
-        .replace('m', "")
-        .trim()
-        .parse::<f64>()
-        .ok()
-}
 
-async fn overpass_trees(
-    state: &AppState,
-    s: f64,
-    w: f64,
-    n: f64,
-    e: f64,
-) -> Result<Arc<Vec<Tree>>, (StatusCode, String)> {
-    // DEBUG : même principe que overpass_terraces/overpass_buildings — clé
-    // fixe, un seul fetch pour toute la durée de vie du process.
-    let key = "DEBUG_ALL".to_string();
-    if let Some(hit) = state.trees.read().await.get(&key) {
-        return Ok(hit.clone());
-    }
-
-    let query = format!(
-        r#"[out:json][timeout:25];
-node["natural"="tree"]({s},{w},{n},{e});
-out 3000;"#
-    );
-    let raw: OverpassResponse = overpass_query(state, &query).await?;
-
-    let trees: Vec<Tree> = raw
-        .elements
-        .into_iter()
-        .filter_map(|el| {
-            let (lat, lng) = (el.lat?, el.lon?);
-            let tags = el.tags.unwrap_or_default();
-            let height_m = parse_meters(tags.get("height")).unwrap_or(10.0).min(40.0);
-            let crown_radius_m = parse_meters(tags.get("diameter_crown"))
-                .map(|d| d / 2.0)
-                .unwrap_or_else(|| (height_m * 0.3).clamp(2.0, 6.0));
-            Some(Tree { lat, lng, height_m, crown_radius_m })
-        })
-        .collect();
-
-    let arc = Arc::new(trees);
-    state.trees.write().await.insert(key, arc.clone());
-    Ok(arc)
-}
-
-/// Miroirs Overpass, essayés dans l'ordre. L'instance officielle
-/// (overpass-api.de) sature souvent (504) aux heures de pointe.
-const OVERPASS_MIRRORS: &[&str] = &[
-    "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-];
-
-/// Requête Overpass générique : essaie chaque miroir dans l'ordre, renvoie
-/// le premier succès. Partagé par POI terrasses et emprises bâtiments.
-async fn overpass_query<T: serde::de::DeserializeOwned>(
-    state: &AppState,
-    query: &str,
-) -> Result<T, (StatusCode, String)> {
-    let mut last_err = String::new();
-    for mirror in OVERPASS_MIRRORS {
-        match state
-            .http
-            .post(*mirror)
-            .form(&[("data", query)])
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-        {
-            Ok(resp) => match resp.json::<T>().await {
-                Ok(parsed) => return Ok(parsed),
-                Err(e) => last_err = format!("{mirror} (JSON) : {e}"),
-            },
-            Err(e) => last_err = format!("{mirror} : {e}"),
-        }
-    }
-    Err((StatusCode::BAD_GATEWAY, format!("Overpass : {last_err}")))
-}
-
-/// Fetch Overpass des POI terrasse (cache mémoire par bbox arrondie —
-/// les POI bougent rarement, l'API publique est lente/instable : on
-/// essaie plusieurs miroirs avant d'abandonner).
-async fn overpass_terraces(
-    state: &AppState,
-    s: f64,
-    w: f64,
-    n: f64,
-    e: f64,
-) -> Result<Arc<Vec<OverpassPoi>>, (StatusCode, String)> {
-    // DEBUG : clé fixe, un seul fetch Overpass pour toute la durée de vie du
-    // process, peu importe la bbox demandée — évite de re-solliciter
-    // Overpass à chaque test iOS sur la même zone. Le premier appel fait
-    // foi pour la zone couverte ; à retirer avant tout usage au-delà du dev
-    // local (des points hors de cette zone n'auront jamais leurs propres
-    // terrasses tant que le process tourne).
-    let key = "DEBUG_ALL".to_string();
-    if let Some(hit) = state.pois.read().await.get(&key) {
-        return Ok(hit.clone());
-    }
-
-    let query = format!(
-        r#"[out:json][timeout:25];
-nwr["amenity"~"^(bar|restaurant|cafe)$"]["outdoor_seating"="yes"]({s},{w},{n},{e});
-out center 500;"#
-    );
-    let raw: OverpassResponse = overpass_query(state, &query).await?;
-
-    let pois: Vec<OverpassPoi> = raw
-        .elements
-        .into_iter()
-        .filter_map(|el| {
-            let (lat, lng) = match (el.lat, el.lon, &el.center) {
-                (Some(la), Some(lo), _) => (la, lo),
-                (_, _, Some(c)) => (c.lat, c.lon),
-                _ => return None,
-            };
-            let tags = el.tags.unwrap_or_default();
-            // Website/téléphone : "contact:*" en repli si le tag simple est absent.
-            let website = tags
-                .get("website")
-                .or_else(|| tags.get("contact:website"))
-                .cloned();
-            let phone = tags
-                .get("phone")
-                .or_else(|| tags.get("contact:phone"))
-                .cloned();
-            Some(OverpassPoi {
-                id: format!("{}/{}", el.element_type, el.id),
-                name: tags.get("name").cloned(),
-                amenity: tags.get("amenity").cloned(),
-                lat,
-                lng,
-                website,
-                phone,
-                opening_hours: tags.get("opening_hours").cloned(),
-                cuisine: tags.get("cuisine").cloned(),
-                wikidata: tags.get("wikidata").cloned(),
-            })
-        })
-        .collect();
-
-    let arc = Arc::new(pois);
-    state.pois.write().await.insert(key, arc.clone());
-    Ok(arc)
-}
-
-/// Emprise d'un bâtiment OSM + hauteur retenue.
-#[derive(Clone)]
-struct Building {
-    /// Identifiant OSM complet ("way/123", "relation/456") — sert à désigner
-    /// le coupable côté client, donc doit être recoupable avec osm.org.
-    osm_id: String,
-    name: Option<String>,
-    /// Anneaux du polygone (lat, lon). Un seul pour un way ; pour une relation
-    /// multipolygone, l'extérieur ET les intérieurs — la rasterisation en
-    /// règle pair-impair creuse alors naturellement les cours.
-    rings: Vec<Vec<(f64, f64)>>,
-    height_m: f32,
-    /// `false` = hauteur devinée (`DEFAULT_BUILDING_HEIGHT_M`), pas taggée.
-    height_from_osm: bool,
-}
-
-/// Fetch Overpass des bâtiments (`building=*`) de la zone, cache mémoire par
-/// bbox arrondie. `out geom` renvoie directement la géométrie (liste de
-/// nœuds) sans second aller-retour pour résoudre les ways.
-async fn overpass_buildings(
-    state: &AppState,
-    s: f64,
-    w: f64,
-    n: f64,
-    e: f64,
-) -> Result<Arc<Vec<Building>>, (StatusCode, String)> {
-    // Clé = bbox arrondie. Contrairement aux POI/arbres, les bâtiments ne sont
-    // PAS mis en cache global "DEBUG_ALL" : ils définissent la géométrie des
-    // ombres, et réutiliser ceux d'une autre zone donne des résultats faux.
-    // Les bbox demandées sont de toute façon alignées sur les tuiles, donc la
-    // clé est stable et le cache efficace.
-    let key = format!("{s:.5},{w:.5},{n:.5},{e:.5}");
-    if let Some(hit) = state.buildings.read().await.get(&key) {
-        return Ok(hit.clone());
-    }
-
-    // Trois familles à ramasser, sinon des casters bien visibles à l'écran
-    // manquent purement et simplement dans la DSM :
-    //  - `way[building]`      : le cas courant ;
-    //  - `way[building:part]` : Simple 3D Buildings — tours, corps de bâtiment
-    //    surélevés. Mapbox les rend, et `stamp_max` gardera le plus haut ;
-    //  - `rel[building]`      : multipolygones, c'est-à-dire précisément les
-    //    grands bâtiments à cour intérieure, très fréquents à Paris. Ils ne
-    //    sont PAS des ways et échappaient donc entièrement à la requête.
-    //
-    // Pas de plafond sur `out geom` : une bbox de 3×3 tuiles au cœur de Paris
-    // contient ~7 700 bâtiments, un `out geom 5000` en perdait un tiers.
-    let query = format!(
-        r#"[out:json][timeout:90];
-(
-  way["building"]({s},{w},{n},{e});
-  way["building:part"]({s},{w},{n},{e});
-  relation["building"]({s},{w},{n},{e});
-);
-out geom;"#
-    );
-    let raw: BuildingsResponse = overpass_query(state, &query).await?;
-
-    let mut buildings: Vec<Building> = raw
-        .elements
-        .into_iter()
-        .filter_map(|el| {
-            let tags = el.tags.clone().unwrap_or_default();
-            let tagged = tags
-                .get("height")
-                .and_then(|h| parse_meters(Some(h)).map(|v| v as f32))
-                .or_else(|| {
-                    tags.get("building:levels")
-                        .and_then(|l| l.trim().parse::<f32>().ok())
-                        // 3 m par niveau + ~3 m de comble/toiture, sinon les
-                        // immeubles haussmanniens sortent trop bas.
-                        .map(|levels| levels * 3.0 + 3.0)
-                });
-
-            // Un way donne un anneau. Une relation en donne plusieurs, et on
-            // garde AUSSI les "inner" : la rasterisation pair-impair s'en sert
-            // pour creuser les cours intérieures. Les ignorer bétonnerait la
-            // cour, et tout point à l'intérieur serait à l'ombre en permanence
-            // (observé sur relation/2779974, un immeuble à cour du 3e).
-            let rings: Vec<Vec<(f64, f64)>> = match (el.geometry, el.members) {
-                (Some(g), _) => vec![g],
-                (None, Some(members)) => members
-                    .into_iter()
-                    .filter(|m| matches!(m.role.as_deref(), Some("outer") | Some("inner")))
-                    .filter_map(|m| m.geometry)
-                    .collect(),
-                _ => Vec::new(),
-            }
-            .into_iter()
-            .filter(|r| r.len() >= 3)
-            .map(|r| r.iter().map(|n| (n.lat, n.lon)).collect())
-            .collect();
-
-            if rings.is_empty() {
-                return None;
-            }
-            Some(Building {
-                osm_id: format!("{}/{}", el.element_type, el.id),
-                name: tags.get("name").cloned(),
-                rings,
-                height_m: tagged.unwrap_or(f32::NAN), // comblé juste après
-                height_from_osm: tagged.is_some(),
-            })
-        })
-        .collect();
-
-    // Défaut local plutôt que global : ~30 % des bâtiments parisiens n'ont
-    // aucun tag de hauteur, et 9 m (3 étages) sous-estime largement un tissu
-    // haussmannien à 20 m — leurs ombres portées disparaissaient. On prend la
-    // médiane des hauteurs connues de la zone, qui s'adapte au quartier.
-    let mut known: Vec<f32> = buildings
-        .iter()
-        .filter(|b| b.height_from_osm)
-        .map(|b| b.height_m)
-        .collect();
-    known.sort_by(f32::total_cmp);
-    let fallback = if known.is_empty() {
-        DEFAULT_BUILDING_HEIGHT_M
-    } else {
-        known[known.len() / 2].clamp(6.0, 40.0)
-    };
-    for b in buildings.iter_mut().filter(|b| !b.height_from_osm) {
-        b.height_m = fallback;
-    }
-
-    println!(
-        "[buildings] {key} → {} bâtiments ({} avec hauteur OSM, {} au défaut local {fallback:.1} m)",
-        buildings.len(),
-        known.len(),
-        buildings.len() - known.len()
-    );
-
-    let arc = Arc::new(buildings);
-    state.buildings.write().await.insert(key, arc.clone());
-    Ok(arc)
-}
-
-#[derive(Deserialize)]
-struct BuildingsResponse {
-    elements: Vec<BuildingElement>,
-}
-
-#[derive(Deserialize)]
-struct BuildingElement {
-    id: u64,
-    /// "way" ou "relation" — sert à composer un id OSM recoupable.
-    #[serde(rename = "type")]
-    element_type: String,
-    tags: Option<HashMap<String, String>>,
-    /// Présent sur les ways.
-    geometry: Option<Vec<GeomNode>>,
-    /// Présent sur les relations (multipolygones).
-    members: Option<Vec<RelationMember>>,
-}
-
-#[derive(Deserialize)]
-struct RelationMember {
-    /// "outer" / "inner" pour un multipolygone.
-    role: Option<String>,
-    geometry: Option<Vec<GeomNode>>,
-}
-
-#[derive(Deserialize)]
-struct GeomNode {
-    lat: f64,
-    lon: f64,
-}
-
-#[derive(Deserialize)]
-struct OverpassResponse {
-    elements: Vec<OverpassElement>,
-}
-
-#[derive(Deserialize)]
-struct OverpassElement {
-    #[serde(rename = "type")]
-    element_type: String,
-    id: u64,
-    lat: Option<f64>,
-    lon: Option<f64>,
-    center: Option<OverpassCenter>,
-    tags: Option<HashMap<String, String>>,
-}
-
-#[derive(Deserialize)]
-struct OverpassCenter {
-    lat: f64,
-    lon: f64,
-}
-
-/// "1753455600", "1753455600.5" ou RFC3339. Absent → maintenant.
 fn parse_time(raw: Option<&str>) -> Result<f64, (StatusCode, String)> {
     let Some(raw) = raw else {
         return Ok(chrono::Utc::now().timestamp() as f64);
