@@ -27,7 +27,7 @@ echo "1/2 — filtrage des tags…"
 osmium tags-filter --overwrite -t -o "$TMP" "$IN" \
   w/building r/building w/building:part \
   n/natural=tree \
-  nwr/amenity=bar,restaurant,cafe
+  nwr/amenity=bar,pub,restaurant,cafe,fast_food,biergarten
 
 echo "2/2 — assemblage des aires et export GeoJSONSeq…"
 # osmium assemble les multipolygones ici : les relations sortent en Polygon /

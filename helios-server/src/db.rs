@@ -99,7 +99,8 @@ pub async fn terraces_in_bbox(
     e: f64,
 ) -> Result<Vec<Poi>, sqlx::Error> {
     let sql = format!(
-        "SELECT osm_id, name, amenity, website, phone, opening_hours, cuisine, wikidata, \
+        "SELECT osm_id, name, amenity, outdoor_seating, website, phone, opening_hours, \
+                cuisine, wikidata, \
                 ST_Y(geom) AS lat, ST_X(geom) AS lng \
          FROM terraces WHERE geom && {}",
         envelope(s, w, n, e)
@@ -112,6 +113,7 @@ pub async fn terraces_in_bbox(
             osm_id: r.get("osm_id"),
             name: r.get("name"),
             amenity: r.get("amenity"),
+            outdoor_seating: r.get("outdoor_seating"),
             lat: r.get("lat"),
             lng: r.get("lng"),
             website: r.get("website"),
@@ -228,17 +230,20 @@ pub async fn upsert_terraces(pool: &PgPool, pois: &[Poi]) -> Result<u64, sqlx::E
         let mut tx = pool.begin().await?;
         for p in chunk {
             written += sqlx::query(
-                "INSERT INTO terraces (osm_id, name, amenity, website, phone, opening_hours, \
-                                       cuisine, wikidata, geom) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ST_SetSRID(ST_MakePoint($9, $10), 4326)) \
+                "INSERT INTO terraces (osm_id, name, amenity, outdoor_seating, website, phone, \
+                                       opening_hours, cuisine, wikidata, geom) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
+                         ST_SetSRID(ST_MakePoint($10, $11), 4326)) \
                  ON CONFLICT (osm_id) DO UPDATE SET \
-                   name = EXCLUDED.name, amenity = EXCLUDED.amenity, website = EXCLUDED.website, \
+                   name = EXCLUDED.name, amenity = EXCLUDED.amenity, \
+                   outdoor_seating = EXCLUDED.outdoor_seating, website = EXCLUDED.website, \
                    phone = EXCLUDED.phone, opening_hours = EXCLUDED.opening_hours, \
                    cuisine = EXCLUDED.cuisine, wikidata = EXCLUDED.wikidata, geom = EXCLUDED.geom",
             )
             .bind(&p.osm_id)
             .bind(&p.name)
             .bind(&p.amenity)
+            .bind(p.outdoor_seating)
             .bind(&p.website)
             .bind(&p.phone)
             .bind(&p.opening_hours)

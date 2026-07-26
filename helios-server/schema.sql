@@ -41,13 +41,22 @@ CREATE TABLE IF NOT EXISTS trees (
 
 -- --------------------------------------------------------------- terrasses
 
--- POI `amenity=bar|restaurant|cafe` + `outdoor_seating=yes`. La position est
--- celle d'OSM, non corrigée : le déport côté rue est calculé au runtime, il
--- dépend de la DSM et n'a rien à faire en base.
+-- Établissements de restauration et de boisson (cf. `osm::AMENITIES`).
+--
+-- Aucun filtre sur `outdoor_seating` à l'ingestion : le tag est très
+-- inégalement renseigné dans OSM, et filtrer dessus faisait disparaître
+-- beaucoup d'établissements qui ont bel et bien une terrasse. On stocke le tag
+-- tel quel et on laisse le filtre au client.
+--
+-- La position est celle d'OSM, non corrigée : le déport côté rue est calculé au
+-- runtime, il dépend de la DSM et n'a rien à faire en base.
 CREATE TABLE IF NOT EXISTS terraces (
     osm_id           text PRIMARY KEY,
     name             text,
     amenity          text,
+    -- `true` = terrasse explicitement taggée. `false` = tag absent OU négatif,
+    -- les deux étant indiscernables et fréquents.
+    outdoor_seating  boolean NOT NULL DEFAULT false,
     website          text,
     phone            text,
     opening_hours    text,

@@ -20,7 +20,9 @@ use std::io::BufRead;
 
 use serde::Deserialize;
 
-use crate::osm::{building_from, fill_missing_heights, poi_from, tree_from, Building, Poi, Tree};
+use crate::osm::{
+    building_from, fill_missing_heights, poi_from, tree_from, Building, Poi, Tree, AMENITIES,
+};
 
 /// Une feature GeoJSON telle que produite par `osmium export -u type_id`.
 #[derive(Deserialize)]
@@ -84,11 +86,13 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
 
         let is_building = tags.contains_key("building") || tags.contains_key("building:part");
         let is_tree = tags.get("natural").map(String::as_str) == Some("tree");
-        let is_terrace = tags.get("outdoor_seating").map(String::as_str) == Some("yes")
-            && matches!(
-                tags.get("amenity").map(String::as_str),
-                Some("bar") | Some("restaurant") | Some("cafe")
-            );
+        // Pas de filtre sur `outdoor_seating` : le tag est très inégalement
+        // renseigné, et filtrer dessus faisait disparaître des établissements
+        // qui ont bel et bien une terrasse. On ramasse tout, l'utilisateur
+        // filtre ensuite.
+        let is_terrace = tags
+            .get("amenity")
+            .is_some_and(|a| AMENITIES.contains(&a.as_str()));
 
         if is_building {
             if let Some(b) = building_from(osm_id.clone(), &tags, rings(&geometry)) {

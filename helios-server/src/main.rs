@@ -963,6 +963,9 @@ struct Terrace {
     id: String,
     name: Option<String>,
     amenity: Option<String>,
+    /// `outdoor_seating=yes` dans OSM. Un `false` ne signifie PAS qu'il n'y a
+    /// pas de terrasse : le tag est souvent simplement absent.
+    outdoor_seating: bool,
     lat: f64,
     lng: f64,
     sunlit: bool,
@@ -1081,6 +1084,7 @@ async fn terraces(
                 id: p.osm_id.clone(),
                 name: p.name.clone(),
                 amenity: p.amenity.clone(),
+                outdoor_seating: p.outdoor_seating,
                 lat: p.lat,
                 lng: p.lng,
                 sunlit: sun.is_up() && hit.is_none(),

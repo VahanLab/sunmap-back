@@ -48,12 +48,30 @@ pub struct Tree {
     pub crown_radius_m: f64,
 }
 
-/// POI terrasse brut (centroïde pour les ways/relations).
+/// Catégories d'établissements retenues.
+///
+/// Volontairement large : le tag `outdoor_seating` est très inégalement
+/// renseigné dans OSM, donc filtrer dessus à l'ingestion faisait disparaître
+/// beaucoup d'établissements qui ont bel et bien une terrasse. On ramasse tout
+/// et on laisse le filtre à l'utilisateur, qui voit sur la carte.
+pub const AMENITIES: &[&str] = &[
+    "bar",
+    "pub",
+    "restaurant",
+    "cafe",
+    "fast_food",
+    "biergarten",
+];
+
+/// Établissement brut (centroïde pour les ways/relations).
 #[derive(Clone, Debug)]
 pub struct Poi {
     pub osm_id: String,
     pub name: Option<String>,
     pub amenity: Option<String>,
+    /// `outdoor_seating=yes` dans OSM. Une absence ne veut PAS dire qu'il n'y a
+    /// pas de terrasse — le tag est souvent simplement non renseigné.
+    pub outdoor_seating: bool,
     pub lat: f64,
     pub lng: f64,
     pub website: Option<String>,
@@ -210,6 +228,7 @@ pub fn poi_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, Strin
         osm_id,
         name: tags.get("name").cloned(),
         amenity: tags.get("amenity").cloned(),
+        outdoor_seating: tags.get("outdoor_seating").map(String::as_str) == Some("yes"),
         lat,
         lng,
         // Website/téléphone : "contact:*" en repli si le tag simple manque.
@@ -303,8 +322,9 @@ pub async fn fetch_terraces(
 ) -> Result<Vec<Poi>, String> {
     let body = format!(
         r#"[out:json][timeout:180];
-nwr["amenity"~"^(bar|restaurant|cafe)$"]["outdoor_seating"="yes"]({s},{w},{n},{e});
-out center;"#
+nwr["amenity"~"^({amenities})$"]({s},{w},{n},{e});
+out center;"#,
+        amenities = AMENITIES.join("|")
     );
     let raw: ElementsResponse = query(http, &body).await?;
 
