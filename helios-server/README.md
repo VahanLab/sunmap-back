@@ -194,8 +194,9 @@ sur la carte — statut immédiat + timeline.
 | Paramètre | Type | Obligatoire | Description |
 |---|---|---|---|
 | `lat`, `lng` | f64 | oui | Coordonnées |
-| `t` | string | non | N'importe quel instant DANS la journée voulue. La journée = jour calendaire **UTC** contenant `t` |
+| `t` | string | non | N'importe quel instant DANS la journée voulue |
 | `observer_height` | f64 | non | Défaut **1.5** |
+| `utc_offset_minutes` | i32 | non | Décalage du **lieu** par rapport à UTC (Paris en été : `120`). Détermine où tombent les bornes de la journée. Défaut `0` = journée UTC, presque jamais ce qu'on veut — **le client doit l'envoyer** |
 
 ```json
 {
@@ -212,7 +213,14 @@ sur la carte — statut immédiat + timeline.
 
 `blocker_now` apparaît quand le point est à l'ombre à `t_unix`, au format de
 `/sunlit`. `intervals` : segments contigus (échantillonnage 5 min, regroupé)
-en secondes Unix UTC — le client formate en heure locale.
+en secondes Unix UTC — le client formate dans le fuseau que la réponse
+renvoie en `utc_offset_minutes`, et surtout pas dans celui de l'appareil : ce
+sont les deux seuls dans lesquels les bornes tombent bien sur minuit.
+
+**Limite** : le décalage vient du client, donc en pratique du téléphone, et non
+du lieu regardé. Correct tant qu'on consulte sa propre ville — le cas dominant.
+Une vraie résolution lat/lng → fuseau demanderait une base de fuseaux côté
+serveur (crate `tzf-rs` par exemple).
 
 ### `GET /trees`
 

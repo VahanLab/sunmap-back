@@ -529,6 +529,11 @@ struct SunHoursQuery {
     t: Option<String>,
     /// Défaut 1,5 m : usage principal = "est-ce que je peux m'asseoir là".
     observer_height: Option<f64>,
+    /// Décalage horaire du LIEU par rapport à UTC, en minutes (Paris en été :
+    /// 120). Détermine où sont les bornes de la journée renvoyée. Défaut 0,
+    /// soit la journée UTC — rarement ce qu'on veut, le client doit
+    /// l'envoyer.
+    utc_offset_minutes: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -545,6 +550,9 @@ struct SunHoursResponse {
     blocker_now: Option<Blocker>,
     day_start_unix: f64,
     day_end_unix: f64,
+    /// Décalage effectivement utilisé pour découper la journée — permet au
+    /// client de vérifier que le serveur a bien compris son fuseau.
+    utc_offset_minutes: i32,
     total_sunlit_minutes: u32,
     total_shadow_minutes: u32,
     intervals: Vec<SunInterval>,
@@ -557,11 +565,19 @@ struct SunInterval {
     sunlit: bool,
 }
 
-/// Journée calendaire UTC (00:00 → 24:00) contenant l'instant donné.
-fn day_bounds_utc(t_unix: f64) -> (f64, f64) {
-    let dt = chrono::DateTime::from_timestamp(t_unix as i64, 0).unwrap_or_default();
-    let start = dt.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
-    let start_unix = start.timestamp() as f64;
+/// Journée calendaire **locale** (00:00 → 24:00) contenant l'instant donné,
+/// pour un décalage donné en minutes par rapport à UTC.
+///
+/// Découper sur la journée UTC était faux dès qu'on sort du méridien de
+/// Greenwich : à Paris en été (UTC+2), un slider réglé sur 00h30 renvoyait la
+/// journée de la veille, et la timeline s'affichait bornée à 02:00 → 02:00 au
+/// lieu de minuit à minuit.
+fn day_bounds_local(t_unix: f64, utc_offset_minutes: i32) -> (f64, f64) {
+    let offset = utc_offset_minutes as f64 * 60.0;
+    // Passer en heure locale, tronquer au jour, revenir en UTC.
+    let local = t_unix + offset;
+    let start_local = (local / 86_400.0).floor() * 86_400.0;
+    let start_unix = start_local - offset;
     (start_unix, start_unix + 86_400.0)
 }
 
@@ -574,7 +590,8 @@ async fn sun_hours(
 ) -> Result<Json<SunHoursResponse>, (StatusCode, String)> {
     let t = parse_time(q.t.as_deref())?;
     let h = q.observer_height.unwrap_or(1.5);
-    let (day_start, day_end) = day_bounds_utc(t);
+    let utc_offset_minutes = q.utc_offset_minutes.unwrap_or(0);
+    let (day_start, day_end) = day_bounds_local(t, utc_offset_minutes);
 
     let ctx = assemble_point(&state, q.lat, q.lng).await?;
     let params = ShadowParams {
@@ -625,6 +642,7 @@ async fn sun_hours(
         blocker_now,
         day_start_unix: day_start,
         day_end_unix: day_end,
+        utc_offset_minutes,
         total_sunlit_minutes,
         total_shadow_minutes,
         intervals,
@@ -1173,4 +1191,45 @@ fn parse_time(raw: Option<&str>) -> Result<f64, (StatusCode, String)> {
                 format!("t invalide : {raw} (RFC3339 ou secondes Unix)"),
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Une journée doit commencer à minuit LOCAL. Le bug d'origine découpait
+    /// sur UTC : à Paris en été, un instant à 00h30 locale (22:30Z la veille)
+    /// renvoyait la journée précédente, bornée à 02:00 → 02:00.
+    #[test]
+    fn day_bounds_follow_local_midnight() {
+        // 2026-07-25T22:30:00Z = 2026-07-26 00:30 à Paris (UTC+2).
+        let t = 1785018600.0;
+        let (start, end) = day_bounds_local(t, 120);
+
+        // Minuit local = 22:00Z la veille.
+        assert_eq!(start, 1785016800.0);
+        assert_eq!(end - start, 86_400.0);
+        // L'instant demandé tombe bien dans la journée renvoyée.
+        assert!(start <= t && t < end);
+    }
+
+    /// Sans décalage, on retombe sur la journée UTC — l'ancien comportement,
+    /// conservé comme défaut pour ne pas casser un appel sans paramètre.
+    #[test]
+    fn zero_offset_is_utc_day() {
+        let t = 1785018600.0; // 2026-07-25T22:30:00Z
+        let (start, _) = day_bounds_local(t, 0);
+        assert_eq!(start, 1784937600.0); // 2026-07-25T00:00:00Z
+    }
+
+    /// Fuseaux négatifs (Amériques) : même règle, minuit local.
+    #[test]
+    fn negative_offset_works() {
+        // 2026-07-26T03:00:00Z = 2026-07-25 23:00 à New York (UTC-4).
+        let t = 1785034800.0;
+        let (start, end) = day_bounds_local(t, -240);
+        assert!(start <= t && t < end);
+        // Minuit à New York le 25 = 04:00Z le 25.
+        assert_eq!(start, 1784952000.0);
+    }
 }
