@@ -32,6 +32,11 @@ const TILE_URL: &str = "https://tiles.mapterhorn.com";
 type TileCache = RwLock<HashMap<(u32, u32, u32), Arc<Vec<f32>>>>;
 type PoiCache = RwLock<HashMap<String, Arc<Vec<OverpassPoi>>>>;
 type BuildingCache = RwLock<HashMap<String, Arc<Vec<Building>>>>;
+type TreeCache = RwLock<HashMap<String, Arc<Vec<Tree>>>>;
+/// Résultat déjà calculé de `/terraces` (classification soleil/ombre), par
+/// clé bbox+instant+hauteur d'observateur — évite de refaire tout le ray
+/// marching quand la même requête (même minute, même zone) revient.
+type TerracesResultCache = RwLock<HashMap<String, Arc<TerracesResponse>>>;
 
 /// Hauteur par défaut quand ni `height` ni `building:levels` ne sont taggés
 /// sur OSM (fréquent) — ~3 étages, prudent en zone dense plutôt que de sous-
@@ -43,6 +48,8 @@ struct AppState {
     tiles: TileCache,
     pois: PoiCache,
     buildings: BuildingCache,
+    trees: TreeCache,
+    terraces_results: TerracesResultCache,
 }
 
 #[tokio::main]
@@ -57,12 +64,15 @@ async fn main() {
         tiles: RwLock::new(HashMap::new()),
         pois: RwLock::new(HashMap::new()),
         buildings: RwLock::new(HashMap::new()),
+        trees: RwLock::new(HashMap::new()),
+        terraces_results: RwLock::new(HashMap::new()),
     });
 
     let app = Router::new()
         .route("/sunlit", get(sunlit))
         .route("/sunlit/batch", post(sunlit_batch))
         .route("/terraces", get(terraces))
+        .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
         .with_state(state);
 
@@ -501,7 +511,7 @@ struct TerracesQuery {
     observer_height: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TerracesResponse {
     t_unix: f64,
     sun_azimuth_deg: f64,
@@ -510,7 +520,7 @@ struct TerracesResponse {
     terraces: Vec<Terrace>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct Terrace {
     /// Identifiant OSM, ex. "node/123456" ou "way/789".
     id: String,
@@ -574,6 +584,15 @@ async fn terraces(
         return Err((StatusCode::BAD_REQUEST, "bbox invalide".into()));
     }
 
+    // Cache de résultat : même bbox + même tranche de 5 min + même hauteur
+    // d'observateur → renvoie directement la classification déjà calculée,
+    // sans refaire tuiles/bâtiments/ray marching.
+    let bucket = (t / 300.0).round() as i64;
+    let result_key = format!("{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2}");
+    if let Some(hit) = state.terraces_results.read().await.get(&result_key) {
+        return Ok(Json((**hit).clone()));
+    }
+
     // Intervalle de tuiles couvrant la bbox + 1 tuile de marge (casters).
     let (wx0, wy0) = world_px(n, w); // coin nord-ouest
     let (wx1, wy1) = world_px(s, e); // coin sud-est
@@ -630,13 +649,121 @@ async fn terraces(
         })
         .collect();
 
-    Ok(Json(TerracesResponse {
+    let response = TerracesResponse {
         t_unix: t,
         sun_azimuth_deg: sun.azimuth_deg,
         sun_elevation_deg: sun.elevation_deg,
         count: terraces.len(),
         terraces,
+    };
+    state
+        .terraces_results
+        .write()
+        .await
+        .insert(result_key, Arc::new(response.clone()));
+    Ok(Json(response))
+}
+
+// ---------------------------------------------------------------- arbres
+
+#[derive(Deserialize)]
+struct TreesQuery {
+    /// `min_lon,min_lat,max_lon,max_lat`
+    bbox: String,
+}
+
+#[derive(Serialize)]
+struct TreesResponse {
+    count: usize,
+    trees: Vec<Tree>,
+}
+
+#[derive(Serialize, Clone)]
+struct Tree {
+    lat: f64,
+    lng: f64,
+    height_m: f64,
+    crown_radius_m: f64,
+}
+
+/// Arbres OSM (`natural=tree`) de la zone — aucun calcul soleil/ombre ici
+/// (le rendu/l'extrusion restent côté client), juste la géométrie. Cache
+/// global comme `/terraces` : un seul fetch Overpass pour toute la durée de
+/// vie du process, peu importe la bbox demandée.
+async fn trees(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TreesQuery>,
+) -> Result<Json<TreesResponse>, (StatusCode, String)> {
+    let parts: Vec<f64> = q
+        .bbox
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let [w, s, e, n] = parts[..] else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "bbox attendue : min_lon,min_lat,max_lon,max_lat".into(),
+        ));
+    };
+    if s >= n || w >= e || !(-85.0..=85.0).contains(&s) || !(-85.0..=85.0).contains(&n) {
+        return Err((StatusCode::BAD_REQUEST, "bbox invalide".into()));
+    }
+
+    let trees = overpass_trees(&state, s, w, n, e).await?;
+    Ok(Json(TreesResponse {
+        count: trees.len(),
+        trees: (*trees).clone(),
     }))
+}
+
+/// "12", "12 m", "12,5" → mètres (tags OSM laxistes).
+fn parse_meters(raw: Option<&String>) -> Option<f64> {
+    let raw = raw?;
+    raw.replace(',', ".")
+        .replace('m', "")
+        .trim()
+        .parse::<f64>()
+        .ok()
+}
+
+async fn overpass_trees(
+    state: &AppState,
+    s: f64,
+    w: f64,
+    n: f64,
+    e: f64,
+) -> Result<Arc<Vec<Tree>>, (StatusCode, String)> {
+    // DEBUG : même principe que overpass_terraces/overpass_buildings — clé
+    // fixe, un seul fetch pour toute la durée de vie du process.
+    let key = "DEBUG_ALL".to_string();
+    if let Some(hit) = state.trees.read().await.get(&key) {
+        return Ok(hit.clone());
+    }
+
+    let query = format!(
+        r#"[out:json][timeout:25];
+node["natural"="tree"]({s},{w},{n},{e});
+out 3000;"#
+    );
+    let raw: OverpassResponse = overpass_query(state, &query).await?;
+
+    let trees: Vec<Tree> = raw
+        .elements
+        .into_iter()
+        .filter_map(|el| {
+            let (lat, lng) = (el.lat?, el.lon?);
+            let tags = el.tags.unwrap_or_default();
+            let height_m = parse_meters(tags.get("height")).unwrap_or(10.0).min(40.0);
+            let crown_radius_m = parse_meters(tags.get("diameter_crown"))
+                .map(|d| d / 2.0)
+                .unwrap_or_else(|| (height_m * 0.3).clamp(2.0, 6.0));
+            Some(Tree { lat, lng, height_m, crown_radius_m })
+        })
+        .collect();
+
+    let arc = Arc::new(trees);
+    state.trees.write().await.insert(key, arc.clone());
+    Ok(arc)
 }
 
 /// Miroirs Overpass, essayés dans l'ordre. L'instance officielle
