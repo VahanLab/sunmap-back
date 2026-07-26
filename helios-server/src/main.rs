@@ -229,18 +229,27 @@ fn stamp_buildings(
     buildings: &[Building],
 ) {
     for (bi, b) in buildings.iter().enumerate() {
-        if b.ring.len() < 3 {
-            continue;
-        }
-        let pixels: Vec<(f64, f64)> = b
-            .ring
+        // Tous les anneaux ensemble : extérieur + cours. La règle pair-impair
+        // du scanline ci-dessous fait le reste — les traversées d'un anneau
+        // intérieur re-basculent en « dehors », donc la cour reste creuse.
+        let rings: Vec<Vec<(f64, f64)>> = b
+            .rings
             .iter()
-            .map(|&(lat, lon)| {
-                let (wx, wy) = world_px(lat, lon);
-                (wx - origin_x, wy - origin_y)
+            .filter(|r| r.len() >= 3)
+            .map(|r| {
+                r.iter()
+                    .map(|&(lat, lon)| {
+                        let (wx, wy) = world_px(lat, lon);
+                        (wx - origin_x, wy - origin_y)
+                    })
+                    .collect()
             })
             .collect();
+        if rings.is_empty() {
+            continue;
+        }
 
+        let pixels: Vec<(f64, f64)> = rings.concat();
         let min_y = pixels.iter().map(|p| p.1).fold(f64::MAX, f64::min);
         let max_y = pixels.iter().map(|p| p.1).fold(f64::MIN, f64::max);
         let min_x = pixels.iter().map(|p| p.0).fold(f64::MAX, f64::min);
@@ -261,12 +270,14 @@ fn stamp_buildings(
         for y in y0..=y1.min(dsm.height - 1) {
             let scan_y = y as f64 + 0.5;
             let mut xs: Vec<f64> = Vec::new();
-            for i in 0..pixels.len() {
-                let (x1, y1p) = pixels[i];
-                let (x2, y2p) = pixels[(i + 1) % pixels.len()];
-                if (y1p <= scan_y && y2p > scan_y) || (y2p <= scan_y && y1p > scan_y) {
-                    let t = (scan_y - y1p) / (y2p - y1p);
-                    xs.push(x1 + t * (x2 - x1));
+            for ring in &rings {
+                for i in 0..ring.len() {
+                    let (x1, y1p) = ring[i];
+                    let (x2, y2p) = ring[(i + 1) % ring.len()];
+                    if (y1p <= scan_y && y2p > scan_y) || (y2p <= scan_y && y1p > scan_y) {
+                        let t = (scan_y - y1p) / (y2p - y1p);
+                        xs.push(x1 + t * (x2 - x1));
+                    }
                 }
             }
             xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -346,7 +357,7 @@ fn describe_blocker(
         .and_then(|o| buildings.get(o as usize));
 
     Blocker {
-        id: b.map_or_else(|| "terrain".to_string(), |b| format!("way/{}", b.id)),
+        id: b.map_or_else(|| "terrain".to_string(), |b| b.osm_id.clone()),
         name: b.and_then(|b| b.name.clone()),
         height_m: b.map(|b| b.height_m),
         height_from_osm: b.is_some_and(|b| b.height_from_osm),
@@ -604,6 +615,23 @@ struct BuildingAtResponse {
     /// Altitude du toit dans la DSM (relief + hauteur), et du relief seul.
     roof_elevation_m: f32,
     terrain_elevation_m: f32,
+    /// Quand `found == false` : le bâtiment le plus proche et sa distance.
+    /// Un immeuble bien visible à l'écran mais à 30 m de la coordonnée reçue
+    /// signale une parallaxe de tap (le point tapé est déprojeté sur le SOL,
+    /// pas sur le volume 3D — à `pitch` élevé l'écart atteint des dizaines de
+    /// mètres) plutôt qu'un trou dans la donnée.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nearest: Option<NearestBuilding>,
+}
+
+#[derive(Serialize)]
+struct NearestBuilding {
+    id: String,
+    name: Option<String>,
+    height_m: f32,
+    distance_m: f64,
+    lat: f64,
+    lng: f64,
 }
 
 async fn building_at(
@@ -623,15 +651,130 @@ async fn building_at(
         .filter(|&o| o != OWNER_TERRAIN)
         .and_then(|o| ctx.buildings.get(o as usize));
 
+    // Rien sous le point : on cherche le bâtiment le plus proche pour pouvoir
+    // distinguer « la DSM ignore ce bâtiment » de « le tap n'a pas atterri où
+    // tu crois ». Distance au sommet le plus proche, suffisant pour trancher.
+    let nearest = b.is_none().then(|| nearest_building(&ctx)).flatten();
+
+    let found = b.is_some();
+    println!(
+        "[building] {:.6},{:.6} → {}",
+        q.lat,
+        q.lng,
+        match (&b, &nearest) {
+            (Some(b), _) => format!("{} h={:.1}m", b.osm_id, b.height_m),
+            (None, Some(n)) => format!("AUCUN (plus proche {} à {:.1} m)", n.id, n.distance_m),
+            (None, None) => "AUCUN, et rien dans un rayon utile".to_string(),
+        }
+    );
+
     Ok(Json(BuildingAtResponse {
-        found: b.is_some(),
-        id: b.map(|b| format!("way/{}", b.id)),
+        found,
+        id: b.map(|b| b.osm_id.clone()),
         name: b.and_then(|b| b.name.clone()),
         height_m: b.map(|b| b.height_m),
         height_from_osm: b.is_some_and(|b| b.height_from_osm),
         roof_elevation_m: ctx.dsm.data[idx],
         terrain_elevation_m: ctx.ground,
+        nearest,
     }))
+}
+
+/// Déplace un point tombé *dans* une emprise bâtie vers le sol libre le plus
+/// proche (trottoir), et renvoie `(px, py, distance parcourue en mètres)`.
+///
+/// Nécessaire parce que les POI OSM d'un bar ou d'un restaurant sont posés sur
+/// le bâtiment, pas sur sa terrasse : le nœud tombe à l'intérieur du polygone
+/// dans la grande majorité des cas. Le rayon solaire percute alors le mur du
+/// bâtiment hôte au tout premier pas et *tout* est classé à l'ombre — observé :
+/// 410 terrasses sur 416 bloquées à 1,57 m, soit exactement une cellule.
+///
+/// Sortir le point est plus juste que d'exclure le bâtiment hôte du test :
+/// depuis le trottoir, sa façade continue de porter ombre le soir, ce qui est
+/// bien le comportement attendu.
+///
+/// Recherche en anneaux croissants sur la grille de propriétaires, plus une
+/// cellule de marge pour ne pas rester collé à la façade. Renvoie le point
+/// d'origine si rien de libre dans le rayon (POI au cœur d'un grand bâtiment).
+fn nudge_out_of_building(
+    dsm: &Dsm,
+    owner: &[u32],
+    px: f64,
+    py: f64,
+    max_radius_px: i32,
+) -> (f64, f64, f64) {
+    let at = |x: i32, y: i32| -> Option<u32> {
+        if x < 0 || y < 0 || x >= dsm.width as i32 || y >= dsm.height as i32 {
+            return None;
+        }
+        Some(owner[y as usize * dsm.width + x as usize])
+    };
+
+    let (cx, cy) = (px.round() as i32, py.round() as i32);
+    if at(cx, cy) == Some(OWNER_TERRAIN) {
+        return (px, py, 0.0); // déjà dehors
+    }
+
+    for r in 1..=max_radius_px {
+        let mut best: Option<(f64, i32, i32)> = None;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                // Seulement le bord de l'anneau : l'intérieur a déjà été vu.
+                if dx.abs() != r && dy.abs() != r {
+                    continue;
+                }
+                if at(cx + dx, cy + dy) != Some(OWNER_TERRAIN) {
+                    continue;
+                }
+                let d = ((dx * dx + dy * dy) as f64).sqrt();
+                if best.as_ref().is_none_or(|(bd, _, _)| d < *bd) {
+                    best = Some((d, dx, dy));
+                }
+            }
+        }
+        if let Some((d, dx, dy)) = best {
+            // Une cellule de marge dans la même direction, pour se poser sur
+            // le trottoir plutôt que contre le mur.
+            let (ux, uy) = (dx as f64 / d, dy as f64 / d);
+            let (nx, ny) = (px + (dx as f64) + ux, py + (dy as f64) + uy);
+            let (nx, ny) = if at(nx.round() as i32, ny.round() as i32) == Some(OWNER_TERRAIN) {
+                (nx, ny)
+            } else {
+                (px + dx as f64, py + dy as f64)
+            };
+            let moved = ((nx - px).hypot(ny - py)) * dsm.meters_per_pixel;
+            return (nx, ny, moved);
+        }
+    }
+    (px, py, 0.0)
+}
+
+/// Bâtiment dont un sommet est le plus proche du point, dans un rayon de 60 m.
+fn nearest_building(ctx: &PointCtx) -> Option<NearestBuilding> {
+    let (plat, plng) = latlon_of_world_px(ctx.origin_x + ctx.px, ctx.origin_y + ctx.py);
+    let m_per_deg_lat = 110_540.0;
+    let m_per_deg_lng = 111_320.0 * plat.to_radians().cos();
+
+    let mut best: Option<(f64, &Building, (f64, f64))> = None;
+    for b in ctx.buildings.iter() {
+        for &(lat, lon) in b.rings.iter().flatten() {
+            let dn = (lat - plat) * m_per_deg_lat;
+            let de = (lon - plng) * m_per_deg_lng;
+            let d = (dn * dn + de * de).sqrt();
+            if d < best.as_ref().map_or(60.0, |(bd, _, _)| *bd) {
+                best = Some((d, b, (lat, lon)));
+            }
+        }
+    }
+
+    best.map(|(d, b, (lat, lng))| NearestBuilding {
+        id: b.osm_id.clone(),
+        name: b.name.clone(),
+        height_m: b.height_m,
+        distance_m: d,
+        lat,
+        lng,
+    })
 }
 
 // ---------------------------------------------------------------- debug
@@ -709,7 +852,7 @@ async fn debug_ray(
             lng,
             dsm_m,
             ray_m,
-            building: b.map(|b| format!("way/{}", b.id)),
+            building: b.map(|b| b.osm_id.clone()),
             building_height_m: b.map(|b| b.height_m),
             blocks,
         });
@@ -800,6 +943,15 @@ struct Terrace {
     /// côté client : « c'est cet immeuble-là qui te met à l'ombre ».
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker: Option<Blocker>,
+    /// Absents si le nœud OSM était déjà sur du sol libre. Sinon : le point
+    /// réellement classé, ramené hors de l'emprise du bâtiment hôte, et la
+    /// distance parcourue pour y arriver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapped_lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapped_lng: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapped_distance_m: Option<f64>,
     elevation_m: f32,
     /// Champs OSM optionnels — couverture très inégale selon les POI.
     website: Option<String>,
@@ -900,13 +1052,17 @@ async fn terraces(
         .iter()
         .map(|p| {
             let (wx, wy) = world_px(p.lat, p.lng);
-            let px = wx - origin_x;
-            let py = wy - origin_y;
+            // Le nœud OSM est presque toujours posé sur le bâtiment, pas sur
+            // la terrasse : on le ramène sur le sol libre voisin (12 m max).
+            let (px, py, moved_m) =
+                nudge_out_of_building(&dsm, &owner, wx - origin_x, wy - origin_y, 8);
             let ground = terrain_only.sample(px, py).unwrap_or(0.0);
             let hit = sun
                 .is_up()
                 .then(|| shadow_hit_from_ground(&dsm, &sun, px, py, ground, &params))
                 .flatten();
+            let (snapped_lat, snapped_lng) =
+                latlon_of_world_px(origin_x + px, origin_y + py);
             Terrace {
                 id: p.id.clone(),
                 name: p.name.clone(),
@@ -916,6 +1072,9 @@ async fn terraces(
                 sunlit: sun.is_up() && hit.is_none(),
                 blocker: hit
                     .map(|h| describe_blocker(&h, &dsm, &owner, &buildings, origin_x, origin_y)),
+                snapped_lat: (moved_m > 0.0).then_some(snapped_lat),
+                snapped_lng: (moved_m > 0.0).then_some(snapped_lng),
+                snapped_distance_m: (moved_m > 0.0).then_some(moved_m),
                 elevation_m: ground,
                 website: p.website.clone(),
                 phone: p.phone.clone(),
@@ -1144,14 +1303,17 @@ out center 500;"#
     Ok(arc)
 }
 
-/// Emprise d'un bâtiment OSM (anneau extérieur) + hauteur retenue.
+/// Emprise d'un bâtiment OSM + hauteur retenue.
 #[derive(Clone)]
 struct Building {
-    /// Identifiant OSM du way, pour pouvoir désigner le coupable côté client.
-    id: u64,
+    /// Identifiant OSM complet ("way/123", "relation/456") — sert à désigner
+    /// le coupable côté client, donc doit être recoupable avec osm.org.
+    osm_id: String,
     name: Option<String>,
-    /// Anneau extérieur du polygone (lat, lon), tel que renvoyé par Overpass.
-    ring: Vec<(f64, f64)>,
+    /// Anneaux du polygone (lat, lon). Un seul pour un way ; pour une relation
+    /// multipolygone, l'extérieur ET les intérieurs — la rasterisation en
+    /// règle pair-impair creuse alors naturellement les cours.
+    rings: Vec<Vec<(f64, f64)>>,
     height_m: f32,
     /// `false` = hauteur devinée (`DEFAULT_BUILDING_HEIGHT_M`), pas taggée.
     height_from_osm: bool,
@@ -1177,12 +1339,24 @@ async fn overpass_buildings(
         return Ok(hit.clone());
     }
 
+    // Trois familles à ramasser, sinon des casters bien visibles à l'écran
+    // manquent purement et simplement dans la DSM :
+    //  - `way[building]`      : le cas courant ;
+    //  - `way[building:part]` : Simple 3D Buildings — tours, corps de bâtiment
+    //    surélevés. Mapbox les rend, et `stamp_max` gardera le plus haut ;
+    //  - `rel[building]`      : multipolygones, c'est-à-dire précisément les
+    //    grands bâtiments à cour intérieure, très fréquents à Paris. Ils ne
+    //    sont PAS des ways et échappaient donc entièrement à la requête.
+    //
     // Pas de plafond sur `out geom` : une bbox de 3×3 tuiles au cœur de Paris
-    // contient ~7 700 bâtiments, un `out geom 5000` en perdait un tiers — donc
-    // autant de casters d'ombre absents de la DSM.
+    // contient ~7 700 bâtiments, un `out geom 5000` en perdait un tiers.
     let query = format!(
-        r#"[out:json][timeout:60];
-way["building"]({s},{w},{n},{e});
+        r#"[out:json][timeout:90];
+(
+  way["building"]({s},{w},{n},{e});
+  way["building:part"]({s},{w},{n},{e});
+  relation["building"]({s},{w},{n},{e});
+);
 out geom;"#
     );
     let raw: BuildingsResponse = overpass_query(state, &query).await?;
@@ -1191,12 +1365,7 @@ out geom;"#
         .elements
         .into_iter()
         .filter_map(|el| {
-            let geometry = el.geometry?;
-            if geometry.len() < 3 {
-                return None;
-            }
-            let ring: Vec<(f64, f64)> = geometry.iter().map(|n| (n.lat, n.lon)).collect();
-            let tags = el.tags.unwrap_or_default();
+            let tags = el.tags.clone().unwrap_or_default();
             let tagged = tags
                 .get("height")
                 .and_then(|h| parse_meters(Some(h)).map(|v| v as f32))
@@ -1207,10 +1376,33 @@ out geom;"#
                         // immeubles haussmanniens sortent trop bas.
                         .map(|levels| levels * 3.0 + 3.0)
                 });
+
+            // Un way donne un anneau. Une relation en donne plusieurs, et on
+            // garde AUSSI les "inner" : la rasterisation pair-impair s'en sert
+            // pour creuser les cours intérieures. Les ignorer bétonnerait la
+            // cour, et tout point à l'intérieur serait à l'ombre en permanence
+            // (observé sur relation/2779974, un immeuble à cour du 3e).
+            let rings: Vec<Vec<(f64, f64)>> = match (el.geometry, el.members) {
+                (Some(g), _) => vec![g],
+                (None, Some(members)) => members
+                    .into_iter()
+                    .filter(|m| matches!(m.role.as_deref(), Some("outer") | Some("inner")))
+                    .filter_map(|m| m.geometry)
+                    .collect(),
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .filter(|r| r.len() >= 3)
+            .map(|r| r.iter().map(|n| (n.lat, n.lon)).collect())
+            .collect();
+
+            if rings.is_empty() {
+                return None;
+            }
             Some(Building {
-                id: el.id,
+                osm_id: format!("{}/{}", el.element_type, el.id),
                 name: tags.get("name").cloned(),
-                ring,
+                rings,
                 height_m: tagged.unwrap_or(f32::NAN), // comblé juste après
                 height_from_osm: tagged.is_some(),
             })
@@ -1256,7 +1448,20 @@ struct BuildingsResponse {
 #[derive(Deserialize)]
 struct BuildingElement {
     id: u64,
+    /// "way" ou "relation" — sert à composer un id OSM recoupable.
+    #[serde(rename = "type")]
+    element_type: String,
     tags: Option<HashMap<String, String>>,
+    /// Présent sur les ways.
+    geometry: Option<Vec<GeomNode>>,
+    /// Présent sur les relations (multipolygones).
+    members: Option<Vec<RelationMember>>,
+}
+
+#[derive(Deserialize)]
+struct RelationMember {
+    /// "outer" / "inner" pour un multipolygone.
+    role: Option<String>,
     geometry: Option<Vec<GeomNode>>,
 }
 
