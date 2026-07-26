@@ -1130,6 +1130,10 @@ struct TreesResponse {
 
 #[derive(Serialize, Clone)]
 struct Tree {
+    /// Identifiant OSM ("node/123"). Sert au client à dédoublonner les arbres
+    /// entre deux bbox qui se recouvrent, et à cibler leur suppression quand
+    /// il purge son cache.
+    id: String,
     lat: f64,
     lng: f64,
     height_m: f64,
@@ -1163,6 +1167,7 @@ async fn trees(
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?
         .into_iter()
         .map(|t| Tree {
+            id: t.osm_id,
             lat: t.lat,
             lng: t.lng,
             height_m: t.height_m,
