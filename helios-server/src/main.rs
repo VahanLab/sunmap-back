@@ -94,7 +94,6 @@ async fn main() {
         .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
-        .route("/building", get(building_at))
         .with_state(state);
 
     let addr = "0.0.0.0:8080";
@@ -649,92 +648,6 @@ async fn sun_hours(
     }))
 }
 
-// ------------------------------------------------------------- bâtiment
-
-#[derive(Deserialize)]
-struct BuildingAtQuery {
-    lat: f64,
-    lng: f64,
-}
-
-/// Le bâtiment *tel que le moteur d'ombre le voit* à cette coordonnée.
-/// Permet de confronter ce qu'on rend (Mapbox) à ce qu'on calcule (OSM+DSM) :
-/// si l'app affiche un immeuble ici et que ça répond `null`, la DSM ne l'a pas.
-#[derive(Serialize)]
-struct BuildingAtResponse {
-    found: bool,
-    id: Option<String>,
-    name: Option<String>,
-    height_m: Option<f32>,
-    height_from_osm: bool,
-    /// Altitude du toit dans la DSM (relief + hauteur), et du relief seul.
-    roof_elevation_m: f32,
-    terrain_elevation_m: f32,
-    /// Quand `found == false` : le bâtiment le plus proche et sa distance.
-    /// Un immeuble bien visible à l'écran mais à 30 m de la coordonnée reçue
-    /// signale une parallaxe de tap (le point tapé est déprojeté sur le SOL,
-    /// pas sur le volume 3D — à `pitch` élevé l'écart atteint des dizaines de
-    /// mètres) plutôt qu'un trou dans la donnée.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nearest: Option<NearestBuilding>,
-}
-
-#[derive(Serialize)]
-struct NearestBuilding {
-    id: String,
-    name: Option<String>,
-    height_m: f32,
-    distance_m: f64,
-    lat: f64,
-    lng: f64,
-}
-
-async fn building_at(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<BuildingAtQuery>,
-) -> Result<Json<BuildingAtResponse>, (StatusCode, String)> {
-    let ctx = assemble_point(&state, q.lat, q.lng).await?;
-    let (xi, yi) = (
-        ctx.px.round().clamp(0.0, (ctx.dsm.width - 1) as f64) as usize,
-        ctx.py.round().clamp(0.0, (ctx.dsm.height - 1) as f64) as usize,
-    );
-    let idx = yi * ctx.dsm.width + xi;
-    let b = ctx
-        .owner
-        .get(idx)
-        .copied()
-        .filter(|&o| o != OWNER_TERRAIN)
-        .and_then(|o| ctx.buildings.get(o as usize));
-
-    // Rien sous le point : on cherche le bâtiment le plus proche pour pouvoir
-    // distinguer « la DSM ignore ce bâtiment » de « le tap n'a pas atterri où
-    // tu crois ». Distance au sommet le plus proche, suffisant pour trancher.
-    let nearest = b.is_none().then(|| nearest_building(&ctx)).flatten();
-
-    let found = b.is_some();
-    println!(
-        "[building] {:.6},{:.6} → {}",
-        q.lat,
-        q.lng,
-        match (&b, &nearest) {
-            (Some(b), _) => format!("{} h={:.1}m", b.osm_id, b.height_m),
-            (None, Some(n)) => format!("AUCUN (plus proche {} à {:.1} m)", n.id, n.distance_m),
-            (None, None) => "AUCUN, et rien dans un rayon utile".to_string(),
-        }
-    );
-
-    Ok(Json(BuildingAtResponse {
-        found,
-        id: b.map(|b| b.osm_id.clone()),
-        name: b.and_then(|b| b.name.clone()),
-        height_m: b.map(|b| b.height_m),
-        height_from_osm: b.is_some_and(|b| b.height_from_osm),
-        roof_elevation_m: ctx.dsm.data[idx],
-        terrain_elevation_m: ctx.ground,
-        nearest,
-    }))
-}
-
 /// Déplace un point tombé *dans* une emprise bâtie vers le sol libre le plus
 /// proche (trottoir), et renvoie `(px, py, distance parcourue en mètres)`.
 ///
@@ -802,34 +715,6 @@ fn nudge_out_of_building(
         }
     }
     (px, py, 0.0)
-}
-
-/// Bâtiment dont un sommet est le plus proche du point, dans un rayon de 60 m.
-fn nearest_building(ctx: &PointCtx) -> Option<NearestBuilding> {
-    let (plat, plng) = latlon_of_world_px(ctx.origin_x + ctx.px, ctx.origin_y + ctx.py);
-    let m_per_deg_lat = 110_540.0;
-    let m_per_deg_lng = 111_320.0 * plat.to_radians().cos();
-
-    let mut best: Option<(f64, &Building, (f64, f64))> = None;
-    for b in ctx.buildings.iter() {
-        for &(lat, lon) in b.rings.iter().flatten() {
-            let dn = (lat - plat) * m_per_deg_lat;
-            let de = (lon - plng) * m_per_deg_lng;
-            let d = (dn * dn + de * de).sqrt();
-            if d < best.as_ref().map_or(60.0, |(bd, _, _)| *bd) {
-                best = Some((d, b, (lat, lon)));
-            }
-        }
-    }
-
-    best.map(|(d, b, (lat, lng))| NearestBuilding {
-        id: b.osm_id.clone(),
-        name: b.name.clone(),
-        height_m: b.height_m,
-        distance_m: d,
-        lat,
-        lng,
-    })
 }
 
 // ---------------------------------------------------------------- debug

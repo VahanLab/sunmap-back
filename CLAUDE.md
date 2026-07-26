@@ -42,7 +42,7 @@ Fonctionnalités cibles :
      queries terrasses (batch + cumuls).
 5. Serveur : Rust/axum, **en place** (cf. `helios-server/README.md`) :
    - `GET /sunlit` + `POST /sunlit/batch`, `GET /places`, `GET /sun-hours`,
-     `GET /trees`, `GET /building`, `GET /debug/ray`.
+     `GET /trees`, `GET /debug/ray`.
    - Reste à faire : `GET /shadow/{z}/{x}/{y}.png?t=` (tuile raster, si piste
      B/web) et le cache CDN clé `(z,x,y,jour,tranche de 5-10 min)`.
 6. **Géométrie OSM en PostgreSQL/PostGIS**, plus d'Overpass au runtime.

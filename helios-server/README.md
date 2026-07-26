@@ -243,34 +243,6 @@ pas encore dans la DSM).
 {"count": 1284, "trees": [{"lat": 48.8571, "lng": 2.3494, "height_m": 12.0, "crown_radius_m": 3.6}]}
 ```
 
-### `GET /building`
-
-Le bâtiment **tel que le moteur d'ombre le voit** à une coordonnée. Sert à
-confronter le rendu (tuiles Mapbox, qui ne portent pas d'identifiant OSM) au
-calcul.
-
-| Paramètre | Type | Obligatoire |
-|---|---|---|
-| `lat`, `lng` | f64 | oui |
-
-```json
-{
-  "found": false,
-  "id": null, "name": null, "height_m": null, "height_from_osm": false,
-  "roof_elevation_m": 35.55, "terrain_elevation_m": 35.56,
-  "nearest": {
-    "id": "relation/2779974", "name": null, "height_m": 18.0,
-    "distance_m": 5.19, "lat": 48.861055, "lng": 2.349284
-  }
-}
-```
-
-`nearest` n'apparaît que si rien n'a été trouvé sous le point. Un immeuble
-bien visible à l'écran mais à 30 m de la coordonnée reçue signale une
-**parallaxe de tap** (le point tapé est déprojeté sur le sol, pas sur le
-volume 3D — à `pitch` élevé l'écart atteint des dizaines de mètres) plutôt
-qu'un trou dans la donnée.
-
 ### `GET /debug/ray`
 
 Profil de la DSM le long du rayon solaire, pas à pas : altitude du terrain +
