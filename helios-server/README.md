@@ -318,7 +318,8 @@ EPSG:4326, index GIST sur chacune. Cf. `schema.sql`, commenté.
 |---|---|---|
 | `buildings` | `MultiPolygon` | Emprises + hauteur + provenance de la hauteur. Les relations gardent leurs anneaux intérieurs (cours) |
 | `trees` | `Point` | Hauteur et rayon de couronne |
-| `places` | `Point` | POI et leurs tags, position OSM **non corrigée** — le déport côté rue dépend de la DSM et se calcule au runtime |
+| `places` | `Point` | Établissements et leurs tags, position OSM **non corrigée** — le déport côté rue dépend de la DSM et se calcule au runtime |
+| `place_terraces` | `Point` | Terrasses signalées par les utilisateurs. Séparée de `places` pour survivre aux réimports |
 
 ## Roadmap (cf. CLAUDE.md racine)
 
