@@ -67,6 +67,29 @@ CREATE TABLE IF NOT EXISTS places (
     geom             geometry(Point, 4326) NOT NULL
 );
 
+-- ------------------------------------------------- contributions utilisateur
+
+-- Terrasse signalée par un utilisateur : sa présence, et surtout sa position
+-- exacte, qu'OSM ne donne jamais (le nœud d'un bar est posé sur le bâtiment).
+--
+-- Table SÉPARÉE de `places`, et c'est essentiel : `bin/import` fait un upsert
+-- sur `places` à chaque réimport d'extrait OSM, ce qui effacerait toute colonne
+-- de contribution qu'on y aurait ajoutée. Ici les deux cycles de vie
+-- n'interfèrent pas.
+--
+-- Pas de clé étrangère vers `places` : un établissement peut disparaître d'OSM
+-- puis revenir, et on ne veut pas perdre la contribution entre-temps.
+CREATE TABLE IF NOT EXISTS place_terraces (
+    osm_id       text PRIMARY KEY,
+    -- L'utilisateur affirme la présence ou l'absence de terrasse. Prime sur le
+    -- tag OSM, y compris pour le contredire.
+    has_terrace  boolean NOT NULL,
+    -- Position de la terrasse. NULL quand `has_terrace` est faux, ou quand
+    -- l'utilisateur signale une terrasse sans la situer.
+    geom         geometry(Point, 4326),
+    updated_at   timestamptz NOT NULL DEFAULT now()
+);
+
 -- ----------------------------------------------------------------- index
 
 -- GIST sur chaque géométrie : c'est ce qui rend le `&&` par bounding box
@@ -74,6 +97,7 @@ CREATE TABLE IF NOT EXISTS places (
 CREATE INDEX IF NOT EXISTS buildings_geom_idx ON buildings USING GIST (geom);
 CREATE INDEX IF NOT EXISTS trees_geom_idx     ON trees     USING GIST (geom);
 CREATE INDEX IF NOT EXISTS places_geom_idx  ON places  USING GIST (geom);
+CREATE INDEX IF NOT EXISTS place_terraces_geom_idx ON place_terraces USING GIST (geom);
 
 -- ------------------------------------------------------ suivi d'ingestion
 

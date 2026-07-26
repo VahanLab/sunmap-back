@@ -41,7 +41,8 @@ Fonctionnalités cibles :
    - Si la piste A suffit visuellement, le serveur Rust ne sert **que** les
      queries terrasses (batch + cumuls).
 5. Serveur : Rust/axum, **en place** (cf. `helios-server/README.md`) :
-   - `GET /sunlit` + `POST /sunlit/batch`, `GET /places`, `GET /sun-hours`,
+   - `GET /sunlit` + `POST /sunlit/batch`, `GET /places`,
+     `POST /places/terrace` (contribution utilisateur), `GET /sun-hours`,
      `GET /trees`, `GET /debug/ray`.
    - Reste à faire : `GET /shadow/{z}/{x}/{y}.png?t=` (tuile raster, si piste
      B/web) et le cache CDN clé `(z,x,y,jour,tranche de 5-10 min)`.
@@ -146,7 +147,10 @@ Fonctionnalités cibles :
    de l'élévation solaire : soleil bas = ombres longues = marge large).
 4. Pipeline data : décodage PNG Terrarium (crate `image`), rasterisation
    polygone des emprises Overture/OSM, cache DSM (PMTiles ou S3).
-5. Intégration Overpass terrasses + classification batch. Échantillonner
+5. **Position de terrasse contribuée par les utilisateurs** (`place_terraces`,
+   table séparée pour survivre aux réimports OSM) : c'est la seule donnée qui
+   situe vraiment une terrasse, OSM ne donnant que le nœud du bâtiment.
+   Échantillonner
    3–5 points dans un buffer de 3–8 m côté rue plutôt que le centroïde du
    bâtiment ; renvoyer un % d'ensoleillement plutôt qu'un booléen.
 6. Si piste B retenue : custom layer Metal (drapage sur terrain = le sujet

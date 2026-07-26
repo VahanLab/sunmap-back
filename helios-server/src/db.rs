@@ -6,6 +6,8 @@
 //! `ST_AsText` suffisent dans les deux sens. Une dépendance de plus pour
 //! parser du WKB n'apporterait rien ici.
 
+use std::collections::HashMap;
+
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
@@ -123,6 +125,90 @@ pub async fn places_in_bbox(
             wikidata: r.get("wikidata"),
         })
         .collect())
+}
+
+// ------------------------------------------- contributions utilisateur
+
+/// Terrasse signalée par un utilisateur pour un établissement.
+#[derive(Clone, Debug)]
+pub struct TerraceReport {
+    pub osm_id: String,
+    pub has_terrace: bool,
+    /// Position précise de la terrasse, si elle a été située.
+    pub lat: Option<f64>,
+    pub lng: Option<f64>,
+}
+
+/// Contributions couvrant la bbox, indexées par identifiant OSM.
+///
+/// Filtre sur la géométrie des `places` et non sur celle de la contribution :
+/// une terrasse signalée sans position n'a pas de géométrie, et serait donc
+/// invisible d'une recherche spatiale.
+pub async fn terrace_reports_in_bbox(
+    pool: &PgPool,
+    s: f64,
+    w: f64,
+    n: f64,
+    e: f64,
+) -> Result<HashMap<String, TerraceReport>, sqlx::Error> {
+    let sql = format!(
+        "SELECT t.osm_id, t.has_terrace, ST_Y(t.geom) AS lat, ST_X(t.geom) AS lng \
+         FROM place_terraces t JOIN places p USING (osm_id) WHERE p.geom && {}",
+        envelope(s, w, n, e)
+    );
+    Ok(sqlx::query(&sql)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let osm_id: String = r.get("osm_id");
+            (
+                osm_id.clone(),
+                TerraceReport {
+                    osm_id,
+                    has_terrace: r.get("has_terrace"),
+                    lat: r.get("lat"),
+                    lng: r.get("lng"),
+                },
+            )
+        })
+        .collect())
+}
+
+/// Enregistre (ou remplace) la contribution pour un établissement.
+pub async fn upsert_terrace_report(
+    pool: &PgPool,
+    report: &TerraceReport,
+) -> Result<(), sqlx::Error> {
+    // Position construite seulement si les deux coordonnées sont là, sinon
+    // NULL : une terrasse peut être signalée sans être située.
+    sqlx::query(
+        "INSERT INTO place_terraces (osm_id, has_terrace, geom, updated_at) \
+         VALUES ($1, $2, \
+                 CASE WHEN $3::float8 IS NULL OR $4::float8 IS NULL THEN NULL \
+                      ELSE ST_SetSRID(ST_MakePoint($3, $4), 4326) END, \
+                 now()) \
+         ON CONFLICT (osm_id) DO UPDATE SET \
+           has_terrace = EXCLUDED.has_terrace, geom = EXCLUDED.geom, \
+           updated_at = EXCLUDED.updated_at",
+    )
+    .bind(&report.osm_id)
+    .bind(report.has_terrace)
+    .bind(report.lng)
+    .bind(report.lat)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// L'établissement existe-t-il ? Garde-fou avant d'accepter une contribution,
+/// pour ne pas accumuler des lignes orphelines sur des identifiants inventés.
+pub async fn place_exists(pool: &PgPool, osm_id: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM places WHERE osm_id = $1")
+        .bind(osm_id)
+        .fetch_one(pool)
+        .await
+        .map(|n| n > 0)
 }
 
 // ----------------------------------------------------------- ingestion

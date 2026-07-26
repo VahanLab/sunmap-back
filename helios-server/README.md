@@ -194,6 +194,42 @@ libre. Sinon ils donnent le point **réellement classé** : c'est ce qui permet
 au client d'afficher le déport et de distinguer « le calcul est faux » de « le
 calcul porte sur un autre endroit ».
 
+### `POST /places/terrace`
+
+Terrasse signalée par un utilisateur : sa présence, et sa position si elle a été
+pointée sur la carte. Cette position prime sur tout ce que le serveur peut
+déduire — OSM place le nœud d'un bar sur son bâtiment, et le repli automatique
+le ressort au jugé sur le sol libre le plus proche, sans savoir de quel côté est
+la rue.
+
+L'identifiant est dans le corps et non dans le chemin : il contient une barre
+oblique (`node/123`), qui casserait le routage.
+
+| Champ | Type | Obligatoire | Description |
+|---|---|---|---|
+| `osm_id` | string | oui | `node/123`, `way/456`… doit exister dans `places` |
+| `has_terrace` | bool | oui | Prime sur le tag OSM, y compris pour le contredire |
+| `lat`, `lng` | f64 | non | Position de la terrasse. Ignorées si `has_terrace` est faux |
+
+```bash
+curl -X POST http://localhost:8080/places/terrace \
+  -H 'Content-Type: application/json' \
+  -d '{"osm_id":"node/250657148","has_terrace":true,"lat":48.86476,"lng":2.34122}'
+```
+
+```json
+{"osm_id": "node/250657148", "has_terrace": true, "located": true}
+```
+
+`404` si l'établissement est inconnu — sans quoi la table se remplirait de
+lignes orphelines. La contribution est stockée dans `place_terraces`, **table
+séparée de `places`** : `bin/import` fait un upsert sur `places` à chaque
+réimport d'extrait OSM, ce qui effacerait toute colonne de contribution qu'on y
+aurait ajoutée.
+
+Les classifications en cache sont jetées, sinon la contribution resterait sans
+effet visible.
+
 ### `GET /sun-hours`
 
 Un point, une journée : heures au soleil et à l'ombre. Pensé pour l'appui long

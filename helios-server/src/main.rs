@@ -91,6 +91,7 @@ async fn main() {
         .route("/sunlit", get(sunlit))
         .route("/sunlit/batch", post(sunlit_batch))
         .route("/places", get(places))
+        .route("/places/terrace", post(report_terrace))
         .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
@@ -853,6 +854,11 @@ struct Place {
     /// terrasse ». Le client ne doit rien afficher dans ce cas.
     #[serde(skip_serializing_if = "Option::is_none")]
     outdoor_seating: Option<bool>,
+    /// `true` quand la présence et/ou la position de la terrasse viennent d'une
+    /// contribution utilisateur plutôt que d'OSM. Dans ce cas `snapped_*` est
+    /// la position exacte de la terrasse, pas une estimation.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    terrace_from_user: bool,
     lat: f64,
     lng: f64,
     sunlit: bool,
@@ -879,6 +885,87 @@ struct Place {
     /// utilisable côté client pour aller chercher une photo (propriété P18)
     /// via l'API Wikidata/Commons — OSM ne stocke pas de photos lui-même.
     wikidata: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TerraceReportBody {
+    /// Identifiant OSM de l'établissement ("node/123"). Dans le corps et non
+    /// dans le chemin : il contient une barre oblique, qui casserait le
+    /// routage.
+    osm_id: String,
+    has_terrace: bool,
+    /// Position de la terrasse. Facultative : on peut signaler une terrasse
+    /// sans la situer, ou signaler son absence.
+    lat: Option<f64>,
+    lng: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct TerraceReportResponse {
+    osm_id: String,
+    has_terrace: bool,
+    located: bool,
+}
+
+/// Enregistre la terrasse signalée par un utilisateur : sa présence, et sa
+/// position si elle a été pointée sur la carte.
+///
+/// Cette position vaut mieux que tout ce qu'on peut déduire : OSM place le nœud
+/// d'un bar sur son bâtiment, et notre repli le ressort au jugé sur le sol
+/// libre le plus proche, sans savoir de quel côté est la rue.
+async fn report_terrace(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<TerraceReportBody>,
+) -> Result<Json<TerraceReportResponse>, (StatusCode, String)> {
+    if let (Some(lat), Some(lng)) = (body.lat, body.lng) {
+        if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
+            return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
+        }
+    }
+
+    // Refuse les identifiants inconnus, sinon la table se remplit de lignes
+    // orphelines qu'aucune requête ne rattachera jamais à un établissement.
+    let exists = db::place_exists(&state.pool, &body.osm_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    if !exists {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("établissement inconnu : {}", body.osm_id),
+        ));
+    }
+
+    let report = db::TerraceReport {
+        osm_id: body.osm_id.clone(),
+        has_terrace: body.has_terrace,
+        // Une terrasse absente n'a pas de position à retenir.
+        lat: body.has_terrace.then_some(body.lat).flatten(),
+        lng: body.has_terrace.then_some(body.lng).flatten(),
+    };
+    db::upsert_terrace_report(&state.pool, &report)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+
+    // Les classifications déjà calculées ignorent cette contribution : les
+    // jeter force le recalcul au prochain appel, sinon l'utilisateur ne verrait
+    // aucun effet à sa contribution.
+    state.places_results.write().await.clear();
+
+    println!(
+        "[terrace] {} → has_terrace={} {}",
+        report.osm_id,
+        report.has_terrace,
+        match (report.lat, report.lng) {
+            (Some(lat), Some(lng)) => format!("({lat:.6}, {lng:.6})"),
+            _ => "sans position".to_string(),
+        }
+    );
+
+    Ok(Json(TerraceReportResponse {
+        located: report.lat.is_some() && report.lng.is_some(),
+        osm_id: report.osm_id,
+        has_terrace: report.has_terrace,
+    }))
 }
 
 /// Bars/restaurants/cafés avec terrasse dans la bbox, classés soleil/ombre.
@@ -936,6 +1023,9 @@ async fn places(
     let pois = db::places_in_bbox(&state.pool, s, w, n, e)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+    let reports = db::terrace_reports_in_bbox(&state.pool, s, w, n, e)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
     let (mut dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
     // Relief seul, avant stamping des bâtiments : sert de sol pour chaque
     // terrasse (cf. commentaire dans classify() — un POI mal placé dans un
@@ -955,11 +1045,27 @@ async fn places(
     let places: Vec<Place> = pois
         .iter()
         .map(|p| {
-            let (wx, wy) = world_px(p.lat, p.lng);
-            // Le nœud OSM est presque toujours posé sur le bâtiment, pas sur
-            // la terrasse : on le ramène sur le sol libre voisin (12 m max).
-            let (px, py, moved_m) =
-                nudge_out_of_building(&dsm, &owner, wx - origin_x, wy - origin_y, 8);
+            let report = reports.get(&p.osm_id);
+            let terrace = report.and_then(|r| Some((r.lat?, r.lng?)));
+            let (osm_wx, osm_wy) = world_px(p.lat, p.lng);
+
+            // Une terrasse située par un utilisateur est prise telle quelle :
+            // il l'a pointée sur la carte, donc elle est déjà au bon endroit.
+            // La rectifier avec `nudge_out_of_building` détruirait justement la
+            // précision qu'on lui a demandée — une terrasse sous arcade ou
+            // adossée à la façade se retrouverait déplacée au milieu de la rue.
+            let (px, py, moved_m) = match terrace {
+                Some((lat, lng)) => {
+                    let (tx, ty) = world_px(lat, lng);
+                    let moved = ((tx - osm_wx).hypot(ty - osm_wy)) * dsm.meters_per_pixel;
+                    (tx - origin_x, ty - origin_y, moved)
+                }
+                // Sinon le nœud OSM est presque toujours posé sur le bâtiment
+                // et non sur la terrasse : on le ramène sur le sol libre
+                // voisin (12 m max).
+                None => nudge_out_of_building(&dsm, &owner, osm_wx - origin_x,
+                                              osm_wy - origin_y, 8),
+            };
             let ground = terrain_only.sample(px, py).unwrap_or(0.0);
             let hit = sun
                 .is_up()
@@ -971,7 +1077,10 @@ async fn places(
                 id: p.osm_id.clone(),
                 name: p.name.clone(),
                 amenity: p.amenity.clone(),
-                outdoor_seating: p.outdoor_seating,
+                // La contribution prime sur le tag OSM, y compris pour le
+                // contredire : quelqu'un sur place en sait plus que le tag.
+                outdoor_seating: report.map(|r| r.has_terrace).or(p.outdoor_seating),
+                terrace_from_user: report.is_some(),
                 lat: p.lat,
                 lng: p.lng,
                 sunlit: sun.is_up() && hit.is_none(),
