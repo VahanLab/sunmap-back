@@ -65,7 +65,7 @@ pub const AMENITIES: &[&str] = &[
 
 /// Établissement brut (centroïde pour les ways/relations).
 #[derive(Clone, Debug)]
-pub struct Poi {
+pub struct Place {
     pub osm_id: String,
     pub name: Option<String>,
     pub amenity: Option<String>,
@@ -222,9 +222,9 @@ pub fn tree_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, Stri
     }
 }
 
-/// POI terrasse à partir de ses tags.
-pub fn poi_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, String>) -> Poi {
-    Poi {
+/// Établissement à partir de ses tags.
+pub fn place_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, String>) -> Place {
+    Place {
         osm_id,
         name: tags.get("name").cloned(),
         amenity: tags.get("amenity").cloned(),
@@ -311,15 +311,15 @@ out;"#
         .collect())
 }
 
-// --------------------------------------------------------------- terrasses
+// ---------------------------------------------------------- établissements
 
-pub async fn fetch_terraces(
+pub async fn fetch_places(
     http: &reqwest::Client,
     s: f64,
     w: f64,
     n: f64,
     e: f64,
-) -> Result<Vec<Poi>, String> {
+) -> Result<Vec<Place>, String> {
     let body = format!(
         r#"[out:json][timeout:180];
 nwr["amenity"~"^({amenities})$"]({s},{w},{n},{e});
@@ -338,7 +338,7 @@ out center;"#,
                 _ => return None,
             };
             let tags = el.tags.unwrap_or_default();
-            Some(poi_from(
+            Some(place_from(
                 format!("{}/{}", el.element_type, el.id),
                 lat,
                 lng,

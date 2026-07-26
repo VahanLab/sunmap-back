@@ -41,7 +41,7 @@ Fonctionnalités cibles :
    - Si la piste A suffit visuellement, le serveur Rust ne sert **que** les
      queries terrasses (batch + cumuls).
 5. Serveur : Rust/axum, **en place** (cf. `helios-server/README.md`) :
-   - `GET /sunlit` + `POST /sunlit/batch`, `GET /terraces`, `GET /sun-hours`,
+   - `GET /sunlit` + `POST /sunlit/batch`, `GET /places`, `GET /sun-hours`,
      `GET /trees`, `GET /building`, `GET /debug/ray`.
    - Reste à faire : `GET /shadow/{z}/{x}/{y}.png?t=` (tuile raster, si piste
      B/web) et le cache CDN clé `(z,x,y,jour,tranche de 5-10 min)`.
@@ -98,8 +98,11 @@ Fonctionnalités cibles :
 - **Arbres (backlog)** : Meta/WRI Canopy Height Map v2 (2026, ~1 m, COG
   EPSG:3857 sur AWS) ; OSM `natural=tree` (riche en France via imports
   municipaux), `tree_row`, `wood`/`forest`.
-- **POI terrasses** : Overpass, `amenity=bar|restaurant|cafe` +
-  `outdoor_seating=yes`.
+- **Établissements (en place)** : OSM `amenity` = bar, pub, restaurant, cafe,
+  fast_food, biergarten (`osm::AMENITIES`). **Pas de filtre sur
+  `outdoor_seating`** à l'ingestion : le tag manque sur ~79 % des
+  établissements parisiens, filtrer dessus en écartait la majorité. Il est
+  stocké tel quel et le filtre est laissé au client.
 
 ## État du code
 

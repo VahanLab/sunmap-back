@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS trees (
 --
 -- La position est celle d'OSM, non corrigée : le déport côté rue est calculé au
 -- runtime, il dépend de la DSM et n'a rien à faire en base.
-CREATE TABLE IF NOT EXISTS terraces (
+CREATE TABLE IF NOT EXISTS places (
     osm_id           text PRIMARY KEY,
     name             text,
     amenity          text,
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS terraces (
 -- utilisable à chaque déplacement de carte.
 CREATE INDEX IF NOT EXISTS buildings_geom_idx ON buildings USING GIST (geom);
 CREATE INDEX IF NOT EXISTS trees_geom_idx     ON trees     USING GIST (geom);
-CREATE INDEX IF NOT EXISTS terraces_geom_idx  ON terraces  USING GIST (geom);
+CREATE INDEX IF NOT EXISTS places_geom_idx  ON places  USING GIST (geom);
 
 -- ------------------------------------------------------ suivi d'ingestion
 
@@ -79,7 +79,7 @@ CREATE INDEX IF NOT EXISTS terraces_geom_idx  ON terraces  USING GIST (geom);
 -- les tuiles déjà absorbées rend l'ingestion reprenable après un 504 ou une
 -- coupure, au lieu de tout refaire.
 CREATE TABLE IF NOT EXISTS ingest_log (
-    layer        text NOT NULL,   -- 'buildings' | 'trees' | 'terraces'
+    layer        text NOT NULL,   -- 'buildings' | 'trees' | 'places'
     chunk_key    text NOT NULL,   -- bbox arrondie de la tuile Overpass
     ingested_at  timestamptz NOT NULL DEFAULT now(),
     feature_count integer NOT NULL,

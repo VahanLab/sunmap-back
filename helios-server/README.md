@@ -43,7 +43,7 @@ osmium export ... -f geojsonseq | cargo run --release --bin import
 
 Mesuré sur l'emprise Paris (extrait Île-de-France, 336 Mo) : **45 s**
 d'extraction osmium, **50 s** d'import, **181 Mo** de RSS crête, pour 357 498
-emprises, 212 973 arbres et 3 931 terrasses.
+emprises, 212 973 arbres et 21 336 établissements.
 
 **`ingest` (Overpass par tuiles) — dépannage seulement.** Utile pour
 rafraîchir une petite zone sans re-télécharger un extrait. Ne pas l'utiliser
@@ -81,7 +81,7 @@ haut projettent 230 m.
 | Hauteur d'observateur | `observer_height` (m) : 0 = sol, 1.5 ≈ personne attablée (« tête au soleil, pieds à l'ombre ») |
 | Position solaire | Algorithme NOAA (~0,01°), UTC |
 | Traçage | Toute réponse « à l'ombre » nomme l'obstacle (`blocker`) : id OSM, hauteur, distance, de combien il dépasse le rayon |
-| Cache | Tuiles DEM et emprises en RAM ; résultats `/terraces` par (bbox, tranche de 5 min, hauteur) |
+| Cache | Tuiles DEM et emprises en RAM ; résultats `/places` par (bbox, tranche de 5 min, hauteur) |
 
 **Limites actuelles :**
 
@@ -150,11 +150,17 @@ curl "http://localhost:8080/sunlit?lat=48.8611&lng=2.3493&t=2026-07-26T13:00:00Z
 Plusieurs points au même instant. Corps JSON : `points` (`[{lat, lng}]`), `t`,
 `observer_height`. Réponse : tableau au format du GET, dans l'ordre d'entrée.
 
-### `GET /terraces`
+### `GET /places`
 
-Bars/restaurants/cafés avec terrasse dans une bounding box, classés
+Établissements de restauration et de boisson d'une bounding box, classés
 soleil/ombre à l'instant t. Une requête par viewport ; le switch soleil/ombre
-filtre côté client sur `sunlit`.
+et les filtres de catégorie s'appliquent côté client, sans nouvel appel.
+
+Catégories retenues (`osm::AMENITIES`) : `bar`, `pub`, `restaurant`, `cafe`,
+`fast_food`, `biergarten`. **Aucun filtre sur `outdoor_seating`** : le tag
+manque sur ~79 % des établissements parisiens, donc filtrer dessus en écartait
+la majorité. Il est renvoyé tel quel, à charge du client d'en faire un filtre
+optionnel.
 
 | Paramètre | Type | Obligatoire | Description |
 |---|---|---|---|
@@ -166,10 +172,11 @@ filtre côté client sur `sunlit`.
 {
   "t_unix": 1785070800.0,
   "sun_azimuth_deg": 208.7, "sun_elevation_deg": 57.9,
-  "count": 422,
-  "terraces": [
+  "count": 1181,
+  "places": [
     {
       "id": "node/2298691508", "name": "Les Acrobates", "amenity": "bar",
+      "outdoor_seating": true,
       "lat": 48.8575, "lng": 2.3496,
       "sunlit": true,
       "snapped_lat": 48.85750, "snapped_lng": 2.34947, "snapped_distance_m": 6.3,
@@ -302,7 +309,7 @@ EPSG:4326, index GIST sur chacune. Cf. `schema.sql`, commenté.
 |---|---|---|
 | `buildings` | `MultiPolygon` | Emprises + hauteur + provenance de la hauteur. Les relations gardent leurs anneaux intérieurs (cours) |
 | `trees` | `Point` | Hauteur et rayon de couronne |
-| `terraces` | `Point` | POI et leurs tags, position OSM **non corrigée** — le déport côté rue dépend de la DSM et se calcule au runtime |
+| `places` | `Point` | POI et leurs tags, position OSM **non corrigée** — le déport côté rue dépend de la DSM et se calcule au runtime |
 
 ## Roadmap (cf. CLAUDE.md racine)
 

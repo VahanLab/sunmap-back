@@ -21,7 +21,7 @@ use std::io::BufRead;
 use serde::Deserialize;
 
 use crate::osm::{
-    building_from, fill_missing_heights, poi_from, tree_from, Building, Poi, Tree, AMENITIES,
+    building_from, fill_missing_heights, place_from, tree_from, Building, Place, Tree, AMENITIES,
 };
 
 /// Une feature GeoJSON telle que produite par `osmium export -u type_id`.
@@ -50,7 +50,7 @@ enum Geometry {
 pub struct Extract {
     pub buildings: Vec<Building>,
     pub trees: Vec<Tree>,
-    pub terraces: Vec<Poi>,
+    pub places: Vec<Place>,
 }
 
 /// Trie chaque feature dans sa couche selon ses tags.
@@ -108,7 +108,7 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
                     out.trees.push(tree_from(osm_id.clone(), lat, lng, &tags));
                 }
                 if is_terrace {
-                    out.terraces.push(poi_from(osm_id, lat, lng, &tags));
+                    out.places.push(place_from(osm_id, lat, lng, &tags));
                 }
             }
         }
@@ -118,11 +118,11 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
     let tagged = out.buildings.iter().filter(|b| b.height_from_osm).count();
     println!(
         "extrait : {} emprises ({tagged} avec hauteur OSM, {} au défaut {fallback:.1} m), \
-         {} arbres, {} terrasses — {ignored} features ignorées",
+         {} arbres, {} établissements — {ignored} features ignorées",
         out.buildings.len(),
         out.buildings.len() - tagged,
         out.trees.len(),
-        out.terraces.len(),
+        out.places.len(),
     );
     Ok(out)
 }
@@ -239,8 +239,8 @@ mod tests {
         let line = r#"{"type":"Feature","id":"w2","properties":{"building":"yes","amenity":"restaurant","outdoor_seating":"yes","name":"Chez X"},"geometry":{"type":"Polygon","coordinates":[[[2.0,48.0],[2.2,48.0],[2.2,48.2],[2.0,48.2],[2.0,48.0]]]}}"#;
         let extract = read_geojsonseq(line.as_bytes()).unwrap();
         assert_eq!(extract.buildings.len(), 1);
-        assert_eq!(extract.terraces.len(), 1);
-        let poi = &extract.terraces[0];
+        assert_eq!(extract.places.len(), 1);
+        let poi = &extract.places[0];
         assert_eq!(poi.name.as_deref(), Some("Chez X"));
         // Ramené au centre de l'emprise, comme `out center` côté Overpass.
         assert!((poi.lat - 48.1).abs() < 1e-9);

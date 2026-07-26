@@ -3,7 +3,7 @@
 //! - `GET /sunlit?lat=&lng=[&t=][&observer_height=]` : le point est-il au
 //!   soleil à l'instant t ? (t = RFC3339 ou secondes Unix, défaut maintenant)
 //! - `POST /sunlit/batch` : même question pour une liste de points
-//!   (classification de terrasses).
+//!   (classification d'établissements).
 //!
 //! DSM : tuiles Mapterhorn (webp 512 px, encodage Terrarium — la même source
 //! que l'app iOS), assemblées 3×3 autour du point pour donner de la marge aux
@@ -30,10 +30,10 @@ use helios_server::osm::Building;
 /// en quelques ms, mais la même fenêtre est redemandée à chaque tick du slider
 /// et le cache évite surtout de refaire le parsing WKT.
 type BuildingCache = RwLock<HashMap<String, Arc<Vec<Building>>>>;
-/// Résultat déjà calculé de `/terraces` (classification soleil/ombre), par
+/// Résultat déjà calculé de `/places` (classification soleil/ombre), par
 /// clé bbox+instant+hauteur d'observateur — évite de refaire tout le ray
 /// marching quand la même requête (même minute, même zone) revient.
-type TerracesResultCache = RwLock<HashMap<String, Arc<TerracesResponse>>>;
+type PlacesResultCache = RwLock<HashMap<String, Arc<PlacesResponse>>>;
 
 /// Valeur de la grille `owner` pour « aucun bâtiment ici » (relief nu).
 const OWNER_TERRAIN: u32 = u32::MAX;
@@ -43,7 +43,7 @@ struct AppState {
     pool: sqlx::PgPool,
     tiles: TileCache,
     buildings: BuildingCache,
-    terraces_results: TerracesResultCache,
+    places_results: PlacesResultCache,
 }
 
 #[tokio::main]
@@ -64,7 +64,7 @@ async fn main() {
     for (table, label) in [
         ("buildings", "bâtiments"),
         ("trees", "arbres"),
-        ("terraces", "terrasses"),
+        ("places", "établissements"),
     ] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&pool)
@@ -84,13 +84,13 @@ async fn main() {
         pool,
         tiles: RwLock::new(HashMap::new()),
         buildings: RwLock::new(HashMap::new()),
-        terraces_results: RwLock::new(HashMap::new()),
+        places_results: RwLock::new(HashMap::new()),
     });
 
     let app = Router::new()
         .route("/sunlit", get(sunlit))
         .route("/sunlit/batch", post(sunlit_batch))
-        .route("/terraces", get(terraces))
+        .route("/places", get(places))
         .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
@@ -937,10 +937,10 @@ async fn fetch_tile(
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
-// ------------------------------------------------------------- terrasses
+// ---------------------------------------------------------- établissements
 
 #[derive(Deserialize)]
-struct TerracesQuery {
+struct PlacesQuery {
     /// `min_lon,min_lat,max_lon,max_lat`
     bbox: String,
     t: Option<String>,
@@ -949,16 +949,16 @@ struct TerracesQuery {
 }
 
 #[derive(Serialize, Clone)]
-struct TerracesResponse {
+struct PlacesResponse {
     t_unix: f64,
     sun_azimuth_deg: f64,
     sun_elevation_deg: f64,
     count: usize,
-    terraces: Vec<Terrace>,
+    places: Vec<Place>,
 }
 
 #[derive(Serialize, Clone)]
-struct Terrace {
+struct Place {
     /// Identifiant OSM, ex. "node/123456" ou "way/789".
     id: String,
     name: Option<String>,
@@ -999,10 +999,10 @@ struct Terrace {
 /// Limite assumée (POC) : classification binaire au centroïde — une terrasse
 /// est un polygone, potentiellement mi-ombre mi-soleil. Prochaine étape :
 /// échantillonner 3-5 points dans un buffer côté rue et renvoyer un %.
-async fn terraces(
+async fn places(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<TerracesQuery>,
-) -> Result<Json<TerracesResponse>, (StatusCode, String)> {
+    Query(q): Query<PlacesQuery>,
+) -> Result<Json<PlacesResponse>, (StatusCode, String)> {
     let t = parse_time(q.t.as_deref())?;
     let h = q.observer_height.unwrap_or(1.5);
 
@@ -1027,7 +1027,7 @@ async fn terraces(
     // sans refaire tuiles/bâtiments/ray marching.
     let bucket = (t / 300.0).round() as i64;
     let result_key = format!("{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2}");
-    if let Some(hit) = state.terraces_results.read().await.get(&result_key) {
+    if let Some(hit) = state.places_results.read().await.get(&result_key) {
         return Ok(Json((**hit).clone()));
     }
 
@@ -1046,7 +1046,7 @@ async fn terraces(
         ));
     }
 
-    let pois = db::terraces_in_bbox(&state.pool, s, w, n, e)
+    let pois = db::places_in_bbox(&state.pool, s, w, n, e)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
     let (mut dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
@@ -1065,7 +1065,7 @@ async fn terraces(
         step_px: 1.0,
     };
 
-    let terraces: Vec<Terrace> = pois
+    let places: Vec<Place> = pois
         .iter()
         .map(|p| {
             let (wx, wy) = world_px(p.lat, p.lng);
@@ -1080,7 +1080,7 @@ async fn terraces(
                 .flatten();
             let (snapped_lat, snapped_lng) =
                 latlon_of_world_px(origin_x + px, origin_y + py);
-            Terrace {
+            Place {
                 id: p.osm_id.clone(),
                 name: p.name.clone(),
                 amenity: p.amenity.clone(),
@@ -1103,15 +1103,15 @@ async fn terraces(
         })
         .collect();
 
-    let response = TerracesResponse {
+    let response = PlacesResponse {
         t_unix: t,
         sun_azimuth_deg: sun.azimuth_deg,
         sun_elevation_deg: sun.elevation_deg,
-        count: terraces.len(),
-        terraces,
+        count: places.len(),
+        places,
     };
     state
-        .terraces_results
+        .places_results
         .write()
         .await
         .insert(result_key, Arc::new(response.clone()));

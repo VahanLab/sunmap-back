@@ -51,7 +51,7 @@ async fn main() {
             .map(|s| s.as_str())
             .collect();
         if explicit.is_empty() {
-            vec!["buildings", "trees", "terraces"]
+            vec!["buildings", "trees", "places"]
         } else {
             explicit
         }
@@ -153,7 +153,7 @@ async fn main() {
     for (table, label) in [
         ("buildings", "bâtiments"),
         ("trees", "arbres"),
-        ("terraces", "terrasses"),
+        ("places", "établissements"),
     ] {
         let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
             .fetch_one(&pool)
@@ -187,9 +187,9 @@ async fn ingest_chunk(
                 .map_err(|e| e.to_string())?;
             Ok(items.len())
         }
-        "terraces" => {
-            let items = osm::fetch_terraces(http, s, w, n, e).await?;
-            db::upsert_terraces(pool, &items)
+        "places" => {
+            let items = osm::fetch_places(http, s, w, n, e).await?;
+            db::upsert_places(pool, &items)
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(items.len())

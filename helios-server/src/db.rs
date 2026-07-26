@@ -9,7 +9,7 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
-use crate::osm::{Building, Poi, Tree};
+use crate::osm::{Building, Place, Tree};
 
 /// URL par défaut en dev local. Surchargeable par `DATABASE_URL`.
 pub const DEFAULT_URL: &str = "postgres://localhost/sunmap";
@@ -91,25 +91,25 @@ pub async fn trees_in_bbox(
         .collect())
 }
 
-pub async fn terraces_in_bbox(
+pub async fn places_in_bbox(
     pool: &PgPool,
     s: f64,
     w: f64,
     n: f64,
     e: f64,
-) -> Result<Vec<Poi>, sqlx::Error> {
+) -> Result<Vec<Place>, sqlx::Error> {
     let sql = format!(
         "SELECT osm_id, name, amenity, outdoor_seating, website, phone, opening_hours, \
                 cuisine, wikidata, \
                 ST_Y(geom) AS lat, ST_X(geom) AS lng \
-         FROM terraces WHERE geom && {}",
+         FROM places WHERE geom && {}",
         envelope(s, w, n, e)
     );
     Ok(sqlx::query(&sql)
         .fetch_all(pool)
         .await?
         .into_iter()
-        .map(|r| Poi {
+        .map(|r| Place {
             osm_id: r.get("osm_id"),
             name: r.get("name"),
             amenity: r.get("amenity"),
@@ -224,13 +224,13 @@ pub async fn upsert_trees(pool: &PgPool, trees: &[Tree]) -> Result<u64, sqlx::Er
     Ok(written)
 }
 
-pub async fn upsert_terraces(pool: &PgPool, pois: &[Poi]) -> Result<u64, sqlx::Error> {
+pub async fn upsert_places(pool: &PgPool, pois: &[Place]) -> Result<u64, sqlx::Error> {
     let mut written = 0u64;
     for chunk in pois.chunks(1000) {
         let mut tx = pool.begin().await?;
         for p in chunk {
             written += sqlx::query(
-                "INSERT INTO terraces (osm_id, name, amenity, outdoor_seating, website, phone, \
+                "INSERT INTO places (osm_id, name, amenity, outdoor_seating, website, phone, \
                                        opening_hours, cuisine, wikidata, geom) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                          ST_SetSRID(ST_MakePoint($10, $11), 4326)) \
