@@ -221,8 +221,11 @@ async fn assemble_grid(
 /// `owner` (même dimensions que la DSM) reçoit l'index du bâtiment qui a fixé
 /// l'altitude de chaque cellule — c'est ce qui permet de répondre « quel
 /// immeuble fait cette ombre » après le ray marching.
+/// `terrain` est le relief nu (la DSM AVANT tout stamping) : c'est lui qui
+/// donne l'altitude du sol sous chaque bâtiment, cf. commentaire plus bas.
 fn stamp_buildings(
     dsm: &mut Dsm,
+    terrain: &Dsm,
     owner: &mut [u32],
     origin_x: f64,
     origin_y: f64,
@@ -261,9 +264,18 @@ fn stamp_buildings(
         // Sol de référence : centre du polygone (bbox center, approximation
         // suffisante pour l'altitude de départ — un bâtiment n'a
         // généralement pas de dénivelé notable sous son emprise).
+        //
+        // Échantillonné sur le RELIEF SEUL, jamais sur la DSM en cours de
+        // construction : sinon un bâtiment posé sur une emprise déjà stampée
+        // prend le toit du précédent pour sol et les hauteurs s'additionnent.
+        // Sans conséquence tant qu'on ne chargeait que `way[building]` (les
+        // empreintes se recouvrent peu), mais `building:part` recouvre par
+        // construction son bâtiment parent, et les membres d'une relation se
+        // recouvrent entre eux — on a observé un toit à 102 m pour un
+        // bâtiment de 25 m sur un sol à 35 m, soit trois empilements.
         let cx = ((min_x + max_x) / 2.0).clamp(0.0, dsm.width as f64 - 1.0);
         let cy = ((min_y + max_y) / 2.0).clamp(0.0, dsm.height as f64 - 1.0);
-        let target = dsm.sample(cx, cy).unwrap_or(0.0) + b.height_m;
+        let target = terrain.sample(cx, cy).unwrap_or(0.0) + b.height_m;
 
         let y0 = min_y.max(0.0).floor() as usize;
         let y1 = max_y.min(dsm.height as f64 - 1.0).ceil() as usize;
@@ -314,7 +326,8 @@ async fn add_buildings(
     let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
     let buildings = overpass_buildings(state, south, west, north, east).await?;
     let mut owner = vec![OWNER_TERRAIN; dsm.width * dsm.height];
-    stamp_buildings(dsm, &mut owner, origin_x, origin_y, &buildings);
+    let terrain = dsm.clone();
+    stamp_buildings(dsm, &terrain, &mut owner, origin_x, origin_y, &buildings);
     Ok((buildings, owner))
 }
 
