@@ -23,6 +23,8 @@ use helios_core::dsm::Dsm;
 use helios_core::shadow::{shadow_hit_from_ground, ShadowHit, ShadowParams};
 use helios_core::sun::sun_position;
 use helios_server::db;
+use helios_server::i18n::{self, Lang};
+use helios_server::opening_hours;
 use helios_server::dem::{self, latlon_of_world_px, world_px, TileCache, TILE_SIZE, ZOOM};
 use helios_server::osm::Building;
 
@@ -829,6 +831,8 @@ async fn fetch_tile(
 struct PlacesQuery {
     /// `min_lon,min_lat,max_lon,max_lat`
     bbox: String,
+    /// Langue des libellés ("fr", "en"). Défaut : français.
+    lang: Option<String>,
     t: Option<String>,
     /// Défaut 1,5 m : personne attablée en terrasse.
     observer_height: Option<f64>,
@@ -879,7 +883,14 @@ struct Place {
     /// Champs OSM optionnels — couverture très inégale selon les POI.
     website: Option<String>,
     phone: Option<String>,
-    opening_hours: Option<String>,
+    /// Libellé traduit de la catégorie — le client n'a plus à connaître les
+    /// valeurs de tags OSM.
+    category_label: Option<String>,
+    /// Types de cuisine traduits. Le tag OSM est une liste séparée par `;` et
+    /// remplie de clés techniques (`coffee_shop`), inutilisables telles quelles.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cuisine_labels: Vec<String>,
+    opening_hours: Option<OpeningHoursPayload>,
     cuisine: Option<String>,
     /// Identifiant Wikidata (ex. "Q123456") : présent sur ~15% des POI,
     /// utilisable côté client pour aller chercher une photo (propriété P18)
@@ -968,6 +979,55 @@ async fn report_terrace(
     }))
 }
 
+/// Horaires d'ouverture prêts à afficher.
+///
+/// `weekly` absent = chaîne non décodable : le client affiche `raw` tel quel.
+/// Le décodage vit ici pour que les clients n'aient qu'à rendre, et pour
+/// qu'Android n'ait pas à réécrire la grammaire `opening_hours`.
+#[derive(Serialize, Clone)]
+struct OpeningHoursPayload {
+    /// Toujours présent, pour l'affichage de repli et pour le debug.
+    raw: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    weekly: Option<Vec<OpeningHoursDay>>,
+}
+
+#[derive(Serialize, Clone)]
+struct OpeningHoursDay {
+    /// 0 = lundi.
+    index: usize,
+    label: String,
+    /// Vide = fermé ce jour-là.
+    ranges: Vec<String>,
+}
+
+fn opening_hours_payload(raw: &str, lang: Lang) -> OpeningHoursPayload {
+    let weekly = opening_hours::parse(raw).map(|week| {
+        let labels = lang.weekdays();
+        week.iter()
+            .enumerate()
+            .map(|(index, ranges)| OpeningHoursDay {
+                index,
+                label: labels[index].to_string(),
+                ranges: ranges
+                    .iter()
+                    .map(|r| {
+                        if r.is_all_day() {
+                            lang.all_day().to_string()
+                        } else {
+                            r.text()
+                        }
+                    })
+                    .collect(),
+            })
+            .collect()
+    });
+    OpeningHoursPayload {
+        raw: raw.to_string(),
+        weekly,
+    }
+}
+
 /// Bars/restaurants/cafés avec terrasse dans la bbox, classés soleil/ombre.
 ///
 /// Limite assumée (POC) : classification binaire au centroïde — une terrasse
@@ -979,6 +1039,7 @@ async fn places(
 ) -> Result<Json<PlacesResponse>, (StatusCode, String)> {
     let t = parse_time(q.t.as_deref())?;
     let h = q.observer_height.unwrap_or(1.5);
+    let lang = Lang::parse(q.lang.as_deref());
 
     // bbox = min_lon,min_lat,max_lon,max_lat
     let parts: Vec<f64> = q
@@ -1000,7 +1061,7 @@ async fn places(
     // d'observateur → renvoie directement la classification déjà calculée,
     // sans refaire tuiles/bâtiments/ray marching.
     let bucket = (t / 300.0).round() as i64;
-    let result_key = format!("{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2}");
+    let result_key = format!("{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2},{lang:?}");
     if let Some(hit) = state.places_results.read().await.get(&result_key) {
         return Ok(Json((**hit).clone()));
     }
@@ -1092,7 +1153,16 @@ async fn places(
                 elevation_m: ground,
                 website: p.website.clone(),
                 phone: p.phone.clone(),
-                opening_hours: p.opening_hours.clone(),
+                category_label: p.amenity.as_deref().map(|a| i18n::amenity_label(a, lang)),
+                cuisine_labels: p
+                    .cuisine
+                    .as_deref()
+                    .map(|c| i18n::cuisine_labels(c, lang))
+                    .unwrap_or_default(),
+                opening_hours: p
+                    .opening_hours
+                    .as_deref()
+                    .map(|raw| opening_hours_payload(raw, lang)),
                 cuisine: p.cuisine.clone(),
                 wikidata: p.wikidata.clone(),
             }

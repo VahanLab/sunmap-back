@@ -7,5 +7,7 @@
 
 pub mod db;
 pub mod dem;
+pub mod i18n;
+pub mod opening_hours;
 pub mod osm;
 pub mod pbf;

@@ -168,6 +168,19 @@ dernier cas : l'absence d'information n'est pas une absence de terrasse.
 | `bbox` | string | oui | `min_lon,min_lat,max_lon,max_lat` (max ~3 km de côté) |
 | `t` | string | non | Défaut : maintenant |
 | `observer_height` | f64 | non | Défaut : **1.5** |
+| `lang` | string | non | Langue des libellés (`fr`, `en`). Défaut : **fr** |
+
+Les valeurs de tags OSM sont des clés techniques anglaises (`coffee_shop`,
+`fast_food`) inutilisables telles quelles. Le serveur renvoie donc
+`category_label` et `cuisine_labels` traduits, et décode `opening_hours` en
+tableau hebdomadaire. Les clients n'ont plus qu'à afficher, et Android n'aura
+pas à recopier ces tables ni la grammaire `opening_hours`.
+
+`opening_hours.weekly` est **absent** quand la chaîne n'a pas pu être décodée :
+le client affiche alors `raw` tel quel. Le décodeur couvre 97,9 % des 6 055
+valeurs distinctes de la base parisienne ; les échecs sont du saisonnier, du
+texte libre et des fautes de frappe, qu'aucun tableau hebdomadaire ne
+représenterait honnêtement.
 
 ```json
 {
