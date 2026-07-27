@@ -261,12 +261,19 @@ sur la carte — statut immédiat + timeline.
   "t_unix": 1784998800.0,
   "sunlit_now": true,
   "day_start_unix": 1784937600.0, "day_end_unix": 1785024000.0,
-  "total_sunlit_minutes": 355, "total_shadow_minutes": 1085,
+  "state_now": "sunlit",
+  "total_sunlit_minutes": 355, "total_shadow_minutes": 555, "total_night_minutes": 530,
   "intervals": [
-    {"start_unix": 1784937600.0, "end_unix": 1784980500.0, "sunlit": false}
+    {"start_unix": 1784937600.0, "end_unix": 1784980500.0, "state": "night"}
   ]
 }
 ```
+
+Trois états et non deux : `sunlit`, `shadow` (soleil levé mais masqué) et
+`night`. Les confondre rendait les cumuls trompeurs — « à l'ombre 16 h » ne dit
+rien de la qualité d'un endroit si 10 h de ces 16 h sont de la nuit. `/places`
+renvoie le même champ `state` à côté de `sunlit`, pour que les deux écrans
+disent la même chose.
 
 `blocker_now` apparaît quand le point est à l'ombre à `t_unix`, au format de
 `/sunlit`. `intervals` : segments contigus (échantillonnage 5 min, regroupé)

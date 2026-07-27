@@ -546,7 +546,7 @@ struct SunHoursResponse {
     /// Instant demandé et sa classification, pour un statut "maintenant"
     /// immédiat sans avoir à chercher dans `intervals`.
     t_unix: f64,
-    sunlit_now: bool,
+    state_now: SunState,
     /// Ce qui bloque le soleil à `t_unix` (absent si au soleil).
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker_now: Option<Blocker>,
@@ -556,15 +556,33 @@ struct SunHoursResponse {
     /// client de vérifier que le serveur a bien compris son fuseau.
     utc_offset_minutes: i32,
     total_sunlit_minutes: u32,
+    /// Ombre portée de jour uniquement. La nuit est comptée à part : un point
+    /// « à l'ombre 16 h » alors qu'il fait nuit 10 h de ces 16 h ne dit rien
+    /// d'utile sur la qualité de l'endroit.
     total_shadow_minutes: u32,
+    total_night_minutes: u32,
     intervals: Vec<SunInterval>,
+}
+
+/// État d'un point vis-à-vis du soleil.
+///
+/// Trois cas et non deux : confondre l'ombre portée et la nuit rendait les
+/// cumuls trompeurs, et la frise de la journée illisible.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum SunState {
+    Sunlit,
+    /// Soleil levé, mais un obstacle le masque.
+    Shadow,
+    /// Soleil sous l'horizon.
+    Night,
 }
 
 #[derive(Serialize)]
 struct SunInterval {
     start_unix: f64,
     end_unix: f64,
-    sunlit: bool,
+    state: SunState,
 }
 
 /// Journée calendaire **locale** (00:00 → 24:00) contenant l'instant donné,
@@ -606,47 +624,58 @@ async fn sun_hours(
     let steps = (86_400.0 / STEP_S) as usize;
 
     let mut intervals: Vec<SunInterval> = Vec::new();
-    let mut sunlit_now = false;
+    let mut state_now = SunState::Night;
     let mut blocker_now = None;
-    let mut total_sunlit_steps: u32 = 0;
+    let (mut sunlit_steps, mut shadow_steps, mut night_steps) = (0u32, 0u32, 0u32);
 
     for i in 0..steps {
         let step_t = day_start + i as f64 * STEP_S;
         let sun = sun_position(step_t, q.lat, q.lng);
         let (sunlit, blocker) = ctx.classify_at(&sun, &params);
-        if sunlit {
-            total_sunlit_steps += 1;
+        let state = if !sun.is_up() {
+            SunState::Night
+        } else if sunlit {
+            SunState::Sunlit
+        } else {
+            SunState::Shadow
+        };
+        match state {
+            SunState::Sunlit => sunlit_steps += 1,
+            SunState::Shadow => shadow_steps += 1,
+            SunState::Night => night_steps += 1,
         }
         if step_t <= t && t < step_t + STEP_S {
-            sunlit_now = sunlit;
+            state_now = state;
             blocker_now = blocker;
         }
 
         match intervals.last_mut() {
-            Some(last) if last.sunlit == sunlit => last.end_unix = step_t + STEP_S,
+            Some(last) if last.state == state => last.end_unix = step_t + STEP_S,
             _ => intervals.push(SunInterval {
                 start_unix: step_t,
                 end_unix: step_t + STEP_S,
-                sunlit,
+                state,
             }),
         }
     }
 
-    let total_sunlit_minutes = total_sunlit_steps * 5;
-    let total_shadow_minutes = (steps as u32 - total_sunlit_steps) * 5;
+    let total_sunlit_minutes = sunlit_steps * 5;
+    let total_shadow_minutes = shadow_steps * 5;
+    let total_night_minutes = night_steps * 5;
 
     Ok(Json(SunHoursResponse {
         lat: q.lat,
         lng: q.lng,
         elevation_m: ctx.ground,
         t_unix: t,
-        sunlit_now,
+        state_now,
         blocker_now,
         day_start_unix: day_start,
         day_end_unix: day_end,
         utc_offset_minutes,
         total_sunlit_minutes,
         total_shadow_minutes,
+        total_night_minutes,
         intervals,
     }))
 }
@@ -866,6 +895,9 @@ struct Place {
     lat: f64,
     lng: f64,
     sunlit: bool,
+    /// Distingue l'ombre portée de la nuit, ce que `sunlit` seul ne peut pas
+    /// dire — les deux y valent `false`.
+    state: SunState,
     /// Ce qui bloque le soleil (absent si `sunlit`) — sert au debug visuel
     /// côté client : « c'est cet immeuble-là qui te met à l'ombre ».
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1145,6 +1177,13 @@ async fn places(
                 lat: p.lat,
                 lng: p.lng,
                 sunlit: sun.is_up() && hit.is_none(),
+                state: if !sun.is_up() {
+                    SunState::Night
+                } else if hit.is_none() {
+                    SunState::Sunlit
+                } else {
+                    SunState::Shadow
+                },
                 blocker: hit
                     .map(|h| describe_blocker(&h, &dsm, &owner, &buildings, origin_x, origin_y)),
                 snapped_lat: (moved_m > 0.0).then_some(snapped_lat),
