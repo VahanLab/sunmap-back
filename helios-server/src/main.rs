@@ -341,10 +341,14 @@ async fn add_buildings(
 ) -> Result<(Arc<Vec<Building>>, Vec<u32>), (StatusCode, String)> {
     let (north, west) = latlon_of_world_px(origin_x, origin_y);
     let (south, east) = latlon_of_world_px(origin_x + dsm.width as f64, origin_y + dsm.height as f64);
+    let phase = std::time::Instant::now();
     let buildings = load_buildings(state, south, west, north, east).await?;
+    let t_buildings_query_ms = phase.elapsed().as_secs_f64() * 1000.0;
     let mut owner = vec![OWNER_TERRAIN; dsm.width * dsm.height];
     let terrain = dsm.clone();
+    let phase = std::time::Instant::now();
     stamp_buildings(dsm, &terrain, &mut owner, origin_x, origin_y, &buildings);
+    let t_stamp_buildings_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
     // Végétation ensuite, jamais avant : là où arbre et bâtiment se recouvrent,
     // c'est le bâtiment qui doit rester le coupable désigné.
@@ -352,15 +356,22 @@ async fn add_buildings(
     // Une lecture ratée n'interrompt pas la requête : mieux vaut une réponse
     // sans ombre de feuillage qu'une erreur, la végétation étant un raffinement
     // par-dessus le relief et le bâti.
+    let phase = std::time::Instant::now();
     let woods = db::woods_in_bbox(&state.pool, south, west, north, east)
         .await
         .unwrap_or_default();
     let trees = db::trees_in_bbox(&state.pool, south, west, north, east)
         .await
         .unwrap_or_default();
+    let t_canopy_query_ms = phase.elapsed().as_secs_f64() * 1000.0;
+    let phase = std::time::Instant::now();
     if !woods.is_empty() || !trees.is_empty() {
         stamp_canopy(dsm, &terrain, &mut owner, origin_x, origin_y, &woods, &trees);
     }
+    let t_stamp_canopy_ms = phase.elapsed().as_secs_f64() * 1000.0;
+    println!("[places] bâtiments : requête {t_buildings_query_ms:.1} ms, stamp {t_stamp_buildings_ms:.1} ms \
+              — canopée ({} bois, {} arbres) : requête {t_canopy_query_ms:.1} ms, stamp {t_stamp_canopy_ms:.1} ms",
+             woods.len(), trees.len());
     Ok((buildings, owner))
 }
 
@@ -553,6 +564,12 @@ async fn assemble_point(
     let py = wy - origin_y;
     let ground = dsm.sample(px, py).unwrap_or(0.0);
     let (buildings, owner) = add_buildings(state, &mut dsm, origin_x, origin_y).await?;
+    // Calculé une fois ici plutôt que dans `classify_at` : la grille ne change
+    // plus après `add_buildings`, mais `classify_at` peut être appelée des
+    // centaines de fois sur le même contexte (`/sun-hours` : un par tranche de
+    // 5 min de la journée) — un scan complet de la DSM à chaque fois y aurait
+    // le même coût que le bug corrigé sur `/places`.
+    let max_elevation = dsm.max_elevation();
 
     Ok(PointCtx {
         dsm,
@@ -563,6 +580,7 @@ async fn assemble_point(
         px,
         py,
         ground,
+        max_elevation,
     })
 }
 
@@ -578,6 +596,9 @@ struct PointCtx {
     py: f64,
     /// Altitude du relief SEUL sous le point (avant stamping des bâtiments).
     ground: f32,
+    /// Point le plus haut de toute la grille — voir le commentaire de
+    /// `assemble_point`.
+    max_elevation: f32,
 }
 
 impl PointCtx {
@@ -586,7 +607,8 @@ impl PointCtx {
         if !sun.is_up() {
             return (false, None);
         }
-        match shadow_hit_from_ground(&self.dsm, sun, self.px, self.py, self.ground, params) {
+        match shadow_hit_from_ground(&self.dsm, sun, self.px, self.py, self.ground, params,
+                                     self.max_elevation) {
             None => (true, None),
             Some(hit) => (
                 false,
@@ -1190,6 +1212,7 @@ async fn places(
     State(state): State<Arc<AppState>>,
     Query(q): Query<PlacesQuery>,
 ) -> Result<Json<PlacesResponse>, (StatusCode, String)> {
+    let request_start = std::time::Instant::now();
     let t = parse_time(q.t.as_deref())?;
     let h = q.observer_height.unwrap_or(1.5);
     let lang = Lang::parse(q.lang.as_deref());
@@ -1216,6 +1239,8 @@ async fn places(
     let bucket = (t / 300.0).round() as i64;
     let result_key = format!("{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2},{lang:?}");
     if let Some(hit) = state.places_results.read().await.get(&result_key) {
+        println!("[places] {result_key} → cache hit ({:.1} ms)",
+                 request_start.elapsed().as_secs_f64() * 1000.0);
         return Ok(Json((**hit).clone()));
     }
 
@@ -1234,18 +1259,25 @@ async fn places(
         ));
     }
 
+    let phase = std::time::Instant::now();
     let pois = db::places_in_bbox(&state.pool, s, w, n, e)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
     let reports = db::terrace_reports_in_bbox(&state.pool, s, w, n, e)
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+    let t_pois_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+    let phase = std::time::Instant::now();
     let (mut dsm, origin_x, origin_y) = assemble_grid(&state, tx0, ty0, tx1, ty1, (s + n) / 2.0).await?;
+    let t_dsm_ms = phase.elapsed().as_secs_f64() * 1000.0;
     // Relief seul, avant stamping des bâtiments : sert de sol pour chaque
     // terrasse (cf. commentaire dans classify() — un POI mal placé dans un
     // bâtiment côté OSM ne doit pas hériter de l'altitude du toit).
     let terrain_only = dsm.clone();
+    let phase = std::time::Instant::now();
     let (buildings, owner) = add_buildings(&state, &mut dsm, origin_x, origin_y).await?;
+    let t_buildings_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
     let mid_lat = (s + n) / 2.0;
     let mid_lng = (w + e) / 2.0;
@@ -1255,7 +1287,12 @@ async fn places(
         observer_height_m: h,
         step_px: 1.0,
     };
+    // Calculé une fois pour toute la classification, pas par établissement :
+    // `Dsm::max_elevation` scanne toute la grille, et le refaire par POI a
+    // fait passer une zone dense (1074 lieux) de ~150 ms à ~2 s.
+    let dsm_max_elevation = dsm.max_elevation();
 
+    let phase = std::time::Instant::now();
     let places: Vec<Place> = pois
         .iter()
         .map(|p| {
@@ -1283,7 +1320,7 @@ async fn places(
             let ground = terrain_only.sample(px, py).unwrap_or(0.0);
             let hit = sun
                 .is_up()
-                .then(|| shadow_hit_from_ground(&dsm, &sun, px, py, ground, &params))
+                .then(|| shadow_hit_from_ground(&dsm, &sun, px, py, ground, &params, dsm_max_elevation))
                 .flatten();
             let (snapped_lat, snapped_lng) =
                 latlon_of_world_px(origin_x + px, origin_y + py);
@@ -1330,6 +1367,8 @@ async fn places(
         })
         .collect();
 
+    let t_classify_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
     let response = PlacesResponse {
         t_unix: t,
         sun_azimuth_deg: sun.azimuth_deg,
@@ -1341,7 +1380,11 @@ async fn places(
         .places_results
         .write()
         .await
-        .insert(result_key, Arc::new(response.clone()));
+        .insert(result_key.clone(), Arc::new(response.clone()));
+    println!("[places] {result_key} → {} lieux — pois/reports {t_pois_ms:.1} ms, \
+              tuiles DEM {t_dsm_ms:.1} ms, bâtiments+canopée {t_buildings_ms:.1} ms, \
+              classification {t_classify_ms:.1} ms, TOTAL {:.1} ms",
+             response.count, request_start.elapsed().as_secs_f64() * 1000.0);
     Ok(Json(response))
 }
 

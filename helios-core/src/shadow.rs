@@ -80,7 +80,8 @@ pub fn is_shadowed_from_ground(
     ground: f32,
     params: &ShadowParams,
 ) -> bool {
-    !sun.is_up() || shadow_hit_from_ground(dsm, sun, px, py, ground, params).is_some()
+    !sun.is_up()
+        || shadow_hit_from_ground(dsm, sun, px, py, ground, params, dsm.max_elevation()).is_some()
 }
 
 /// Variante instrumentée de [`is_shadowed_from_ground`] : renvoie l'obstacle
@@ -90,6 +91,13 @@ pub fn is_shadowed_from_ground(
 ///
 /// Note : soleil couché renvoie `None` (aucun obstacle) alors que le point est
 /// bien à l'ombre — d'où le test `is_up()` séparé chez l'appelant.
+/// `dsm_max_elevation` : point le plus haut de toute la grille, en fourni par
+/// l'appelant plutôt que recalculé ici — `Dsm::max_elevation` scanne toute la
+/// grille (O(largeur×hauteur)), et cette fonction tourne une fois par
+/// établissement classifié. Le recalculer à chaque appel a fait une requête
+/// `/places` passer de ~150 ms à ~2 s sur une zone dense (1074 lieux × un
+/// scan complet de la DSM chacun). La grille ne change pas pendant la
+/// classification : un seul calcul en amont suffit.
 pub fn shadow_hit_from_ground(
     dsm: &Dsm,
     sun: &SunPosition,
@@ -97,6 +105,7 @@ pub fn shadow_hit_from_ground(
     py: f64,
     ground: f32,
     params: &ShadowParams,
+    dsm_max_elevation: f32,
 ) -> Option<ShadowHit> {
     if !sun.is_up() {
         return None;
@@ -115,7 +124,7 @@ pub fn shadow_hit_from_ground(
 
     // Au-delà de cette distance, même le point le plus haut de la grille
     // passe sous le rayon : inutile de marcher plus loin.
-    let max_useful_m = ((dsm.max_elevation() as f64 - z0).max(0.0)) / tan_elev.max(1e-9);
+    let max_useful_m = ((dsm_max_elevation as f64 - z0).max(0.0)) / tan_elev.max(1e-9);
     let max_m = params.max_distance_m.min(max_useful_m);
     let max_steps = (max_m / step_m).ceil() as usize;
 
