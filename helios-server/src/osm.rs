@@ -210,6 +210,71 @@ pub fn building_from(
     })
 }
 
+/// Emprise boisée.
+///
+/// Même forme qu'un bâtiment — un contour, une hauteur — donc même type, pour
+/// ne pas dupliquer la rasterisation en scanline ni le parsing WKT. C'est la
+/// table qui les sépare, et le tampon dans la DSM qui les traite différemment.
+pub type Wood = Building;
+
+/// Valeurs de `natural` et `landuse` qui désignent une emprise boisée.
+pub const WOOD_TAGS: &[(&str, &str)] = &[
+    ("natural", "wood"),
+    ("landuse", "forest"),
+    ("natural", "tree_row"),
+    ("natural", "scrub"),
+];
+
+/// Hauteur de canopée par défaut, en mètres, selon le type d'emprise.
+///
+/// OSM ne tague quasiment jamais la hauteur d'un bois. Ces valeurs sont des
+/// ordres de grandeur pour la végétation d'Europe tempérée, destinées à être
+/// remplacées par un modèle de hauteur de canopée. Volontairement prudentes :
+/// surestimer allongerait des ombres qui n'existent pas.
+fn default_canopy_height(tags: &HashMap<String, String>) -> f64 {
+    match (
+        tags.get("natural").map(String::as_str),
+        tags.get("landuse").map(String::as_str),
+    ) {
+        // Broussailles : au-dessus d'une personne assise, sous un arbre.
+        (Some("scrub"), _) => 3.0,
+        // Alignement d'arbres de rue, généralement étêté.
+        (Some("tree_row"), _) => 12.0,
+        // Futaie tempérée arrivée à maturité.
+        _ => 18.0,
+    }
+}
+
+/// Emprise boisée à partir de ses tags et de ses anneaux.
+///
+/// Renvoie `None` si aucun anneau exploitable — même garde-fou que pour les
+/// bâtiments.
+pub fn wood_from(
+    osm_id: String,
+    tags: &HashMap<String, String>,
+    rings: Vec<Vec<(f64, f64)>>,
+) -> Option<Wood> {
+    let rings: Vec<Vec<(f64, f64)>> = rings.into_iter().filter(|r| r.len() >= 3).collect();
+    if rings.is_empty() {
+        return None;
+    }
+    let tagged = parse_meters(tags.get("height"));
+    Some(Wood {
+        osm_id,
+        name: tags.get("name").cloned(),
+        rings,
+        height_m: tagged.unwrap_or_else(|| default_canopy_height(tags)) as f32,
+        height_from_osm: tagged.is_some(),
+    })
+}
+
+/// Est-ce une emprise boisée ?
+pub fn is_wood(tags: &HashMap<String, String>) -> bool {
+    WOOD_TAGS
+        .iter()
+        .any(|(k, v)| tags.get(*k).map(String::as_str) == Some(*v))
+}
+
 /// Arbre à partir de ses tags. Mêmes replis quelle que soit la source.
 pub fn tree_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, String>) -> Tree {
     let height_m = parse_meters(tags.get("height")).unwrap_or(10.0).min(40.0);

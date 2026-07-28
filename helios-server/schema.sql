@@ -39,6 +39,27 @@ CREATE TABLE IF NOT EXISTS trees (
     geom             geometry(Point, 4326) NOT NULL
 );
 
+-- ------------------------------------------------------------------ bois
+
+-- Emprises boisées : forêts, bois, alignements d'arbres.
+--
+-- Table à part des bâtiments malgré une forme identique — un contour et une
+-- hauteur — parce que leur ombre n'est pas de même nature : un bâtiment est
+-- opaque, une canopée laisse passer une partie du soleil. La distinction est
+-- portée par la table plutôt que par une colonne, pour que rien ne puisse
+-- confondre les deux en chemin.
+--
+-- OSM ne donne jamais la hauteur d'une forêt ; celle stockée ici est un repli
+-- par type, à remplacer par un modèle de hauteur de canopée (Meta/WRI CHM ou
+-- IGN MNH).
+CREATE TABLE IF NOT EXISTS woods (
+    osm_id           text PRIMARY KEY,
+    name             text,
+    height_m         real NOT NULL,
+    height_from_osm  boolean NOT NULL,
+    geom             geometry(MultiPolygon, 4326) NOT NULL
+);
+
 -- --------------------------------------------------------------- terrasses
 
 -- Établissements de restauration et de boisson (cf. `osm::AMENITIES`).
@@ -132,6 +153,7 @@ ALTER TABLE place_terraces
 -- utilisable à chaque déplacement de carte.
 CREATE INDEX IF NOT EXISTS buildings_geom_idx ON buildings USING GIST (geom);
 CREATE INDEX IF NOT EXISTS trees_geom_idx     ON trees     USING GIST (geom);
+CREATE INDEX IF NOT EXISTS woods_geom_idx     ON woods     USING GIST (geom);
 CREATE INDEX IF NOT EXISTS places_geom_idx  ON places  USING GIST (geom);
 CREATE INDEX IF NOT EXISTS place_terraces_geom_idx ON place_terraces USING GIST (geom);
 

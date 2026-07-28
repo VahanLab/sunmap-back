@@ -21,7 +21,8 @@ use std::io::BufRead;
 use serde::Deserialize;
 
 use crate::osm::{
-    building_from, fill_missing_heights, place_from, tree_from, Building, Place, Tree, AMENITIES,
+    building_from, fill_missing_heights, is_wood, place_from, tree_from, wood_from, Building,
+    Place, Tree, Wood, AMENITIES,
 };
 
 /// Une feature GeoJSON telle que produite par `osmium export -u type_id`.
@@ -49,6 +50,7 @@ enum Geometry {
 #[derive(Default)]
 pub struct Extract {
     pub buildings: Vec<Building>,
+    pub woods: Vec<Wood>,
     pub trees: Vec<Tree>,
     pub places: Vec<Place>,
 }
@@ -86,6 +88,10 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
 
         let is_building = tags.contains_key("building") || tags.contains_key("building:part");
         let is_tree = tags.get("natural").map(String::as_str) == Some("tree");
+        // Un bois n'est jamais un bâtiment : le `if` plus bas est exclusif, mais
+        // rien n'empêche une forêt de porter aussi un `amenity`, d'où un test
+        // indépendant.
+        let wood = is_wood(&tags);
         // Pas de filtre sur `outdoor_seating` : le tag est très inégalement
         // renseigné, et filtrer dessus faisait disparaître des établissements
         // qui ont bel et bien une terrasse. On ramasse tout, l'utilisateur
@@ -94,6 +100,11 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
             .get("amenity")
             .is_some_and(|a| AMENITIES.contains(&a.as_str()));
 
+        if wood {
+            if let Some(w) = wood_from(osm_id.clone(), &tags, rings(&geometry)) {
+                out.woods.push(w);
+            }
+        }
         if is_building {
             if let Some(b) = building_from(osm_id.clone(), &tags, rings(&geometry)) {
                 out.buildings.push(b);
@@ -234,6 +245,54 @@ mod tests {
     }
 
     /// Un restaurant cartographié en bâtiment alimente les deux couches.
+    #[test]
+    fn foret_devient_une_emprise_boisee() {
+        let line = r#"{"type":"Feature","id":"w9","properties":{"landuse":"forest","name":"Bois test"},"geometry":{"type":"Polygon","coordinates":[[[2.0,48.0],[2.1,48.0],[2.1,48.1],[2.0,48.1],[2.0,48.0]]]}}"#;
+        let extract = read_geojsonseq(std::io::Cursor::new(line)).unwrap();
+        assert_eq!(extract.woods.len(), 1);
+        assert_eq!(extract.buildings.len(), 0, "un bois n'est pas un caster opaque");
+        let w = &extract.woods[0];
+        assert_eq!(w.osm_id, "way/9");
+        assert_eq!(w.height_m, 18.0, "hauteur de futaie par défaut");
+        assert!(!w.height_from_osm, "aucune hauteur taguée");
+    }
+
+    /// Une clairière est un anneau intérieur : la perdre bétonnerait le trou,
+    /// exactement comme pour la cour d'un immeuble.
+    #[test]
+    fn clairiere_conservee_comme_anneau_interieur() {
+        let line = r#"{"type":"Feature","id":"r4","properties":{"natural":"wood"},"geometry":{"type":"Polygon","coordinates":[[[2.0,48.0],[2.1,48.0],[2.1,48.1],[2.0,48.1],[2.0,48.0]],[[2.04,48.04],[2.06,48.04],[2.06,48.06],[2.04,48.06],[2.04,48.04]]]}}"#;
+        let extract = read_geojsonseq(std::io::Cursor::new(line)).unwrap();
+        assert_eq!(extract.woods.len(), 1);
+        assert_eq!(extract.woods[0].rings.len(), 2);
+    }
+
+    /// Les hauteurs par défaut diffèrent : des broussailles ne portent pas
+    /// l'ombre d'une futaie.
+    #[test]
+    fn hauteurs_par_defaut_selon_le_type() {
+        for (tags, expected) in [
+            (r#""natural":"scrub""#, 3.0),
+            (r#""natural":"tree_row""#, 12.0),
+            (r#""natural":"wood""#, 18.0),
+        ] {
+            let line = format!(
+                r#"{{"type":"Feature","id":"w1","properties":{{{tags}}},"geometry":{{"type":"Polygon","coordinates":[[[2.0,48.0],[2.1,48.0],[2.1,48.1],[2.0,48.0]]]}}}}"#
+            );
+            let extract = read_geojsonseq(std::io::Cursor::new(line)).unwrap();
+            assert_eq!(extract.woods[0].height_m, expected, "pour {tags}");
+        }
+    }
+
+    /// Une hauteur taguée prime sur le repli, et se signale comme telle.
+    #[test]
+    fn hauteur_taguee_prime() {
+        let line = r#"{"type":"Feature","id":"w5","properties":{"natural":"wood","height":"25"},"geometry":{"type":"Polygon","coordinates":[[[2.0,48.0],[2.1,48.0],[2.1,48.1],[2.0,48.0]]]}}"#;
+        let extract = read_geojsonseq(std::io::Cursor::new(line)).unwrap();
+        assert_eq!(extract.woods[0].height_m, 25.0);
+        assert!(extract.woods[0].height_from_osm);
+    }
+
     #[test]
     fn building_that_is_also_a_terrace_feeds_both_layers() {
         let line = r#"{"type":"Feature","id":"w2","properties":{"building":"yes","amenity":"restaurant","outdoor_seating":"yes","name":"Chez X"},"geometry":{"type":"Polygon","coordinates":[[[2.0,48.0],[2.2,48.0],[2.2,48.2],[2.0,48.2],[2.0,48.0]]]}}"#;

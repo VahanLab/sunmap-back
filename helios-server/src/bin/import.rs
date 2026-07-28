@@ -65,6 +65,7 @@ async fn main() {
     for (label, result) in [
         ("bâtiments", db::upsert_buildings(&pool, &extract.buildings).await),
         ("arbres", db::upsert_trees(&pool, &extract.trees).await),
+        ("bois", db::upsert_woods(&pool, &extract.woods).await),
         ("établissements", db::upsert_places(&pool, &extract.places).await),
     ] {
         match result {

@@ -22,11 +22,15 @@ echo "1/2 — filtrage des tags…"
 # `w/building` garde les ways bâtiment, `r/building` les relations
 # multipolygone (les immeubles à cour, majoritaires à Paris — les oublier
 # retirait 41 % des casters d'ombre). `building:part` couvre Simple 3D
-# Buildings. Le `-t` conserve les objets référencés (nœuds des ways, membres
-# des relations), sans quoi il n'y aurait aucune géométrie à assembler.
+# Buildings. Les emprises boisées viennent de `natural=wood`/`landuse=forest`,
+# en `wr` : une grande forêt est presque toujours une relation multipolygone,
+# avec des clairières en anneaux intérieurs qu'il faut garder creuses. Le `-t`
+# conserve les objets référencés (nœuds des ways, membres des relations), sans
+# quoi il n'y aurait aucune géométrie à assembler.
 osmium tags-filter --overwrite -t -o "$TMP" "$IN" \
   w/building r/building w/building:part \
   n/natural=tree \
+  wr/natural=wood,tree_row,scrub wr/landuse=forest \
   nwr/amenity=bar,pub,restaurant,cafe,fast_food,biergarten
 
 echo "2/2 — assemblage des aires et export GeoJSONSeq…"

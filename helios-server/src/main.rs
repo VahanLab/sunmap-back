@@ -41,6 +41,10 @@ type PlacesResultCache = RwLock<HashMap<String, Arc<PlacesResponse>>>;
 
 /// Valeur de la grille `owner` pour « aucun bâtiment ici » (relief nu).
 const OWNER_TERRAIN: u32 = u32::MAX;
+/// Idem pour la végétation. Sentinelle distincte du terrain : sans elle, une
+/// ombre d'arbre serait attribuée au relief, et `describe_blocker` irait chercher
+/// un bâtiment à un indice qui n'en désigne aucun.
+const OWNER_CANOPY: u32 = u32::MAX - 1;
 
 struct AppState {
     auth: auth::FirebaseAuth,
@@ -341,6 +345,22 @@ async fn add_buildings(
     let mut owner = vec![OWNER_TERRAIN; dsm.width * dsm.height];
     let terrain = dsm.clone();
     stamp_buildings(dsm, &terrain, &mut owner, origin_x, origin_y, &buildings);
+
+    // Végétation ensuite, jamais avant : là où arbre et bâtiment se recouvrent,
+    // c'est le bâtiment qui doit rester le coupable désigné.
+    //
+    // Une lecture ratée n'interrompt pas la requête : mieux vaut une réponse
+    // sans ombre de feuillage qu'une erreur, la végétation étant un raffinement
+    // par-dessus le relief et le bâti.
+    let woods = db::woods_in_bbox(&state.pool, south, west, north, east)
+        .await
+        .unwrap_or_default();
+    let trees = db::trees_in_bbox(&state.pool, south, west, north, east)
+        .await
+        .unwrap_or_default();
+    if !woods.is_empty() || !trees.is_empty() {
+        stamp_canopy(dsm, &terrain, &mut owner, origin_x, origin_y, &woods, &trees);
+    }
     Ok((buildings, owner))
 }
 
@@ -393,6 +413,79 @@ struct Blocker {
 }
 
 /// Traduit un `ShadowHit` (cellule DSM) en `Blocker` nommé.
+/// Tamponne la végétation : emprises boisées puis arbres isolés.
+///
+/// Traitée après les bâtiments et jamais avant : là où les deux se recouvrent —
+/// un arbre de cour, un bois qui mord sur un hangar — c'est le bâtiment qui doit
+/// rester le coupable désigné, il est plus haut et surtout opaque.
+///
+/// Limite assumée de cette étape : la canopée est tamponnée comme un volume
+/// plein, donc opaque. Une forêt fait un bloc, ce qui est à peu près juste pour
+/// une futaie dense en été et faux pour des feuillus en hiver. La transmittance
+/// demande un ray marching qui accumule au lieu de s'arrêter au premier impact,
+/// et une classe portée par la DSM.
+fn stamp_canopy(
+    dsm: &mut Dsm,
+    terrain: &Dsm,
+    owner: &mut [u32],
+    origin_x: f64,
+    origin_y: f64,
+    woods: &[Building],
+    trees: &[helios_server::osm::Tree],
+) {
+    // Les bois passent par la même rasterisation scanline que les bâtiments —
+    // même forme de donnée, mêmes anneaux intérieurs à garder creux (une
+    // clairière est un anneau intérieur).
+    let mut wood_owner = vec![OWNER_TERRAIN; owner.len()];
+    stamp_buildings(dsm, terrain, &mut wood_owner, origin_x, origin_y, woods);
+
+    // Les arbres isolés : un disque de rayon de couronne, pas un rectangle. Un
+    // rectangle surestimerait l'emprise de 27 % et ferait des ombres carrées.
+    for t in trees {
+        let (wx, wy) = world_px(t.lat, t.lng);
+        let (cx, cy) = (wx - origin_x, wy - origin_y);
+        let radius_px = (t.crown_radius_m / dsm.meters_per_pixel).max(0.5);
+        let ground = match terrain.sample(
+            cx.clamp(0.0, dsm.width as f64 - 1.0),
+            cy.clamp(0.0, dsm.height as f64 - 1.0),
+        ) {
+            Some(g) => g,
+            None => continue,
+        };
+        let top = ground + t.height_m as f32;
+
+        let x0 = (cx - radius_px).floor().max(0.0) as usize;
+        let x1 = (cx + radius_px).ceil().min(dsm.width as f64 - 1.0) as usize;
+        let y0 = (cy - radius_px).floor().max(0.0) as usize;
+        let y1 = (cy + radius_px).ceil().min(dsm.height as f64 - 1.0) as usize;
+        if x1 < x0 || y1 < y0 {
+            continue;
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let dx = x as f64 + 0.5 - cx;
+                let dy = y as f64 + 0.5 - cy;
+                if dx * dx + dy * dy > radius_px * radius_px {
+                    continue;
+                }
+                let i = y * dsm.width + x;
+                if top > dsm.data[i] {
+                    dsm.data[i] = top;
+                    wood_owner[i] = OWNER_CANOPY;
+                }
+            }
+        }
+    }
+
+    // Report final : la végétation ne réclame une case que si elle n'est pas
+    // déjà revendiquée par un bâtiment.
+    for (i, &w) in wood_owner.iter().enumerate() {
+        if w != OWNER_TERRAIN && owner[i] == OWNER_TERRAIN {
+            owner[i] = OWNER_CANOPY;
+        }
+    }
+}
+
 fn describe_blocker(
     hit: &ShadowHit,
     dsm: &Dsm,
@@ -402,14 +495,19 @@ fn describe_blocker(
     origin_y: f64,
 ) -> Blocker {
     let (lat, lng) = latlon_of_world_px(origin_x + hit.x as f64 + 0.5, origin_y + hit.y as f64 + 0.5);
-    let b = owner
-        .get(hit.y * dsm.width + hit.x)
-        .copied()
-        .filter(|&o| o != OWNER_TERRAIN)
+    let owner_at = owner.get(hit.y * dsm.width + hit.x).copied();
+    let is_canopy = owner_at == Some(OWNER_CANOPY);
+    let b = owner_at
+        .filter(|&o| o != OWNER_TERRAIN && o != OWNER_CANOPY)
         .and_then(|o| buildings.get(o as usize));
 
     Blocker {
-        id: b.map_or_else(|| "terrain".to_string(), |b| b.osm_id.clone()),
+        id: b.map_or_else(
+            || {
+                if is_canopy { "vegetation".to_string() } else { "terrain".to_string() }
+            },
+            |b| b.osm_id.clone(),
+        ),
         name: b.and_then(|b| b.name.clone()),
         height_m: b.map(|b| b.height_m),
         height_from_osm: b.is_some_and(|b| b.height_from_osm),

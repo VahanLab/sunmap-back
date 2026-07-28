@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
-use crate::osm::{Building, Place, Tree};
+use crate::osm::{Building, Place, Tree, Wood};
 
 /// URL par défaut en dev local. Surchargeable par `DATABASE_URL`.
 pub const DEFAULT_URL: &str = "postgres://localhost/sunmap";
@@ -306,6 +306,93 @@ async fn insert_one_by_one(pool: &PgPool, chunk: &[Building]) -> u64 {
         }
     }
     written
+}
+
+/// Emprises boisées couvrant la bbox. Même lecture que les bâtiments.
+pub async fn woods_in_bbox(
+    pool: &PgPool,
+    s: f64,
+    w: f64,
+    n: f64,
+    e: f64,
+) -> Result<Vec<Wood>, sqlx::Error> {
+    let sql = format!(
+        "SELECT osm_id, name, height_m, height_from_osm, ST_AsText(geom) AS wkt \
+         FROM woods WHERE geom && {}",
+        envelope(s, w, n, e)
+    );
+    Ok(sqlx::query(&sql)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .filter_map(|r| {
+            let wkt: String = r.get("wkt");
+            Some(Wood {
+                osm_id: r.get("osm_id"),
+                name: r.get("name"),
+                height_m: r.get("height_m"),
+                height_from_osm: r.get("height_from_osm"),
+                rings: Some(parse_multipolygon_wkt(&wkt)).filter(|r| !r.is_empty())?,
+            })
+        })
+        .collect())
+}
+
+const INSERT_WOOD: &str =
+    "INSERT INTO woods (osm_id, name, height_m, height_from_osm, geom) \
+     VALUES ($1, $2, $3, $4, \
+       ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromText($5, 4326)), 3))) \
+     ON CONFLICT (osm_id) DO UPDATE SET \
+       name = EXCLUDED.name, height_m = EXCLUDED.height_m, \
+       height_from_osm = EXCLUDED.height_from_osm, geom = EXCLUDED.geom";
+
+/// Mêmes précautions que pour les bâtiments : par paquets, avec repli ligne à
+/// ligne — une emprise forestière auto-intersectée ne doit pas coûter la tuile.
+pub async fn upsert_woods(pool: &PgPool, woods: &[Wood]) -> Result<u64, sqlx::Error> {
+    let mut written = 0u64;
+    for chunk in woods.chunks(500) {
+        let mut ok = true;
+        let mut tx = pool.begin().await?;
+        let mut n = 0u64;
+        for w in chunk {
+            let Some(wkt) = multipolygon_wkt(&w.rings) else { continue };
+            match sqlx::query(INSERT_WOOD)
+                .bind(&w.osm_id)
+                .bind(&w.name)
+                .bind(w.height_m)
+                .bind(w.height_from_osm)
+                .bind(&wkt)
+                .execute(&mut *tx)
+                .await
+            {
+                Ok(r) => n += r.rows_affected(),
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            tx.commit().await?;
+            written += n;
+        } else {
+            tx.rollback().await.ok();
+            for w in chunk {
+                let Some(wkt) = multipolygon_wkt(&w.rings) else { continue };
+                written += sqlx::query(INSERT_WOOD)
+                    .bind(&w.osm_id)
+                    .bind(&w.name)
+                    .bind(w.height_m)
+                    .bind(w.height_from_osm)
+                    .bind(&wkt)
+                    .execute(pool)
+                    .await
+                    .map(|r| r.rows_affected())
+                    .unwrap_or(0);
+            }
+        }
+    }
+    Ok(written)
 }
 
 pub async fn upsert_trees(pool: &PgPool, trees: &[Tree]) -> Result<u64, sqlx::Error> {
