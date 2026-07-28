@@ -69,6 +69,31 @@ CREATE TABLE IF NOT EXISTS places (
 
 -- ------------------------------------------------- contributions utilisateur
 
+-- --------------------------------------------------------------- comptes
+
+-- Identité vérifiée par Firebase, pseudo tenu ici.
+--
+-- Le pseudo vit en PostgreSQL et non côté Firebase : c'est une donnée métier,
+-- affichée à côté des contributions, et la contrainte d'unicité d'une base est
+-- la seule garantie qui tienne sous concurrence — deux inscriptions simultanées
+-- sur le même pseudo se départagent ici, pas dans le client.
+CREATE TABLE IF NOT EXISTS users (
+    -- `sub` du jeton Firebase. Stable pour un compte, quel que soit le
+    -- fournisseur employé pour s'y connecter (mot de passe, Google, Apple).
+    uid          text PRIMARY KEY,
+    -- Casse d'origine, pour l'affichage.
+    username     text NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    -- Unicité insensible à la casse : « Karl » et « karl » désignent la même
+    -- personne aux yeux d'un lecteur, les laisser coexister inviterait à
+    -- l'usurpation. Chacun garde malgré tout la casse qu'il a choisie.
+    username_key text GENERATED ALWAYS AS (lower(username)) STORED UNIQUE,
+    -- Le serveur valide déjà la forme pour renvoyer un message clair ; la base
+    -- reste le garde-fou, y compris pour un import ou une correction à la main.
+    CONSTRAINT username_shape CHECK (username ~ '^[A-Za-z0-9_.]{3,20}$')
+);
+
 -- Terrasse signalée par un utilisateur : sa présence, et surtout sa position
 -- exacte, qu'OSM ne donne jamais (le nœud d'un bar est posé sur le bâtiment).
 --
@@ -87,8 +112,19 @@ CREATE TABLE IF NOT EXISTS place_terraces (
     -- Position de la terrasse. NULL quand `has_terrace` est faux, ou quand
     -- l'utilisateur signale une terrasse sans la situer.
     geom         geometry(Point, 4326),
-    updated_at   timestamptz NOT NULL DEFAULT now()
+    updated_at   timestamptz NOT NULL DEFAULT now(),
+    -- Auteur de la contribution. NULL pour celles d'avant l'authentification.
+    -- `ON DELETE SET NULL` : supprimer un compte ne doit pas emporter les
+    -- terrasses qu'il a signalées, elles restent vraies sans lui.
+    user_uid     text REFERENCES users(uid) ON DELETE SET NULL
 );
+
+-- ------------------------------------------------------------ migrations
+
+-- `CREATE TABLE IF NOT EXISTS` ne modifie pas une table déjà présente : les
+-- bases créées avant l'authentification n'auraient jamais la colonne d'auteur.
+ALTER TABLE place_terraces
+    ADD COLUMN IF NOT EXISTS user_uid text REFERENCES users(uid) ON DELETE SET NULL;
 
 -- ----------------------------------------------------------------- index
 

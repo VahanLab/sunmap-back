@@ -5,9 +5,11 @@
 //! le chemin d'une requête client (`osm`), il ne sert qu'à remplir PostGIS, et
 //! le serveur ne lit plus que la base (`db`).
 
+pub mod auth;
 pub mod db;
 pub mod dem;
 pub mod i18n;
 pub mod opening_hours;
 pub mod osm;
 pub mod pbf;
+pub mod username;
