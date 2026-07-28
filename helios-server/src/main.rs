@@ -905,6 +905,10 @@ struct Place {
     /// la position exacte de la terrasse, pas une estimation.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     terrace_from_user: bool,
+    /// Pseudo de qui a signalé la terrasse. Absent des contributions antérieures
+    /// à l'authentification, et bien sûr des établissements sans contribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terrace_author: Option<String>,
     lat: f64,
     lng: f64,
     sunlit: bool,
@@ -1193,6 +1197,7 @@ async fn places(
                 // contredire : quelqu'un sur place en sait plus que le tag.
                 outdoor_seating: report.map(|r| r.has_terrace).or(p.outdoor_seating),
                 terrace_from_user: report.is_some(),
+                terrace_author: report.and_then(|r| r.author_username.clone()),
                 lat: p.lat,
                 lng: p.lng,
                 sunlit: sun.is_up() && hit.is_none(),
