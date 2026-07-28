@@ -107,6 +107,57 @@ pub fn candidates(seed: u64, count: usize) -> Vec<String> {
     out
 }
 
+/// Pseudo dérivé d'un nom d'affichage Google ou Apple.
+///
+/// Jamais repris tel quel : « Karl Gochgarian » porte un espace, « Zoé » un
+/// accent, et rien ne garantit la longueur. On enlève les accents, on jette ce
+/// qui reste interdit, on tronque — et on renvoie `None` s'il ne subsiste pas de
+/// quoi faire un pseudo, ce qui arrive avec un nom entièrement non latin. La
+/// disponibilité, elle, n'est pas l'affaire de cette fonction.
+pub fn from_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .flat_map(fold_accent)
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .take(MAX_LEN)
+        .collect();
+    validate(&cleaned).ok()
+}
+
+/// Repli ASCII des lettres accentuées courantes.
+///
+/// Table à la main plutôt qu'une dépendance de normalisation Unicode : on ne
+/// traite ici que des noms propres latins, et une bibliothèque complète pèserait
+/// bien plus que le problème. Un nom qui n'y survit pas tombe simplement sur les
+/// suggestions thématiques.
+fn fold_accent(c: char) -> impl Iterator<Item = char> {
+    let folded: &str = match c {
+        'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => "a",
+        'À' | 'Á' | 'Â' | 'Ã' | 'Ä' | 'Å' => "A",
+        'ç' => "c",
+        'Ç' => "C",
+        'è' | 'é' | 'ê' | 'ë' => "e",
+        'È' | 'É' | 'Ê' | 'Ë' => "E",
+        'ì' | 'í' | 'î' | 'ï' => "i",
+        'Ì' | 'Í' | 'Î' | 'Ï' => "I",
+        'ñ' => "n",
+        'Ñ' => "N",
+        'ò' | 'ó' | 'ô' | 'õ' | 'ö' => "o",
+        'Ò' | 'Ó' | 'Ô' | 'Õ' | 'Ö' => "O",
+        'ù' | 'ú' | 'û' | 'ü' => "u",
+        'Ù' | 'Ú' | 'Û' | 'Ü' => "U",
+        'ý' | 'ÿ' => "y",
+        'Ý' => "Y",
+        'æ' => "ae",
+        'Æ' => "AE",
+        'œ' => "oe",
+        'Œ' => "OE",
+        'ß' => "ss",
+        _ => return Some(c).into_iter().chain("".chars()),
+    };
+    None.into_iter().chain(folded.chars())
+}
+
 /// Xorshift64 : suffisant pour proposer des pseudos, et évite une dépendance
 /// pour ce seul usage. Rien ici n'a besoin d'être imprévisible.
 struct Xorshift(u64);
@@ -169,6 +220,42 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), 4, "doublon dans {list:?}");
+    }
+
+    #[test]
+    fn nom_d_affichage_normalise() {
+        assert_eq!(from_display_name("Karl Gochgarian").as_deref(), Some("KarlGochgarian"));
+        assert_eq!(from_display_name("Zoé Lefèvre").as_deref(), Some("ZoeLefevre"));
+        assert_eq!(from_display_name("Jean-Luc Picard").as_deref(), Some("JeanLucPicard"));
+        assert_eq!(from_display_name("  karl  ").as_deref(), Some("karl"));
+    }
+
+    /// Tronqué à la limite, pas refusé : un nom long reste une meilleure base
+    /// qu'un tirage au sort.
+    #[test]
+    fn nom_trop_long_tronque() {
+        let derived = from_display_name("Jean Baptiste Emmanuel Zorg").unwrap();
+        assert_eq!(derived.chars().count(), MAX_LEN);
+        assert_eq!(derived, "JeanBaptisteEmmanuel");
+    }
+
+    /// Rien d'exploitable : à l'appelant de retomber sur les suggestions.
+    #[test]
+    fn nom_sans_lettres_latines_refuse() {
+        assert_eq!(from_display_name("李明"), None);
+        assert_eq!(from_display_name("🙂"), None);
+        assert_eq!(from_display_name("A B"), None); // « AB » : deux caractères
+    }
+
+    #[test]
+    fn tout_nom_derive_est_valide() {
+        for name in ["Karl Gochgarian", "Zoé Lefèvre", "Ærø Ünïcøde", "Straße Müller",
+                     "O'Neill", "Anne-Marie", "  x.y_z  "] {
+            if let Some(derived) = from_display_name(name) {
+                assert_eq!(validate(&derived).as_deref(), Ok(derived.as_str()),
+                           "dérivé invalide pour {name} : {derived}");
+            }
+        }
     }
 
     #[test]

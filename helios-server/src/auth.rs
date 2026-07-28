@@ -58,12 +58,17 @@ pub struct Identity {
     pub uid: String,
     /// Présent selon le fournisseur — Apple permet de le masquer.
     pub email: Option<String>,
+    /// Nom fourni par Google ou Apple, quand il y en a un. Sert à proposer un
+    /// pseudo plausible plutôt qu'un tirage au sort ; jamais utilisé tel quel,
+    /// un nom d'affichage contient des espaces et des accents.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct Claims {
     sub: String,
     email: Option<String>,
+    name: Option<String>,
 }
 
 /// Vérificateur de jetons, avec ses clés en cache.
@@ -197,6 +202,7 @@ fn verify_with(token: &str, key: &DecodingKey, project_id: &str) -> Result<Ident
     Ok(Identity {
         uid: data.claims.sub,
         email: data.claims.email,
+        display_name: data.claims.name,
     })
 }
 
@@ -233,6 +239,8 @@ mod tests {
         exp: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         email: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     }
 
     fn now() -> u64 {
@@ -260,6 +268,7 @@ mod tests {
             iss: format!("https://securetoken.google.com/{PROJECT}"),
             exp: now() + 3_600,
             email: Some("karl@example.com".into()),
+            name: Some("Karl Gochgarian".into()),
         }
     }
 
@@ -268,6 +277,7 @@ mod tests {
         let identity = verify_with(&sign(claims()), &decoding_key(), PROJECT).unwrap();
         assert_eq!(identity.uid, "uid-abc");
         assert_eq!(identity.email.as_deref(), Some("karl@example.com"));
+        assert_eq!(identity.display_name.as_deref(), Some("Karl Gochgarian"));
     }
 
     /// Le cas qui compte le plus : les jetons de *tous* les projets Firebase sont

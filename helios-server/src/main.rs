@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::http::{HeaderMap, StatusCode};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -22,11 +22,13 @@ use tokio::sync::RwLock;
 use helios_core::dsm::Dsm;
 use helios_core::shadow::{shadow_hit_from_ground, ShadowHit, ShadowParams};
 use helios_core::sun::sun_position;
+use helios_server::auth;
 use helios_server::db;
 use helios_server::i18n::{self, Lang};
 use helios_server::opening_hours;
 use helios_server::dem::{self, latlon_of_world_px, world_px, TileCache, TILE_SIZE, ZOOM};
 use helios_server::osm::Building;
+use helios_server::username;
 
 /// Emprises déjà lues en base pour une bbox de tuiles donnée. PostGIS répond
 /// en quelques ms, mais la même fenêtre est redemandée à chaque tick du slider
@@ -41,6 +43,7 @@ type PlacesResultCache = RwLock<HashMap<String, Arc<PlacesResponse>>>;
 const OWNER_TERRAIN: u32 = u32::MAX;
 
 struct AppState {
+    auth: auth::FirebaseAuth,
     http: reqwest::Client,
     pool: sqlx::PgPool,
     tiles: TileCache,
@@ -75,7 +78,14 @@ async fn main() {
         println!("base : {n} {label}");
     }
 
+    // Projet Firebase attendu comme destinataire des jetons. Surchargeable par
+    // l'environnement pour pointer un projet de test sans recompiler.
+    let project_id = std::env::var("FIREBASE_PROJECT_ID")
+        .unwrap_or_else(|_| "sunmap-d06df".to_string());
+    println!("authentification Firebase : projet {project_id}");
+
     let state = Arc::new(AppState {
+        auth: auth::FirebaseAuth::new(project_id),
         // Ne sert plus qu'aux tuiles DEM Mapterhorn — la géométrie OSM vient
         // de PostGIS, plus d'Overpass au runtime.
         http: reqwest::Client::builder()
@@ -94,6 +104,9 @@ async fn main() {
         .route("/sunlit/batch", post(sunlit_batch))
         .route("/places", get(places))
         .route("/places/terrace", post(report_terrace))
+        .route("/users/me", get(current_user))
+        .route("/users/username", put(set_username))
+        .route("/users/username/suggestions", get(username_suggestions))
         .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
@@ -958,8 +971,12 @@ struct TerraceReportResponse {
 /// libre le plus proche, sans savoir de quel côté est la rue.
 async fn report_terrace(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<TerraceReportBody>,
 ) -> Result<Json<TerraceReportResponse>, (StatusCode, String)> {
+    // Contribuer demande un compte : sans quoi n'importe qui écrase la
+    // contribution de n'importe qui, `osm_id` étant la clé primaire.
+    let identity = authenticate(&state, &headers).await?;
     if let (Some(lat), Some(lng)) = (body.lat, body.lng) {
         if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
             return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
@@ -982,6 +999,8 @@ async fn report_terrace(
         osm_id: body.osm_id.clone(),
         has_terrace: body.has_terrace,
         // Une terrasse absente n'a pas de position à retenir.
+        author_uid: Some(identity.uid.clone()),
+        author_username: None,
         lat: body.has_terrace.then_some(body.lat).flatten(),
         lng: body.has_terrace.then_some(body.lng).flatten(),
     };
@@ -1346,4 +1365,111 @@ mod tests {
         // Minuit à New York le 25 = 04:00Z le 25.
         assert_eq!(start, 1784952000.0);
     }
+}
+
+// -------------------------------------------------------------- comptes
+
+/// Vérifie le jeton porté par la requête, ou refuse.
+async fn authenticate(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<auth::Identity, (StatusCode, String)> {
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    state
+        .auth
+        .verify_header(header)
+        .await
+        .map_err(|e| (e.status(), e.message()))
+}
+
+#[derive(Serialize)]
+struct UserResponse {
+    uid: String,
+    /// Absent tant que l'utilisateur n'a pas choisi son pseudo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+}
+
+async fn current_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<UserResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    let record = db::user_by_uid(&state.pool, &identity.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    Ok(Json(UserResponse {
+        uid: identity.uid,
+        username: record.map(|r| r.username),
+    }))
+}
+
+#[derive(Deserialize)]
+struct UsernameBody {
+    username: String,
+}
+
+async fn set_username(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<UsernameBody>,
+) -> Result<Json<UserResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    let username = username::validate(&body.username)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.message()))?;
+
+    match db::set_username(&state.pool, &identity.uid, &username).await {
+        Ok(Ok(record)) => Ok(Json(UserResponse {
+            uid: record.uid,
+            username: Some(record.username),
+        })),
+        // 409 et non 400 : la demande est bien formée, c'est l'état du monde qui
+        // s'y oppose — et il peut s'y opposer entre deux tentatives identiques.
+        Ok(Err(_)) => Err((StatusCode::CONFLICT, "pseudo déjà pris".into())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}"))),
+    }
+}
+
+#[derive(Serialize)]
+struct SuggestionsResponse {
+    suggestions: Vec<String>,
+}
+
+/// Quatre pseudos libres à proposer à la saisie.
+///
+/// Le nom d'affichage du fournisseur passe en premier quand il donne quelque
+/// chose d'exploitable : « KarlGochgarian » se reconnaît mieux que
+/// « SunLover3448 ». Le reste vient de la liste thématique.
+async fn username_suggestions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<SuggestionsResponse>, (StatusCode, String)> {
+    const WANTED: usize = 4;
+
+    let identity = authenticate(&state, &headers).await?;
+
+    let mut pool_of_candidates = Vec::new();
+    if let Some(from_name) = identity.display_name.as_deref().and_then(username::from_display_name) {
+        pool_of_candidates.push(from_name);
+    }
+    // Large marge : les pseudos pris sont écartés ensuite, et repartir en base
+    // pour compléter coûterait un aller-retour de plus.
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    pool_of_candidates.extend(username::candidates(seed, WANTED * 4));
+
+    let taken = db::taken_usernames(&state.pool, &pool_of_candidates)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+
+    let suggestions: Vec<String> = pool_of_candidates
+        .into_iter()
+        .filter(|c| !taken.contains(&c.to_lowercase()))
+        .take(WANTED)
+        .collect();
+    Ok(Json(SuggestionsResponse { suggestions }))
 }

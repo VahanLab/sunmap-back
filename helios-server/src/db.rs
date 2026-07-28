@@ -6,7 +6,7 @@
 //! `ST_AsText` suffisent dans les deux sens. Une dépendance de plus pour
 //! parser du WKB n'apporterait rien ici.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
@@ -137,7 +137,24 @@ pub struct TerraceReport {
     /// Position précise de la terrasse, si elle a été située.
     pub lat: Option<f64>,
     pub lng: Option<f64>,
+    /// Auteur, quand il est connu. Absent des contributions antérieures à
+    /// l'authentification.
+    pub author_uid: Option<String>,
+    /// Pseudo de l'auteur, joint à la lecture pour que la fiche d'un
+    /// établissement puisse citer qui a signalé sa terrasse sans requête de plus.
+    pub author_username: Option<String>,
 }
+
+/// Compte, tel qu'on le connaît.
+#[derive(Clone, Debug)]
+pub struct UserRecord {
+    pub uid: String,
+    pub username: String,
+}
+
+/// Le pseudo demandé est déjà pris.
+#[derive(Debug)]
+pub struct UsernameTaken;
 
 /// Contributions couvrant la bbox, indexées par identifiant OSM.
 ///
@@ -152,8 +169,12 @@ pub async fn terrace_reports_in_bbox(
     e: f64,
 ) -> Result<HashMap<String, TerraceReport>, sqlx::Error> {
     let sql = format!(
-        "SELECT t.osm_id, t.has_terrace, ST_Y(t.geom) AS lat, ST_X(t.geom) AS lng \
-         FROM place_terraces t JOIN places p USING (osm_id) WHERE p.geom && {}",
+        "SELECT t.osm_id, t.has_terrace, ST_Y(t.geom) AS lat, ST_X(t.geom) AS lng, \
+                t.user_uid, u.username \
+         FROM place_terraces t \
+         JOIN places p USING (osm_id) \
+         LEFT JOIN users u ON u.uid = t.user_uid \
+         WHERE p.geom && {}",
         envelope(s, w, n, e)
     );
     Ok(sqlx::query(&sql)
@@ -169,6 +190,8 @@ pub async fn terrace_reports_in_bbox(
                     has_terrace: r.get("has_terrace"),
                     lat: r.get("lat"),
                     lng: r.get("lng"),
+                    author_uid: r.get("user_uid"),
+                    author_username: r.get("username"),
                 },
             )
         })
@@ -183,19 +206,20 @@ pub async fn upsert_terrace_report(
     // Position construite seulement si les deux coordonnées sont là, sinon
     // NULL : une terrasse peut être signalée sans être située.
     sqlx::query(
-        "INSERT INTO place_terraces (osm_id, has_terrace, geom, updated_at) \
+        "INSERT INTO place_terraces (osm_id, has_terrace, geom, updated_at, user_uid) \
          VALUES ($1, $2, \
                  CASE WHEN $3::float8 IS NULL OR $4::float8 IS NULL THEN NULL \
                       ELSE ST_SetSRID(ST_MakePoint($3, $4), 4326) END, \
-                 now()) \
+                 now(), $5) \
          ON CONFLICT (osm_id) DO UPDATE SET \
            has_terrace = EXCLUDED.has_terrace, geom = EXCLUDED.geom, \
-           updated_at = EXCLUDED.updated_at",
+           updated_at = EXCLUDED.updated_at, user_uid = EXCLUDED.user_uid",
     )
     .bind(&report.osm_id)
     .bind(report.has_terrace)
     .bind(report.lng)
     .bind(report.lat)
+    .bind(&report.author_uid)
     .execute(pool)
     .await?;
     Ok(())
@@ -481,5 +505,78 @@ mod tests {
     #[test]
     fn wkt_rejects_degenerate_ring() {
         assert!(multipolygon_wkt(&[vec![(48.0, 2.0), (48.1, 2.1)]]).is_none());
+    }
+}
+
+// ------------------------------------------------------------------ comptes
+
+pub async fn user_by_uid(pool: &PgPool, uid: &str) -> Result<Option<UserRecord>, sqlx::Error> {
+    Ok(
+        sqlx::query("SELECT uid, username FROM users WHERE uid = $1")
+            .bind(uid)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| UserRecord {
+                uid: r.get("uid"),
+                username: r.get("username"),
+            }),
+    )
+}
+
+/// Pseudos déjà pris parmi ceux proposés, comparés sans tenir compte de la casse.
+///
+/// Une requête pour toute la liste plutôt qu'une par candidat : c'est la même
+/// latence pour quatre suggestions que pour quarante.
+pub async fn taken_usernames(
+    pool: &PgPool,
+    candidates: &[String],
+) -> Result<HashSet<String>, sqlx::Error> {
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let lowered: Vec<String> = candidates.iter().map(|c| c.to_lowercase()).collect();
+    Ok(
+        sqlx::query("SELECT username_key FROM users WHERE username_key = ANY($1)")
+            .bind(&lowered)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|r| r.get::<String, _>("username_key"))
+            .collect(),
+    )
+}
+
+/// Attribue un pseudo à un compte, en créant le compte au besoin.
+///
+/// L'unicité n'est pas vérifiée avant d'écrire : entre la lecture et l'écriture,
+/// quelqu'un d'autre peut prendre le même pseudo. C'est la contrainte de la base
+/// qui tranche, et sa violation qu'on traduit ici — un `SELECT` préalable ne
+/// ferait qu'élargir la fenêtre tout en donnant l'illusion d'être protégé.
+pub async fn set_username(
+    pool: &PgPool,
+    uid: &str,
+    username: &str,
+) -> Result<Result<UserRecord, UsernameTaken>, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO users (uid, username) VALUES ($1, $2) \
+         ON CONFLICT (uid) DO UPDATE SET username = EXCLUDED.username, updated_at = now() \
+         RETURNING uid, username",
+    )
+    .bind(uid)
+    .bind(username)
+    .fetch_one(pool)
+    .await;
+
+    match result {
+        Ok(r) => Ok(Ok(UserRecord {
+            uid: r.get("uid"),
+            username: r.get("username"),
+        })),
+        // 23505 = violation d'unicité. Le seul index unique en jeu ici est celui
+        // du pseudo, la clé primaire étant gérée par le `ON CONFLICT`.
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+            Ok(Err(UsernameTaken))
+        }
+        Err(e) => Err(e),
     }
 }
