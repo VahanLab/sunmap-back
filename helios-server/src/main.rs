@@ -733,6 +733,13 @@ struct SunInterval {
 /// Greenwich : à Paris en été (UTC+2), un slider réglé sur 00h30 renvoyait la
 /// journée de la veille, et la timeline s'affichait bornée à 02:00 → 02:00 au
 /// lieu de minuit à minuit.
+/// Découpage de `sun_day` : 144 tranches de 10 min couvrent la journée.
+/// 10 min et non le pas de 5 min du slider : deux fois moins de rayons pour
+/// une précision largement suffisante — une ombre qui balaie une terrasse ne
+/// se joue pas à 5 min près.
+const SUN_DAY_STEP_S: f64 = 600.0;
+const SUN_DAY_SLOTS: usize = (86_400.0 / SUN_DAY_STEP_S) as usize;
+
 fn day_bounds_local(t_unix: f64, utc_offset_minutes: i32) -> (f64, f64) {
     let offset = utc_offset_minutes as f64 * 60.0;
     // Passer en heure locale, tronquer au jour, revenir en UTC.
@@ -1006,6 +1013,10 @@ struct PlacesQuery {
     t: Option<String>,
     /// Défaut 1,5 m : personne attablée en terrasse.
     observer_height: Option<f64>,
+    /// Décalage du fuseau du client en minutes, pour caler `sun_day` sur SA
+    /// journée locale — sans lui, la journée découpée serait celle d'UTC,
+    /// décalée de deux heures en été à Paris.
+    utc_offset_minutes: Option<i32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -1013,6 +1024,10 @@ struct PlacesResponse {
     t_unix: f64,
     sun_azimuth_deg: f64,
     sun_elevation_deg: f64,
+    /// Début (unix) de la journée locale couverte par les `sun_day`, et pas
+    /// de chaque tranche en secondes.
+    day_start_unix: f64,
+    day_step_s: f64,
     count: usize,
     places: Vec<Place>,
 }
@@ -1043,6 +1058,13 @@ struct Place {
     /// Distingue l'ombre portée de la nuit, ce que `sunlit` seul ne peut pas
     /// dire — les deux y valent `false`.
     state: SunState,
+    /// Toute la journée locale en un mot : 144 tranches de 10 min, un bit
+    /// par tranche (bit à 1 = au soleil), octets en hexadécimal, bit de la
+    /// tranche `i` = octet `i/8`, bit `i%8` (LSB en premier). Permet au
+    /// client de reclasser le lieu à chaque cran du slider sans requête —
+    /// la nuit se déduit localement de l'élévation solaire, le bit ne
+    /// distingue que soleil/ombre.
+    sun_day: String,
     /// Ce qui bloque le soleil (absent si `sunlit`) — sert au debug visuel
     /// côté client : « c'est cet immeuble-là qui te met à l'ombre ».
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1487,11 +1509,21 @@ async fn places(
         return Err((StatusCode::BAD_REQUEST, "bbox invalide".into()));
     }
 
+    // Journée locale du client, pour découper `sun_day` sur SES minuits.
+    let utc_offset_minutes = q.utc_offset_minutes.unwrap_or(0);
+    let (day_start, _) = day_bounds_local(t, utc_offset_minutes);
+
     // Cache de résultat : même bbox + même tranche de 5 min + même hauteur
     // d'observateur → renvoie directement la classification déjà calculée,
-    // sans refaire tuiles/bâtiments/ray marching.
+    // sans refaire tuiles/bâtiments/ray marching. La tranche fine reste dans
+    // la clé malgré `sun_day` (qui ne dépend que du jour) : les champs à
+    // l'instant `t` — `sunlit`, `state`, `blocker` — en dépendent, eux. Le
+    // client muni du bitfield ne redemande de toute façon plus qu'une fois
+    // par jour et par zone.
     let bucket = (t / 300.0).round() as i64;
-    let result_key = format!("{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2},{lang:?}");
+    let result_key = format!(
+        "{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2},{lang:?},{utc_offset_minutes}"
+    );
     if let Some(hit) = state.places_results.read().await.get(&result_key) {
         println!("[places] {result_key} → cache hit ({:.1} ms)",
                  request_start.elapsed().as_secs_f64() * 1000.0);
@@ -1583,6 +1615,28 @@ async fn places(
                 .is_up()
                 .then(|| shadow_hit_from_ground(&dsm, &sun, px, py, ground, &params, dsm_max_elevation))
                 .flatten();
+
+            // Toute la journée du même point, sur la même DSM : 144 tranches
+            // de 10 min, un rayon par tranche de jour — la nuit se tranche
+            // sur la seule élévation solaire, sans rayon. Échantillonné au
+            // milieu de chaque tranche, pour que le bit représente la
+            // tranche entière plutôt que son bord.
+            let mut day_bits = [0u8; SUN_DAY_SLOTS / 8];
+            for slot in 0..SUN_DAY_SLOTS {
+                let slot_t = day_start + slot as f64 * SUN_DAY_STEP_S + SUN_DAY_STEP_S / 2.0;
+                let slot_sun = sun_position(slot_t, p.lat, p.lng);
+                if !slot_sun.is_up() {
+                    continue;
+                }
+                let slot_hit = shadow_hit_from_ground(
+                    &dsm, &slot_sun, px, py, ground, &params, dsm_max_elevation,
+                );
+                if slot_hit.is_none() {
+                    day_bits[slot / 8] |= 1 << (slot % 8);
+                }
+            }
+            let sun_day: String = day_bits.iter().map(|b| format!("{b:02x}")).collect();
+
             let (snapped_lat, snapped_lng) =
                 latlon_of_world_px(origin_x + px, origin_y + py);
             Place {
@@ -1604,6 +1658,7 @@ async fn places(
                 } else {
                     SunState::Shadow
                 },
+                sun_day,
                 blocker: hit
                     .map(|h| describe_blocker(&h, &dsm, &owner, &buildings, origin_x, origin_y)),
                 snapped_lat: (moved_m > 0.0).then_some(snapped_lat),
@@ -1639,6 +1694,8 @@ async fn places(
         t_unix: t,
         sun_azimuth_deg: sun.azimuth_deg,
         sun_elevation_deg: sun.elevation_deg,
+        day_start_unix: day_start,
+        day_step_s: SUN_DAY_STEP_S,
         count: places.len(),
         places,
     };
