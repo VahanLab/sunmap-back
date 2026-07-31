@@ -16,7 +16,7 @@ serde = { version = "1", features = ["derive"] }
 jsonwebtoken = "9"
 
 serde_json = "1"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 # PostGIS : la géométrie OSM vit en base, Overpass n'est plus sur le chemin
 # d'une requête client. `sqlx` en requêtes non vérifiées à la compilation
 # (pas de macro `query!`) pour ne pas exiger une base joignable au build.

@@ -221,11 +221,16 @@ pub async fn terrace_reports_in_bbox(
         .collect())
 }
 
-/// Enregistre (ou remplace) la contribution pour un établissement.
+/// Enregistre (ou remplace) la contribution pour un établissement, et
+/// journalise le geste dans `place_terrace_contributions` — `place_terraces`
+/// ne garde que la dernière valeur, l'historique sert à savoir qui a signalé
+/// en premier et si quelqu'un d'autre a corrigé depuis.
 pub async fn upsert_terrace_report(
     pool: &PgPool,
     report: &TerraceReport,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
     // Position construite seulement si les deux coordonnées sont là, sinon
     // NULL : une terrasse peut être signalée sans être située.
     sqlx::query(
@@ -243,9 +248,61 @@ pub async fn upsert_terrace_report(
     .bind(report.lng)
     .bind(report.lat)
     .bind(&report.author_uid)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    sqlx::query(
+        "INSERT INTO place_terrace_contributions \
+           (place_id, user_uid, has_terrace, lat, lng) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&report.osm_id)
+    .bind(&report.author_uid)
+    .bind(report.has_terrace)
+    .bind(report.lat)
+    .bind(report.lng)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(())
+}
+
+/// Historique des signalements de terrasse d'un établissement, le plus
+/// récent d'abord.
+pub struct TerraceContributionRecord {
+    pub username: Option<String>,
+    pub has_terrace: bool,
+    pub lat: Option<f64>,
+    pub lng: Option<f64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn terrace_contributions(
+    pool: &PgPool,
+    place_id: &str,
+) -> Result<Vec<TerraceContributionRecord>, sqlx::Error> {
+    sqlx::query(
+        "SELECT u.username, c.has_terrace, c.lat, c.lng, c.created_at \
+         FROM place_terrace_contributions c \
+         LEFT JOIN users u ON u.uid = c.user_uid \
+         WHERE c.place_id = $1 \
+         ORDER BY c.created_at DESC",
+    )
+    .bind(place_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|r| TerraceContributionRecord {
+                username: r.get("username"),
+                has_terrace: r.get("has_terrace"),
+                lat: r.get("lat"),
+                lng: r.get("lng"),
+                created_at: r.get("created_at"),
+            })
+            .collect()
+    })
 }
 
 /// L'établissement existe-t-il ? Garde-fou avant d'accepter une contribution,
@@ -256,6 +313,174 @@ pub async fn place_exists(pool: &PgPool, osm_id: &str) -> Result<bool, sqlx::Err
         .fetch_one(pool)
         .await
         .map(|n| n > 0)
+}
+
+/// Ajoute un banc ou une table de pique-nique contribué depuis l'app.
+///
+/// `osm_id` synthétique généré côté base (`gen_random_uuid()`, disponible
+/// nativement depuis PostgreSQL 13) plutôt qu'en Rust : éviter une dépendance
+/// `uuid` pour un identifiant qui ne sert qu'à ne jamais collisionner avec un
+/// vrai identifiant OSM.
+///
+/// Journalise aussi la toute première ligne d'historique (`applied = true`) :
+/// sans elle, la liste des contributions d'un meuble tout juste posé serait
+/// vide jusqu'à sa première correction.
+pub async fn insert_user_furniture(
+    pool: &PgPool,
+    amenity: &str,
+    lat: f64,
+    lng: f64,
+    direction_deg: Option<f64>,
+    backrest: Option<bool>,
+    contributor_uid: &str,
+) -> Result<String, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let osm_id: String = sqlx::query_scalar(
+        "INSERT INTO places (osm_id, amenity, direction_deg, backrest, contributor_uid, geom) \
+         VALUES ('user/' || gen_random_uuid(), $1, $2, $3, $4, \
+                 ST_SetSRID(ST_MakePoint($5, $6), 4326)) \
+         RETURNING osm_id",
+    )
+    .bind(amenity)
+    .bind(direction_deg)
+    .bind(backrest)
+    .bind(contributor_uid)
+    .bind(lng)
+    .bind(lat)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO place_furniture_contributions \
+           (place_id, user_uid, lat, lng, direction_deg, backrest, applied) \
+         VALUES ($1, $2, $3, $4, $5, $6, true)",
+    )
+    .bind(&osm_id)
+    .bind(contributor_uid)
+    .bind(lat)
+    .bind(lng)
+    .bind(direction_deg)
+    .bind(backrest)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(osm_id)
+}
+
+/// Soumet une correction de position/orientation/dossier sur un meuble déjà en
+/// base — posé depuis l'app ou importé d'OSM.
+///
+/// Toujours appliquée — dernier écrit gagne sur la ligne entière — et toujours
+/// journalisée. Pas de verrou de propriété : un premier contributeur pose le
+/// banc, un deuxième corrige l'orientation, un troisième précise l'absence de
+/// dossier, et chacun voit son tour appliqué. Ça ne perd rien des deux
+/// premiers tant que l'écran d'édition préremplit son formulaire depuis
+/// l'état courant avant modification (`FurnitureContributionView`) : le
+/// troisième renvoie donc l'orientation corrigée par le deuxième, même s'il
+/// ne l'a pas lui-même touchée. `contributor_uid` ne sert plus qu'à afficher
+/// qui a soumis en dernier, plus à décider qui a le droit d'écrire.
+///
+/// Contrepartie assumée : deux corrections envoyées en même temps depuis des
+/// formulaires ouverts avant l'une et l'autre peuvent se courir après, la
+/// seconde écrasant un champ que la première venait de changer. Risque jugé
+/// faible pour du mobilier urbain, et déjà le même que celui de
+/// `place_terraces`.
+///
+/// `WHERE amenity IN (...)` interdit d'appeler ceci sur autre chose qu'un
+/// meuble — sans ce garde-fou, l'endpoint pourrait déplacer n'importe quel
+/// établissement. Renvoie `None` si l'identifiant ne correspond à aucun
+/// meuble.
+pub async fn submit_furniture_contribution(
+    pool: &PgPool,
+    id: &str,
+    lat: f64,
+    lng: f64,
+    direction_deg: Option<f64>,
+    backrest: Option<bool>,
+    author_uid: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let amenity: Option<String> = sqlx::query_scalar(
+        "UPDATE places SET \
+           direction_deg = $2, backrest = $3, contributor_uid = $4, \
+           geom = ST_SetSRID(ST_MakePoint($5, $6), 4326) \
+         WHERE osm_id = $1 AND amenity IN ('bench', 'picnic_table') \
+         RETURNING amenity",
+    )
+    .bind(id)
+    .bind(direction_deg)
+    .bind(backrest)
+    .bind(author_uid)
+    .bind(lng)
+    .bind(lat)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(amenity) = amenity else {
+        return Ok(None);
+    };
+
+    sqlx::query(
+        "INSERT INTO place_furniture_contributions \
+           (place_id, user_uid, lat, lng, direction_deg, backrest, applied) \
+         VALUES ($1, $2, $3, $4, $5, $6, true)",
+    )
+    .bind(id)
+    .bind(author_uid)
+    .bind(lat)
+    .bind(lng)
+    .bind(direction_deg)
+    .bind(backrest)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(amenity))
+}
+
+/// Historique des contributions d'un meuble, la plus récente d'abord —
+/// pseudo et date de chacune, pour que l'app puisse toutes les montrer.
+pub struct FurnitureContributionRecord {
+    pub username: Option<String>,
+    pub lat: f64,
+    pub lng: f64,
+    pub direction_deg: Option<f64>,
+    pub backrest: Option<bool>,
+    pub applied: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn furniture_contributions(
+    pool: &PgPool,
+    place_id: &str,
+) -> Result<Vec<FurnitureContributionRecord>, sqlx::Error> {
+    sqlx::query(
+        "SELECT u.username, c.lat, c.lng, c.direction_deg, c.backrest, c.applied, c.created_at \
+         FROM place_furniture_contributions c \
+         LEFT JOIN users u ON u.uid = c.user_uid \
+         WHERE c.place_id = $1 \
+         ORDER BY c.created_at DESC",
+    )
+    .bind(place_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|r| FurnitureContributionRecord {
+                username: r.get("username"),
+                lat: r.get("lat"),
+                lng: r.get("lng"),
+                // Colonne `real` (FLOAT4) en base : décoder directement en
+                // `f64` fait paniquer sqlx (type SQL/Rust non compatibles),
+                // d'où le détour par `f32`.
+                direction_deg: r.get::<Option<f32>, _>("direction_deg").map(f64::from),
+                backrest: r.get("backrest"),
+                applied: r.get("applied"),
+                created_at: r.get("created_at"),
+            })
+            .collect()
+    })
 }
 
 // ----------------------------------------------------------- ingestion

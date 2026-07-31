@@ -109,6 +109,9 @@ async fn main() {
         .route("/sunlit/batch", post(sunlit_batch))
         .route("/places", get(places))
         .route("/places/terrace", post(report_terrace))
+        .route("/places/furniture", post(add_furniture).put(edit_furniture))
+        .route("/places/furniture/contributions", get(furniture_contributions))
+        .route("/places/terrace/contributions", get(terrace_contributions))
         .route("/users/me", get(current_user))
         .route("/users/me/profile", get(current_profile))
         .route("/users/username", put(set_username))
@@ -1170,6 +1173,239 @@ async fn report_terrace(
         osm_id: report.osm_id,
         has_terrace: report.has_terrace,
     }))
+}
+
+#[derive(Deserialize)]
+struct FurnitureContributionBody {
+    /// "bench" ou "picnic_table" — les deux seules catégories de mobilier
+    /// que l'app sait poser en modèle 3D.
+    category: String,
+    lat: f64,
+    lng: f64,
+    /// Cap du meuble en degrés depuis le nord. Absent : le modèle se pose
+    /// sans rotation, comme un meuble OSM sans tag `direction`.
+    direction_deg: Option<f64>,
+    /// Dossier ou non — n'a de sens que pour un banc, ignoré côté base pour
+    /// une table. Absent plutôt que `false` par défaut : on ne veut pas
+    /// affirmer une absence de dossier que l'app n'aurait pas demandée.
+    backrest: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct FurnitureContributionResponse {
+    id: String,
+    category: String,
+    lat: f64,
+    lng: f64,
+    direction_deg: Option<f64>,
+    backrest: Option<bool>,
+    /// Toujours `true` : conservé pour la forme, plus aucune soumission
+    /// n'est refusée — cf. `db::submit_furniture_contribution`.
+    applied: bool,
+}
+
+/// Ajoute un banc ou une table de pique-nique posé depuis l'app.
+///
+/// Contrairement à une terrasse, il n'y a rien à corriger dans OSM : le
+/// mobilier ajouté ici est directement rangé dans `places`, sous un
+/// `osm_id` synthétique qui ne rejouera jamais avec un réimport OSM.
+async fn add_furniture(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<FurnitureContributionBody>,
+) -> Result<Json<FurnitureContributionResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    if !matches!(body.category.as_str(), "bench" | "picnic_table") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "catégorie inconnue : attendu bench ou picnic_table".into(),
+        ));
+    }
+    if !(-85.0..=85.0).contains(&body.lat) || !(-180.0..=180.0).contains(&body.lng) {
+        return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
+    }
+
+    let osm_id = db::insert_user_furniture(
+        &state.pool,
+        &body.category,
+        body.lat,
+        body.lng,
+        body.direction_deg,
+        body.backrest,
+        &identity.uid,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+
+    // Comme pour une terrasse : la classification déjà en cache ignore ce
+    // nouveau point tant qu'on ne la jette pas.
+    state.places_results.write().await.clear();
+
+    println!("[furniture] {osm_id} ({}) ajouté par {}", body.category, identity.uid);
+
+    Ok(Json(FurnitureContributionResponse {
+        id: osm_id,
+        category: body.category,
+        lat: body.lat,
+        lng: body.lng,
+        direction_deg: body.direction_deg,
+        backrest: body.backrest,
+        applied: true,
+    }))
+}
+
+#[derive(Deserialize)]
+struct FurnitureEditBody {
+    /// Identifiant du meuble à corriger — le sien, qu'il vienne d'une
+    /// contribution (`user/…`) ou d'OSM. Dans le corps et non le chemin,
+    /// comme pour `report_terrace` : un `osm_id` OSM contient une barre
+    /// oblique, qui casserait le routage.
+    id: String,
+    lat: f64,
+    lng: f64,
+    direction_deg: Option<f64>,
+    backrest: Option<bool>,
+}
+
+/// Corrige la position, l'orientation ou le dossier d'un banc ou d'une table
+/// déjà en base — contribué depuis l'app ou importé d'OSM.
+///
+/// Toujours appliquée à `places` et journalisée : pas de verrou de propriété,
+/// n'importe quel contributeur authentifié peut corriger n'importe quel
+/// meuble — cf. `db::submit_furniture_contribution` pour pourquoi ça ne perd
+/// pas les corrections des autres tant que l'écran d'édition préremplit son
+/// formulaire depuis l'état courant.
+///
+/// Écrit directement dans `places`, sans passer par une table de contribution
+/// séparée comme `place_terraces` : un banc, contrairement à un établissement,
+/// n'a pas de nœud OSM ambigu à corriger par-dessus, sa position EST la donnée.
+/// Contrepartie assumée : sur un meuble importé d'OSM, un réimport ultérieur
+/// (`bin/import`) écrasera la correction avec la valeur du tag d'origine —
+/// comme toute colonne de `places` hors contribution.
+async fn edit_furniture(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<FurnitureEditBody>,
+) -> Result<Json<FurnitureContributionResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    if !(-85.0..=85.0).contains(&body.lat) || !(-180.0..=180.0).contains(&body.lng) {
+        return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
+    }
+
+    let category = db::submit_furniture_contribution(
+        &state.pool,
+        &body.id,
+        body.lat,
+        body.lng,
+        body.direction_deg,
+        body.backrest,
+        &identity.uid,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?
+    .ok_or((
+        StatusCode::NOT_FOUND,
+        format!("mobilier inconnu : {}", body.id),
+    ))?;
+
+    state.places_results.write().await.clear();
+
+    println!("[furniture] {} ({category}) modifié par {}", body.id, identity.uid);
+
+    Ok(Json(FurnitureContributionResponse {
+        id: body.id,
+        category,
+        lat: body.lat,
+        lng: body.lng,
+        direction_deg: body.direction_deg,
+        backrest: body.backrest,
+        applied: true,
+    }))
+}
+
+#[derive(Deserialize)]
+struct FurnitureContributionsQuery {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct FurnitureContributionEntry {
+    /// Absent pour une contribution antérieure à l'authentification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    lat: f64,
+    lng: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backrest: Option<bool>,
+    /// Version actuellement affichée sur la carte, parmi toutes celles
+    /// listées ici.
+    applied: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Historique des contributions d'un banc ou d'une table — qui a proposé
+/// quoi, et quand.
+async fn furniture_contributions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<FurnitureContributionsQuery>,
+) -> Result<Json<Vec<FurnitureContributionEntry>>, (StatusCode, String)> {
+    let rows = db::furniture_contributions(&state.pool, &query.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| FurnitureContributionEntry {
+                username: r.username,
+                lat: r.lat,
+                lng: r.lng,
+                direction_deg: r.direction_deg,
+                backrest: r.backrest,
+                applied: r.applied,
+                created_at: r.created_at,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct TerraceContributionsQuery {
+    id: String,
+}
+
+#[derive(Serialize)]
+struct TerraceContributionEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    username: Option<String>,
+    has_terrace: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lat: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lng: Option<f64>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Historique des signalements de terrasse d'un établissement — qui a signalé
+/// quoi, et quand.
+async fn terrace_contributions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<TerraceContributionsQuery>,
+) -> Result<Json<Vec<TerraceContributionEntry>>, (StatusCode, String)> {
+    let rows = db::terrace_contributions(&state.pool, &query.id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| TerraceContributionEntry {
+                username: r.username,
+                has_terrace: r.has_terrace,
+                lat: r.lat,
+                lng: r.lng,
+                created_at: r.created_at,
+            })
+            .collect(),
+    ))
 }
 
 /// Horaires d'ouverture prêts à afficher.

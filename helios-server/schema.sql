@@ -157,6 +157,56 @@ ALTER TABLE places
 ALTER TABLE place_terraces
     ADD COLUMN IF NOT EXISTS user_uid text REFERENCES users(uid) ON DELETE SET NULL;
 
+-- Historique des signalements de terrasse, à côté de `place_terraces` qui ne
+-- garde que le dernier. Même esprit que `place_furniture_contributions` :
+-- savoir qui a signalé en premier, et si quelqu'un d'autre a corrigé depuis,
+-- demande de ne rien écraser.
+CREATE TABLE IF NOT EXISTS place_terrace_contributions (
+    id           bigserial PRIMARY KEY,
+    place_id     text NOT NULL REFERENCES places(osm_id) ON DELETE CASCADE,
+    user_uid     text REFERENCES users(uid) ON DELETE SET NULL,
+    has_terrace  boolean NOT NULL,
+    lat          double precision,
+    lng          double precision,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS place_terrace_contributions_place_idx
+    ON place_terrace_contributions (place_id, created_at DESC);
+
+-- Banc ou table de pique-nique ajouté depuis l'app plutôt qu'importé d'OSM.
+-- NULL pour toutes les lignes venues de `bin/import` ou `bin/ingest` : ceux-là
+-- ne référencent jamais un compte. Contrairement aux terrasses, pas de table
+-- séparée — l'`osm_id` synthétique (`user/<uuid>`) ne collisionne jamais avec
+-- un identifiant OSM réel, donc rien à protéger d'un réimport.
+--
+-- Auteur **courant** de ce qui est affiché : celui qui a posé le meuble, ou le
+-- dernier à en avoir corrigé position/orientation/dossier. NULL pour un meuble
+-- OSM jamais retouché — quiconque peut alors le prendre en charge le premier.
+ALTER TABLE places
+    ADD COLUMN IF NOT EXISTS contributor_uid text REFERENCES users(uid) ON DELETE SET NULL;
+
+-- Historique de toutes les contributions sur un même meuble, et pas seulement
+-- la dernière : deux personnes peuvent en avoir une lecture différente (la
+-- terrasse du café d'à côté a bougé le banc), et effacer les versions
+-- précédentes reviendrait à trancher entre elles sans le dire. Seul
+-- `applied` distingue ce qui est effectivement affiché de ce qui reste une
+-- proposition concurrente — cf. `db::submit_furniture_contribution` : une
+-- contribution d'un autre auteur que le contributeur courant s'ajoute ici
+-- sans toucher à `places`.
+CREATE TABLE IF NOT EXISTS place_furniture_contributions (
+    id           bigserial PRIMARY KEY,
+    place_id     text NOT NULL REFERENCES places(osm_id) ON DELETE CASCADE,
+    user_uid     text REFERENCES users(uid) ON DELETE SET NULL,
+    lat          double precision NOT NULL,
+    lng          double precision NOT NULL,
+    direction_deg real,
+    backrest     boolean,
+    applied      boolean NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS place_furniture_contributions_place_idx
+    ON place_furniture_contributions (place_id, created_at DESC);
+
 -- ----------------------------------------------------------------- index
 
 -- GIST sur chaque géométrie : c'est ce qui rend le `&&` par bounding box
