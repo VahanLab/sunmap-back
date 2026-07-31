@@ -64,6 +64,8 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("cafe", "Café"),
             ("fast_food", "Restauration rapide"),
             ("biergarten", "Biergarten"),
+            ("bench", "Banc public"),
+            ("picnic_table", "Table de pique-nique"),
         ],
         Lang::En => &[
             ("bar", "Bar"),
@@ -72,6 +74,8 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("cafe", "Café"),
             ("fast_food", "Fast food"),
             ("biergarten", "Beer garden"),
+            ("bench", "Public bench"),
+            ("picnic_table", "Picnic table"),
         ],
     };
     lookup(table, amenity)

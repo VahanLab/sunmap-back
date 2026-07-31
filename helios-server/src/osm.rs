@@ -63,6 +63,24 @@ pub const AMENITIES: &[&str] = &[
     "biergarten",
 ];
 
+/// Mobilier urbain assis : la question « au soleil à quelle heure ? » s'y pose
+/// exactement comme pour une terrasse, avec un avantage — la coordonnée OSM
+/// est déjà la bonne, aucun recalage hors bâtiment à faire.
+///
+/// Le banc arrive par `amenity=bench`, la table de pique-nique par
+/// `leisure=picnic_table` : cette fonction ramène les deux à une « amenity »
+/// unique, pour qu'ils traversent le pipeline des établissements sans le
+/// dupliquer.
+pub fn furniture_kind(tags: &HashMap<String, String>) -> Option<&'static str> {
+    if tags.get("amenity").map(String::as_str) == Some("bench") {
+        return Some("bench");
+    }
+    if tags.get("leisure").map(String::as_str) == Some("picnic_table") {
+        return Some("picnic_table");
+    }
+    None
+}
+
 /// Établissement brut (centroïde pour les ways/relations).
 #[derive(Clone, Debug)]
 pub struct Place {
@@ -82,6 +100,16 @@ pub struct Place {
     pub opening_hours: Option<String>,
     pub cuisine: Option<String>,
     pub wikidata: Option<String>,
+    // --- Mobilier urbain (bancs, tables de pique-nique) ; None ailleurs ---
+    /// Tag `direction` : où porte le regard une fois assis, en degrés depuis
+    /// le nord. Croisé avec l'azimut solaire, il dit « soleil de face » ou
+    /// « dans le dos » — rare mais précieux.
+    pub direction_deg: Option<f64>,
+    /// Sous abri : jamais « au soleil », quelle que soit la classification.
+    pub covered: Option<bool>,
+    pub backrest: Option<bool>,
+    pub seats: Option<i32>,
+    pub material: Option<String>,
 }
 
 /// Requête Overpass générique : essaie chaque miroir dans l'ordre, renvoie le
@@ -291,11 +319,42 @@ pub fn tree_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, Stri
 }
 
 /// Établissement à partir de ses tags.
+/// Tag OSM `direction` → degrés depuis le nord.
+///
+/// Le wiki accepte deux écritures et les deux existent en base : des degrés
+/// (`direction=225`) et des points cardinaux (`direction=SW`, jusqu'à 16
+/// points). Les valeurs hors de ces deux formes (`both`, plages…) sont
+/// ignorées plutôt que devinées.
+fn parse_direction_deg(raw: &str) -> Option<f64> {
+    if let Ok(deg) = raw.trim().parse::<f64>() {
+        return Some(deg.rem_euclid(360.0));
+    }
+    let cardinal: &[(&str, f64)] = &[
+        ("N", 0.0), ("NNE", 22.5), ("NE", 45.0), ("ENE", 67.5),
+        ("E", 90.0), ("ESE", 112.5), ("SE", 135.0), ("SSE", 157.5),
+        ("S", 180.0), ("SSW", 202.5), ("SW", 225.0), ("WSW", 247.5),
+        ("W", 270.0), ("WNW", 292.5), ("NW", 315.0), ("NNW", 337.5),
+    ];
+    let upper = raw.trim().to_ascii_uppercase();
+    cardinal.iter().find(|(k, _)| *k == upper).map(|(_, v)| *v)
+}
+
+/// Tag booléen OSM : seul « no » est un refus, tout le reste vaut oui — même
+/// convention que `outdoor_seating`.
+fn parse_yes_no(raw: &str) -> bool {
+    raw != "no"
+}
+
 pub fn place_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, String>) -> Place {
     Place {
         osm_id,
         name: tags.get("name").cloned(),
-        amenity: tags.get("amenity").cloned(),
+        // Le mobilier prime : une table de pique-nique n'a pas d'`amenity`
+        // (elle vient de `leisure=picnic_table`), et la normaliser ici évite à
+        // tout le reste du pipeline de connaître deux clés de tag.
+        amenity: furniture_kind(tags)
+            .map(str::to_string)
+            .or_else(|| tags.get("amenity").cloned()),
         // "no" est le seul refus explicite ; "seasonal", "sidewalk",
         // "garden"… décrivent une terrasse et valent donc oui.
         outdoor_seating: tags
@@ -315,6 +374,11 @@ pub fn place_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, Str
         opening_hours: tags.get("opening_hours").cloned(),
         cuisine: tags.get("cuisine").cloned(),
         wikidata: tags.get("wikidata").cloned(),
+        direction_deg: tags.get("direction").and_then(|d| parse_direction_deg(d)),
+        covered: tags.get("covered").map(|v| parse_yes_no(v)),
+        backrest: tags.get("backrest").map(|v| parse_yes_no(v)),
+        seats: tags.get("seats").and_then(|s| s.trim().parse().ok()),
+        material: tags.get("material").cloned(),
     }
 }
 
@@ -484,4 +548,44 @@ struct Element {
 struct Center {
     lat: f64,
     lon: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direction_numerique_et_cardinale() {
+        assert_eq!(parse_direction_deg("225"), Some(225.0));
+        assert_eq!(parse_direction_deg("SW"), Some(225.0));
+        assert_eq!(parse_direction_deg("sw"), Some(225.0));
+        assert_eq!(parse_direction_deg("NNW"), Some(337.5));
+        // Normalisé dans [0, 360) : certains mappeurs écrivent -90 ou 450.
+        assert_eq!(parse_direction_deg("-90"), Some(270.0));
+        // Valeurs libres du wiki qu'on refuse de deviner.
+        assert_eq!(parse_direction_deg("both"), None);
+        assert_eq!(parse_direction_deg("90-180"), None);
+    }
+
+    #[test]
+    fn mobilier_normalise_en_amenity() {
+        let mut tags = HashMap::new();
+        tags.insert("leisure".to_string(), "picnic_table".to_string());
+        tags.insert("covered".to_string(), "yes".to_string());
+        tags.insert("direction".to_string(), "SE".to_string());
+        tags.insert("seats".to_string(), "6".to_string());
+        let p = place_from("node/1".into(), 48.0, 2.0, &tags);
+        assert_eq!(p.amenity.as_deref(), Some("picnic_table"));
+        assert_eq!(p.covered, Some(true));
+        assert_eq!(p.direction_deg, Some(135.0));
+        assert_eq!(p.seats, Some(6));
+
+        let mut bench = HashMap::new();
+        bench.insert("amenity".to_string(), "bench".to_string());
+        bench.insert("backrest".to_string(), "no".to_string());
+        let b = place_from("node/2".into(), 48.0, 2.0, &bench);
+        assert_eq!(b.amenity.as_deref(), Some("bench"));
+        assert_eq!(b.backrest, Some(false));
+        assert_eq!(b.direction_deg, None);
+    }
 }

@@ -12,4 +12,5 @@ pub mod i18n;
 pub mod opening_hours;
 pub mod osm;
 pub mod pbf;
+pub mod tiers;
 pub mod username;

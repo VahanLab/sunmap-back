@@ -102,7 +102,7 @@ pub async fn places_in_bbox(
 ) -> Result<Vec<Place>, sqlx::Error> {
     let sql = format!(
         "SELECT osm_id, name, amenity, outdoor_seating, website, phone, opening_hours, \
-                cuisine, wikidata, \
+                cuisine, wikidata, direction_deg, covered, backrest, seats, material, \
                 ST_Y(geom) AS lat, ST_X(geom) AS lng \
          FROM places WHERE geom && {}",
         envelope(s, w, n, e)
@@ -123,6 +123,12 @@ pub async fn places_in_bbox(
             opening_hours: r.get("opening_hours"),
             cuisine: r.get("cuisine"),
             wikidata: r.get("wikidata"),
+            // `real` PostgreSQL = f32 ; élargi en f64 côté domaine.
+            direction_deg: r.get::<Option<f32>, _>("direction_deg").map(f64::from),
+            covered: r.get("covered"),
+            backrest: r.get("backrest"),
+            seats: r.get("seats"),
+            material: r.get("material"),
         })
         .collect())
 }
@@ -155,6 +161,23 @@ pub struct UserRecord {
 /// Le pseudo demandé est déjà pris.
 #[derive(Debug)]
 pub struct UsernameTaken;
+
+/// Une contribution, vue depuis le profil de son auteur.
+///
+/// Porte l'établissement (nom, catégorie, position) et non la seule référence :
+/// une liste de `node/123456` ne dirait rien à personne, et le client n'a pas de
+/// quoi les résoudre — il ne connaît que les établissements de la zone qu'il
+/// regarde, or les contributions sont éparpillées.
+#[derive(Clone, Debug)]
+pub struct ContributionRecord {
+    pub osm_id: String,
+    pub name: Option<String>,
+    pub amenity: Option<String>,
+    pub has_terrace: bool,
+    pub lat: f64,
+    pub lng: f64,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
 
 /// Contributions couvrant la bbox, indexées par identifiant OSM.
 ///
@@ -428,14 +451,19 @@ pub async fn upsert_places(pool: &PgPool, pois: &[Place]) -> Result<u64, sqlx::E
         for p in chunk {
             written += sqlx::query(
                 "INSERT INTO places (osm_id, name, amenity, outdoor_seating, website, phone, \
-                                       opening_hours, cuisine, wikidata, geom) \
+                                       opening_hours, cuisine, wikidata, geom, \
+                                       direction_deg, covered, backrest, seats, material) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                         ST_SetSRID(ST_MakePoint($10, $11), 4326)) \
+                         ST_SetSRID(ST_MakePoint($10, $11), 4326), \
+                         $12, $13, $14, $15, $16) \
                  ON CONFLICT (osm_id) DO UPDATE SET \
                    name = EXCLUDED.name, amenity = EXCLUDED.amenity, \
                    outdoor_seating = EXCLUDED.outdoor_seating, website = EXCLUDED.website, \
                    phone = EXCLUDED.phone, opening_hours = EXCLUDED.opening_hours, \
-                   cuisine = EXCLUDED.cuisine, wikidata = EXCLUDED.wikidata, geom = EXCLUDED.geom",
+                   cuisine = EXCLUDED.cuisine, wikidata = EXCLUDED.wikidata, geom = EXCLUDED.geom, \
+                   direction_deg = EXCLUDED.direction_deg, covered = EXCLUDED.covered, \
+                   backrest = EXCLUDED.backrest, seats = EXCLUDED.seats, \
+                   material = EXCLUDED.material",
             )
             .bind(&p.osm_id)
             .bind(&p.name)
@@ -448,6 +476,11 @@ pub async fn upsert_places(pool: &PgPool, pois: &[Place]) -> Result<u64, sqlx::E
             .bind(&p.wikidata)
             .bind(p.lng)
             .bind(p.lat)
+            .bind(p.direction_deg.map(|d| d as f32))
+            .bind(p.covered)
+            .bind(p.backrest)
+            .bind(p.seats)
+            .bind(&p.material)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -608,6 +641,77 @@ pub async fn user_by_uid(pool: &PgPool, uid: &str) -> Result<Option<UserRecord>,
                 username: r.get("username"),
             }),
     )
+}
+
+/// Compte désigné par son pseudo, sans tenir compte de la casse.
+///
+/// Recherche sur `username_key` et non sur `username` : c'est la colonne
+/// générée en minuscules qui porte l'index unique, donc la seule qui garantisse
+/// à la fois l'unicité du résultat et une lecture indexée. Ouvrir le profil de
+/// « Karl » depuis une fiche doit marcher, quelle que soit la casse du lien.
+pub async fn user_by_username(
+    pool: &PgPool,
+    username: &str,
+) -> Result<Option<UserRecord>, sqlx::Error> {
+    Ok(
+        sqlx::query("SELECT uid, username FROM users WHERE username_key = $1")
+            .bind(username.to_lowercase())
+            .fetch_optional(pool)
+            .await?
+            .map(|r| UserRecord {
+                uid: r.get("uid"),
+                username: r.get("username"),
+            }),
+    )
+}
+
+/// Nombre de contributions d'un compte.
+///
+/// Compté à part de la liste plutôt que déduit de sa longueur : la liste est
+/// tronquée pour l'affichage, et le total est justement ce qui décide du palier
+/// — le déduire d'une liste plafonnée figerait tout le monde au plafond.
+pub async fn contribution_count(pool: &PgPool, uid: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM place_terraces WHERE user_uid = $1")
+        .bind(uid)
+        .fetch_one(pool)
+        .await
+}
+
+/// Établissements auxquels un compte a contribué, du plus récent au plus ancien.
+///
+/// `JOIN places` et non `LEFT JOIN` : une contribution dont l'établissement a
+/// disparu d'OSM depuis n'a plus rien à montrer — ni nom, ni catégorie, ni
+/// position. Elle reste comptée dans le total, mais n'a pas sa place dans une
+/// liste dont chaque ligne est censée être cliquable.
+pub async fn contributions_by_user(
+    pool: &PgPool,
+    uid: &str,
+    limit: i64,
+) -> Result<Vec<ContributionRecord>, sqlx::Error> {
+    Ok(sqlx::query(
+        "SELECT t.osm_id, t.has_terrace, t.updated_at, \
+                p.name, p.amenity, ST_Y(p.geom) AS lat, ST_X(p.geom) AS lng \
+         FROM place_terraces t \
+         JOIN places p USING (osm_id) \
+         WHERE t.user_uid = $1 \
+         ORDER BY t.updated_at DESC \
+         LIMIT $2",
+    )
+    .bind(uid)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| ContributionRecord {
+        osm_id: r.get("osm_id"),
+        name: r.get("name"),
+        amenity: r.get("amenity"),
+        has_terrace: r.get("has_terrace"),
+        lat: r.get("lat"),
+        lng: r.get("lng"),
+        updated_at: r.get("updated_at"),
+    })
+    .collect())
 }
 
 /// Pseudos déjà pris parmi ceux proposés, comparés sans tenir compte de la casse.

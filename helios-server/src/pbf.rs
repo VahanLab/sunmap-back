@@ -99,6 +99,9 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
         let is_terrace = tags
             .get("amenity")
             .is_some_and(|a| AMENITIES.contains(&a.as_str()));
+        // Bancs et tables de pique-nique : même table et même pipeline que les
+        // établissements — `place_from` normalise leur « amenity ».
+        let is_furniture = crate::osm::furniture_kind(&tags).is_some();
 
         if wood {
             if let Some(w) = wood_from(osm_id.clone(), &tags, rings(&geometry)) {
@@ -113,12 +116,12 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
         // Arbres et terrasses sont ponctuels : un objet surfacique (un
         // restaurant cartographié en bâtiment) est ramené à son centroïde,
         // comme le faisait `out center` côté Overpass.
-        if is_tree || is_terrace {
+        if is_tree || is_terrace || is_furniture {
             if let Some((lat, lng)) = representative_point(&geometry) {
                 if is_tree {
                     out.trees.push(tree_from(osm_id.clone(), lat, lng, &tags));
                 }
-                if is_terrace {
+                if is_terrace || is_furniture {
                     out.places.push(place_from(osm_id, lat, lng, &tags));
                 }
             }

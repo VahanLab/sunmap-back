@@ -22,4 +22,7 @@ chrono = "0.4"
 # (pas de macro `query!`) pour ne pas exiger une base joignable au build.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls", "postgres", "macros",
+    # `timestamptz` → `chrono::DateTime<Utc>`, pour dater les contributions
+    # affichées sur un profil.
+    "chrono",
 ] }

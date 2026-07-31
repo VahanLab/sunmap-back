@@ -28,6 +28,7 @@ use helios_server::i18n::{self, Lang};
 use helios_server::opening_hours;
 use helios_server::dem::{self, latlon_of_world_px, world_px, TileCache, TILE_SIZE, ZOOM};
 use helios_server::osm::Building;
+use helios_server::tiers;
 use helios_server::username;
 
 /// Emprises déjà lues en base pour une bbox de tuiles donnée. PostGIS répond
@@ -109,8 +110,12 @@ async fn main() {
         .route("/places", get(places))
         .route("/places/terrace", post(report_terrace))
         .route("/users/me", get(current_user))
+        .route("/users/me/profile", get(current_profile))
         .route("/users/username", put(set_username))
         .route("/users/username/suggestions", get(username_suggestions))
+        // Après les routes littérales : sinon `/users/me` tomberait dans le
+        // motif et on chercherait un compte au pseudo « me ».
+        .route("/users/{username}/profile", get(user_profile))
         .route("/trees", get(trees))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
@@ -1065,6 +1070,19 @@ struct Place {
     /// utilisable côté client pour aller chercher une photo (propriété P18)
     /// via l'API Wikidata/Commons — OSM ne stocke pas de photos lui-même.
     wikidata: Option<String>,
+    /// Mobilier urbain (bancs, tables de pique-nique) — absents partout
+    /// ailleurs. `direction_deg` : où porte le regard assis, en degrés depuis
+    /// le nord.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covered: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backrest: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seats: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    material: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1305,12 +1323,19 @@ async fn places(
             // La rectifier avec `nudge_out_of_building` détruirait justement la
             // précision qu'on lui a demandée — une terrasse sous arcade ou
             // adossée à la façade se retrouverait déplacée au milieu de la rue.
+            // Un banc ou une table de pique-nique est cartographié à sa
+            // position réelle : le recalage hors bâtiment, pensé pour des
+            // nœuds d'établissement posés sur leur immeuble, ne ferait que
+            // déplacer un meuble déjà bien placé.
+            let is_furniture =
+                matches!(p.amenity.as_deref(), Some("bench" | "picnic_table"));
             let (px, py, moved_m) = match terrace {
                 Some((lat, lng)) => {
                     let (tx, ty) = world_px(lat, lng);
                     let moved = ((tx - osm_wx).hypot(ty - osm_wy)) * dsm.meters_per_pixel;
                     (tx - origin_x, ty - origin_y, moved)
                 }
+                None if is_furniture => (osm_wx - origin_x, osm_wy - origin_y, 0.0),
                 // Sinon le nœud OSM est presque toujours posé sur le bâtiment
                 // et non sur la terrasse : on le ramène sur le sol libre
                 // voisin (12 m max).
@@ -1363,6 +1388,11 @@ async fn places(
                     .map(|raw| opening_hours_payload(raw, lang)),
                 cuisine: p.cuisine.clone(),
                 wikidata: p.wikidata.clone(),
+                direction_deg: p.direction_deg,
+                covered: p.covered,
+                backrest: p.backrest,
+                seats: p.seats,
+                material: p.material.clone(),
             }
         })
         .collect();
@@ -1618,4 +1648,160 @@ async fn username_suggestions(
         .take(WANTED)
         .collect();
     Ok(Json(SuggestionsResponse { suggestions }))
+}
+
+// ------------------------------------------------------------------ profils
+
+/// Nombre de contributions listées sur un profil.
+///
+/// Plafond et non pagination : au-delà, la liste n'est plus consultée mais
+/// parcourue, et c'est le compteur — qui, lui, n'est pas plafonné — qui porte
+/// l'information. Une pagination viendra si quelqu'un dépasse vraiment ce
+/// volume.
+const PROFILE_CONTRIBUTIONS_LIMIT: i64 = 200;
+
+#[derive(Serialize)]
+struct ProfileResponse {
+    username: String,
+    /// Total réel, jamais plafonné : c'est lui qui décide du palier.
+    contribution_count: i64,
+    tier: TierPayload,
+    /// Absent au sommet du barème — il n'y a alors plus rien à viser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_tier: Option<TierPayload>,
+    /// Contributions restantes avant `next_tier`. `0` au sommet.
+    remaining_to_next: i64,
+    /// Avancement dans le palier courant, de 0 à 1.
+    progress: f64,
+    /// Tronquée à `PROFILE_CONTRIBUTIONS_LIMIT`, contrairement au compteur.
+    contributions: Vec<ContributionPayload>,
+}
+
+#[derive(Serialize)]
+struct TierPayload {
+    /// Clé stable ("novice", "budding"…) : le client y accroche son icône et sa
+    /// couleur sans dépendre d'un libellé traduit.
+    key: &'static str,
+    label: &'static str,
+    tagline: &'static str,
+    /// Contributions nécessaires pour l'atteindre.
+    threshold: i64,
+}
+
+impl TierPayload {
+    fn of(tier: tiers::Tier, lang: Lang) -> TierPayload {
+        TierPayload {
+            key: tier.key(),
+            label: tier.label(lang),
+            tagline: tier.tagline(lang),
+            threshold: tier.threshold(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ContributionPayload {
+    osm_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amenity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category_label: Option<String>,
+    /// L'utilisateur a-t-il signalé une terrasse, ou son absence ? Les deux sont
+    /// des contributions : dire « pas de terrasse » corrige la carte autant que
+    /// l'inverse.
+    has_terrace: bool,
+    lat: f64,
+    lng: f64,
+    updated_at: String,
+}
+
+#[derive(Deserialize)]
+struct ProfileQuery {
+    lang: Option<String>,
+}
+
+/// Assemble le profil d'un compte déjà identifié.
+///
+/// Partagé par le profil personnel et le profil public : les deux montrent
+/// exactement la même chose. Rien de privé n'est en jeu — ni e-mail (le serveur
+/// ne le stocke pas, il vit dans Firebase) ni identifiant Firebase, qui n'a
+/// aucune raison de sortir. Ce qu'on publie, ce sont des contributions faites
+/// pour être vues.
+async fn build_profile(
+    state: &Arc<AppState>,
+    user: db::UserRecord,
+    lang: Lang,
+) -> Result<ProfileResponse, (StatusCode, String)> {
+    let count = db::contribution_count(&state.pool, &user.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    let records = db::contributions_by_user(&state.pool, &user.uid, PROFILE_CONTRIBUTIONS_LIMIT)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+
+    let progress = tiers::Progress::of(count);
+    Ok(ProfileResponse {
+        username: user.username,
+        contribution_count: progress.count,
+        tier: TierPayload::of(progress.tier, lang),
+        next_tier: progress.next.map(|t| TierPayload::of(t, lang)),
+        remaining_to_next: progress.remaining,
+        progress: progress.fraction,
+        contributions: records
+            .into_iter()
+            .map(|r| ContributionPayload {
+                category_label: r.amenity.as_deref().map(|a| i18n::amenity_label(a, lang)),
+                osm_id: r.osm_id,
+                name: r.name,
+                amenity: r.amenity,
+                has_terrace: r.has_terrace,
+                lat: r.lat,
+                lng: r.lng,
+                updated_at: r.updated_at.to_rfc3339(),
+            })
+            .collect(),
+    })
+}
+
+/// Profil du compte connecté.
+///
+/// Distinct de `GET /users/me`, qui reste le strict nécessaire à l'amorçage de
+/// la session (uid, pseudo) et que l'app appelle à chaque restauration : y
+/// greffer deux requêtes de contributions ralentirait tous les lancements pour
+/// un écran qu'on n'ouvre qu'à la demande.
+async fn current_profile(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ProfileQuery>,
+) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    let user = db::user_by_uid(&state.pool, &identity.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "aucun pseudo choisi pour ce compte".to_string(),
+        ))?;
+    let profile = build_profile(&state, user, Lang::parse(q.lang.as_deref())).await?;
+    Ok(Json(profile))
+}
+
+/// Profil public d'un contributeur, désigné par son pseudo.
+///
+/// Sans authentification : c'est le pseudo affiché sous une terrasse signalée
+/// qui y mène, et consulter la carte n'a jamais demandé de compte — exiger d'en
+/// créer un pour savoir qui a contribué prendrait l'attribution à rebours.
+async fn user_profile(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Query(q): Query<ProfileQuery>,
+) -> Result<Json<ProfileResponse>, (StatusCode, String)> {
+    let user = db::user_by_username(&state.pool, &username)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "pseudo inconnu".to_string()))?;
+    let profile = build_profile(&state, user, Lang::parse(q.lang.as_deref())).await?;
+    Ok(Json(profile))
 }

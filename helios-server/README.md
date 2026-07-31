@@ -96,7 +96,7 @@ haut projettent 230 m.
   calculer, et l'expose en `snapped_*`. Mais il ne sait pas de quel côté est
   la rue — pour une terrasse en angle il peut sortir du mauvais côté.
 - **Arbres absents de la DSM** : la canopée ne porte pas ombre (backlog, cf.
-  CLAUDE.md racine).
+  AGENTS.md racine).
 - Le DEM Mapterhorn n'est pas parfaitement bare-earth partout : quelques
   bloqueurs ressortent en `terrain` à très courte distance.
 - Cache RAM non borné, pas de persistance. Pas d'auth ni de rate limiting :
@@ -286,6 +286,88 @@ du lieu regardé. Correct tant qu'on consulte sa propre ville — le cas dominan
 Une vraie résolution lat/lng → fuseau demanderait une base de fuseaux côté
 serveur (crate `tzf-rs` par exemple).
 
+### Mobilier urbain dans `/places`
+
+Les bancs (`amenity=bench`) et les tables de pique-nique
+(`leisure=picnic_table`) passent par la **même table et le même endpoint** que
+les établissements : la question « au soleil à quelle heure ? » y est
+identique, et les dupliquer aurait dupliqué tout le pipeline bbox +
+classification.
+
+`leisure=picnic_table` est normalisé en `amenity: "picnic_table"` dès
+l'extraction (`osm::furniture_kind`), pour que rien en aval n'ait à connaître
+deux clés de tag.
+
+Deux différences de traitement, toutes deux volontaires :
+
+- **Pas de recalage hors bâtiment.** Un banc est cartographié là où il est ;
+  `nudge_out_of_building`, pensé pour des nœuds d'établissement posés sur leur
+  immeuble, ne ferait que déplacer un meuble déjà bien placé. `snapped_*` est
+  donc toujours absent pour eux.
+- **Champs supplémentaires**, absents partout ailleurs :
+
+| Champ | Type | Origine | Note |
+|---|---|---|---|
+| `direction_deg` | f64 | `direction` | Degrés depuis le nord. Accepte les degrés (`225`) et les points cardinaux (`SW`) |
+| `covered` | bool | `covered` | Sous abri : jamais vraiment « au soleil » |
+| `backrest` | bool | `backrest` | |
+| `seats` | i32 | `seats` | |
+| `material` | string | `material` | Valeur OSM brute, traduite côté client |
+
+Volume à connaître avant d'afficher : ~49 500 bancs et ~2 900 tables pour la
+seule Île-de-France. Le client les laisse **éteints par défaut** — des milliers
+de pastilles par arrondissement noieraient les établissements.
+
+### `GET /users/me/profile` · `GET /users/{username}/profile`
+
+Profil d'un contributeur : son palier, son avancement, ses signalements. Le
+premier lit le compte du jeton (`Authorization: Bearer …`), le second n'importe
+quel pseudo, **sans authentification** — c'est le pseudo affiché sous une
+terrasse signalée qui y mène, et consulter la carte n'a jamais demandé de compte.
+
+Les deux servent exactement la même chose. Rien de privé n'est en jeu : l'e-mail
+n'est pas stocké côté serveur (il vit dans Firebase, sur l'appareil) et l'uid
+Firebase ne sort pas. Ce qu'on publie, ce sont des contributions faites pour être
+vues.
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `lang` | string | non | `fr` (défaut) ou `en`. Traduit libellés de palier et de catégorie |
+
+```json
+{
+  "username": "AmiDuSoleil5842",
+  "contribution_count": 5,
+  "tier": {
+    "key": "budding", "label": "Contributeur en herbe",
+    "tagline": "Vos signalements aident déjà à trouver l'ombre.", "threshold": 3
+  },
+  "next_tier": { "key": "established", "label": "Contributeur affirmé", "threshold": 10 },
+  "remaining_to_next": 5,
+  "progress": 0.2857,
+  "contributions": [
+    {
+      "osm_id": "node/2267752285", "name": "Epifani",
+      "amenity": "restaurant", "category_label": "Restaurant",
+      "has_terrace": true, "lat": 48.8426051, "lng": 2.2779253,
+      "updated_at": "2026-07-29T10:19:17.507222+00:00"
+    }
+  ]
+}
+```
+
+Barème dans `src/tiers.rs` — **côté serveur et pas dans les clients** : les
+seuils bougeront avec l'usage, et une app déjà installée afficherait sinon
+l'ancien. Le client n'accroche son décor qu'à `key`, jamais au libellé traduit.
+
+`next_tier` est absent au sommet du barème, `remaining_to_next` vaut alors `0` et
+`progress` vaut `1`. `contribution_count` est le total réel ; `contributions` est
+tronquée à 200 — le compteur, lui, ne l'est jamais, puisque c'est lui qui décide
+du palier.
+
+`404` si le pseudo est inconnu, ou si le compte du jeton n'a pas encore choisi le
+sien.
+
 ### `GET /trees`
 
 Arbres OSM (`natural=tree`) de la bbox — géométrie seule, aucun calcul
@@ -341,7 +423,7 @@ EPSG:4326, index GIST sur chacune. Cf. `schema.sql`, commenté.
 | `places` | `Point` | Établissements et leurs tags, position OSM **non corrigée** — le déport côté rue dépend de la DSM et se calcule au runtime |
 | `place_terraces` | `Point` | Terrasses signalées par les utilisateurs. Séparée de `places` pour survivre aux réimports |
 
-## Roadmap (cf. CLAUDE.md racine)
+## Roadmap (cf. AGENTS.md racine)
 
 - Échantillonnage multi-points par terrasse → pourcentage d'ensoleillement
   plutôt qu'un booléen, et déport orienté vers la rue

@@ -142,6 +142,16 @@ CREATE TABLE IF NOT EXISTS place_terraces (
 
 -- ------------------------------------------------------------ migrations
 
+-- Mobilier urbain (bancs `amenity=bench`, tables `leisure=picnic_table`),
+-- logé dans `places` : même pipeline bbox + classification soleil/ombre que
+-- les établissements. Colonnes NULL pour tout le reste de la table.
+ALTER TABLE places
+    ADD COLUMN IF NOT EXISTS direction_deg real,
+    ADD COLUMN IF NOT EXISTS covered boolean,
+    ADD COLUMN IF NOT EXISTS backrest boolean,
+    ADD COLUMN IF NOT EXISTS seats integer,
+    ADD COLUMN IF NOT EXISTS material text;
+
 -- `CREATE TABLE IF NOT EXISTS` ne modifie pas une table déjà présente : les
 -- bases créées avant l'authentification n'auraient jamais la colonne d'auteur.
 ALTER TABLE place_terraces
