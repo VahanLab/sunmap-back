@@ -1,4 +1,5 @@
-//! Digital Surface Model : grille d'altitudes fusionnant terrain et bâtiments.
+//! Digital Surface Model : grille d'altitudes fusionnant terrain et bâtiments,
+//! plus une couche de canopée semi-transparente.
 //!
 //! Convention de grille : `x` croît vers l'est, `y` croît vers le sud
 //! (ligne 0 = bord nord), comme une image raster classique.
@@ -6,6 +7,11 @@
 //! La fusion terrain + bâtiments se fait en amont du moteur : on part d'un DEM
 //! (tuile Terrarium décodée) puis on « tamponne » chaque emprise de bâtiment à
 //! `altitude_sol + hauteur` via [`Dsm::stamp_max`].
+//!
+//! La végétation ne vit PAS dans `data` : un arbre n'est pas un mur. Elle
+//! occupe sa propre couche (`canopy_top`/`canopy_base`), que le ray marching
+//! traverse en accumulant une atténuation au lieu de s'arrêter — cf.
+//! `shadow.rs`.
 
 /// Grille d'altitudes en mètres.
 #[derive(Debug, Clone)]
@@ -14,8 +20,17 @@ pub struct Dsm {
     pub height: usize,
     /// Taille d'une cellule en mètres (résolution au sol).
     pub meters_per_pixel: f64,
-    /// Altitudes, ordre row-major, `data[y * width + x]`.
+    /// Altitudes des obstacles **opaques** (terrain + bâtiments), ordre
+    /// row-major, `data[y * width + x]`.
     pub data: Vec<f32>,
+    /// Sommet de canopée par cellule (altitude absolue), `f32::NEG_INFINITY`
+    /// là où il n'y a pas de végétation. `None` tant qu'aucune végétation n'a
+    /// été tamponnée — le ray marching saute alors toute la logique canopée.
+    pub canopy_top: Option<Vec<f32>>,
+    /// Base de la couronne (altitude absolue) : un rayon qui passe sous elle
+    /// — sous le houppier d'un arbre d'alignement — ne traverse rien.
+    /// Toujours présent si `canopy_top` l'est.
+    pub canopy_base: Option<Vec<f32>>,
 }
 
 impl Dsm {
@@ -26,6 +41,8 @@ impl Dsm {
             height,
             meters_per_pixel,
             data: vec![elevation; width * height],
+            canopy_top: None,
+            canopy_base: None,
         }
     }
 
@@ -50,6 +67,8 @@ impl Dsm {
             height,
             meters_per_pixel,
             data,
+            canopy_top: None,
+            canopy_base: None,
         }
     }
 
@@ -80,9 +99,57 @@ impl Dsm {
         Some(top * (1.0 - fy) + bot * fy)
     }
 
-    /// Altitude maximale de la grille — borne l'horizon de recherche du ray marching.
+    /// Altitude maximale de la grille — borne l'horizon de recherche du ray
+    /// marching. Canopée comprise : une futaie qui dépasse les toits doit
+    /// pouvoir arrêter un rayon au-delà du plus haut bâtiment.
     pub fn max_elevation(&self) -> f32 {
-        self.data.iter().copied().fold(f32::MIN, f32::max)
+        let solid = self.data.iter().copied().fold(f32::MIN, f32::max);
+        match &self.canopy_top {
+            Some(top) => top
+                .iter()
+                .copied()
+                .filter(|t| t.is_finite())
+                .fold(solid, f32::max),
+            None => solid,
+        }
+    }
+
+    /// Alloue les couches de canopée si besoin, et les renvoie en écriture.
+    pub fn canopy_layers_mut(&mut self) -> (&mut [f32], &mut [f32]) {
+        let len = self.width * self.height;
+        if self.canopy_top.is_none() {
+            self.canopy_top = Some(vec![f32::NEG_INFINITY; len]);
+            self.canopy_base = Some(vec![f32::NEG_INFINITY; len]);
+        }
+        (
+            self.canopy_top.as_mut().unwrap(),
+            self.canopy_base.as_mut().unwrap(),
+        )
+    }
+
+    /// Couronne de canopée à la cellule contenant `(x, y)` : `(base, sommet)`
+    /// en altitudes absolues, `None` sans végétation ici.
+    ///
+    /// Cellule entière et non bilinéaire, contrairement à `sample` : la
+    /// canopée est éparse, et interpoler entre une couronne et du vide
+    /// fabriquerait des demi-arbres fantômes autour de chaque houppier.
+    #[inline]
+    pub fn canopy_at(&self, x: f64, y: f64) -> Option<(f32, f32)> {
+        let top = self.canopy_top.as_ref()?;
+        let base = self.canopy_base.as_ref()?;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let (cx, cy) = (x.round() as usize, y.round() as usize);
+        if cx >= self.width || cy >= self.height {
+            return None;
+        }
+        let i = cy * self.width + cx;
+        let t = top[i];
+        if !t.is_finite() {
+            return None;
+        }
+        Some((base[i], t))
     }
 
     /// « Tamponne » une altitude sur un rectangle de cellules en gardant le max

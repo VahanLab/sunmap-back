@@ -133,6 +133,8 @@ pub async fn elevation_at_zoom(
         height: TILE_SIZE,
         meters_per_pixel: meters_per_pixel(lat),
         data: (*tile).clone(),
+        canopy_top: None,
+        canopy_base: None,
     };
     dsm.sample(px, py).ok_or_else(|| "hors tuile".to_string())
 }

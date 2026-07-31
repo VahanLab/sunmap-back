@@ -227,6 +227,8 @@ async fn assemble_grid(
         height,
         meters_per_pixel,
         data,
+        canopy_top: None,
+        canopy_base: None,
     };
     Ok((
         dsm,
@@ -431,18 +433,17 @@ struct Blocker {
     ray_elevation_m: f64,
 }
 
-/// Traduit un `ShadowHit` (cellule DSM) en `Blocker` nommé.
 /// Tamponne la végétation : emprises boisées puis arbres isolés.
 ///
-/// Traitée après les bâtiments et jamais avant : là où les deux se recouvrent —
-/// un arbre de cour, un bois qui mord sur un hangar — c'est le bâtiment qui doit
-/// rester le coupable désigné, il est plus haut et surtout opaque.
+/// Dans les couches **canopée** de la DSM, pas dans la grille opaque : depuis
+/// la transmittance, un arbre n'est plus un mur — le ray marching traverse la
+/// couronne en atténuant la lumière au lieu de s'arrêter (cf. `shadow.rs`).
+/// Une terrasse sous ses platanes d'alignement revoit ainsi le soleil, une
+/// futaie dense l'éteint toujours.
 ///
-/// Limite assumée de cette étape : la canopée est tamponnée comme un volume
-/// plein, donc opaque. Une forêt fait un bloc, ce qui est à peu près juste pour
-/// une futaie dense en été et faux pour des feuillus en hiver. La transmittance
-/// demande un ray marching qui accumule au lieu de s'arrêter au premier impact,
-/// et une classe portée par la DSM.
+/// Traitée après les bâtiments : là où les deux se recouvrent — un arbre de
+/// cour, un bois qui mord sur un hangar — c'est le bâtiment qui doit rester le
+/// coupable désigné dans `owner`.
 fn stamp_canopy(
     dsm: &mut Dsm,
     terrain: &Dsm,
@@ -454,29 +455,53 @@ fn stamp_canopy(
 ) {
     // Les bois passent par la même rasterisation scanline que les bâtiments —
     // même forme de donnée, mêmes anneaux intérieurs à garder creux (une
-    // clairière est un anneau intérieur).
+    // clairière est un anneau intérieur). Rasterisés dans une grille de
+    // travail, puis reportés dans la couche canopée : `stamp_buildings` ne
+    // sait écrire que dans une grille opaque.
     let mut wood_owner = vec![OWNER_TERRAIN; owner.len()];
-    stamp_buildings(dsm, terrain, &mut wood_owner, origin_x, origin_y, woods);
+    let mut scratch = terrain.clone();
+    stamp_buildings(&mut scratch, terrain, &mut wood_owner, origin_x, origin_y, woods);
+
+    let width = dsm.width;
+    let (canopy_top, canopy_base) = dsm.canopy_layers_mut();
+
+    // Bois : couronne du sol au sommet — un sous-bois n'a pas de base
+    // dégagée, contrairement à un arbre d'alignement taillé pour le passage.
+    for (i, &w) in wood_owner.iter().enumerate() {
+        if w != OWNER_TERRAIN {
+            canopy_top[i] = canopy_top[i].max(scratch.data[i]);
+            canopy_base[i] = terrain.data[i];
+        }
+    }
 
     // Les arbres isolés : un disque de rayon de couronne, pas un rectangle. Un
     // rectangle surestimerait l'emprise de 27 % et ferait des ombres carrées.
     for t in trees {
         let (wx, wy) = world_px(t.lat, t.lng);
         let (cx, cy) = (wx - origin_x, wy - origin_y);
-        let radius_px = (t.crown_radius_m / dsm.meters_per_pixel).max(0.5);
+        let radius_px = (t.crown_radius_m / scratch.meters_per_pixel).max(0.5);
         let ground = match terrain.sample(
-            cx.clamp(0.0, dsm.width as f64 - 1.0),
-            cy.clamp(0.0, dsm.height as f64 - 1.0),
+            cx.clamp(0.0, width as f64 - 1.0),
+            cy.clamp(0.0, terrain.height as f64 - 1.0),
         ) {
             Some(g) => g,
             None => continue,
         };
         let top = ground + t.height_m as f32;
+        // Base de la couronne : le houppier occupe le haut de l'arbre, le
+        // tronc laisse passer dessous. Profondeur de couronne ≈ son diamètre,
+        // bornée pour qu'un arbre trapu garde au moins un mètre de couronne —
+        // sans jamais passer sous le sol (`max` avant `min`, pas `clamp` :
+        // un arbuste d'un mètre rend les deux bornes inversées et `clamp`
+        // panique).
+        let base = (top - 2.0 * t.crown_radius_m as f32)
+            .min(top - 1.0)
+            .max(ground);
 
         let x0 = (cx - radius_px).floor().max(0.0) as usize;
-        let x1 = (cx + radius_px).ceil().min(dsm.width as f64 - 1.0) as usize;
+        let x1 = (cx + radius_px).ceil().min(width as f64 - 1.0) as usize;
         let y0 = (cy - radius_px).floor().max(0.0) as usize;
-        let y1 = (cy + radius_px).ceil().min(dsm.height as f64 - 1.0) as usize;
+        let y1 = (cy + radius_px).ceil().min(terrain.height as f64 - 1.0) as usize;
         if x1 < x0 || y1 < y0 {
             continue;
         }
@@ -487,9 +512,14 @@ fn stamp_canopy(
                 if dx * dx + dy * dy > radius_px * radius_px {
                     continue;
                 }
-                let i = y * dsm.width + x;
-                if top > dsm.data[i] {
-                    dsm.data[i] = top;
+                let i = y * width + x;
+                if top > canopy_top[i] {
+                    canopy_top[i] = top;
+                    canopy_base[i] = if canopy_base[i].is_finite() {
+                        canopy_base[i].min(base)
+                    } else {
+                        base
+                    };
                     wood_owner[i] = OWNER_CANOPY;
                 }
             }
@@ -647,6 +677,7 @@ async fn classify(
         max_distance_m: 5_000.0, // relief : ombres longues possibles
         observer_height_m,
         step_px: 1.0,
+        ..ShadowParams::default()
     };
     let (sunlit, blocker) = ctx.classify_at(&sun, &params);
 
@@ -766,6 +797,7 @@ async fn sun_hours(
         max_distance_m: 5_000.0,
         observer_height_m: h,
         step_px: 1.0,
+        ..ShadowParams::default()
     };
 
     const STEP_S: f64 = 300.0; // 5 min
@@ -851,11 +883,14 @@ fn nudge_out_of_building(
     py: f64,
     max_radius_px: i32,
 ) -> (f64, f64, f64) {
+    // La canopée compte comme du dehors : depuis la transmittance, un point
+    // sous un arbre est un point valide — seul un bâtiment doit repousser.
     let at = |x: i32, y: i32| -> Option<u32> {
         if x < 0 || y < 0 || x >= dsm.width as i32 || y >= dsm.height as i32 {
             return None;
         }
-        Some(owner[y as usize * dsm.width + x as usize])
+        let o = owner[y as usize * dsm.width + x as usize];
+        Some(if o == OWNER_CANOPY { OWNER_TERRAIN } else { o })
     };
 
     let (cx, cy) = (px.round() as i32, py.round() as i32);
@@ -1572,6 +1607,7 @@ async fn places(
         max_distance_m: 5_000.0,
         observer_height_m: h,
         step_px: 1.0,
+        ..ShadowParams::default()
     };
     // Calculé une fois pour toute la classification, pas par établissement :
     // `Dsm::max_elevation` scanne toute la grille, et le refaire par POI a

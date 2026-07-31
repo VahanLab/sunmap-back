@@ -96,17 +96,24 @@ Fonctionnalités cibles :
   GeoTIFF 1 km × 1 km au pas de 50 cm. Le MNS = terrain + bâtiments +
   végétation → DSM directe sans fusion. Couverture ~80 % fin 2025, complète
   prévue fin 2026.
-- **Végétation (étape 1 en place)** : arbres isolés (`natural=tree`, disque de
-  rayon de couronne) et emprises boisées (`natural=wood`, `landuse=forest`,
-  `tree_row`, `scrub`) tamponnés dans la DSM, donc porteurs d'ombre. Hauteurs :
-  tag `height` s'il existe, sinon repli par type (futaie 18 m, alignement 12 m,
-  broussailles 3 m) — OSM ne tague quasiment jamais la hauteur d'un bois, et
+- **Végétation (étape 2 en place — transmittance)** : arbres isolés
+  (`natural=tree`, disque de rayon de couronne) et emprises boisées
+  (`natural=wood`, `landuse=forest`, `tree_row`, `scrub`) tamponnés dans une
+  **couche canopée dédiée** de la DSM (`canopy_top`/`canopy_base`), séparée
+  des obstacles opaques. Le ray marching **traverse** la couronne en
+  atténuant (`canopy_transmittance_per_m`, défaut 0,6/m ; seuil de lumière
+  25 %) au lieu de s'arrêter : un arbre d'alignement laisse passer le soleil
+  sur ses bords, une futaie l'éteint. Le rayon passe librement **sous la base
+  du houppier** (base = sommet − diamètre de couronne pour un arbre isolé, le
+  sol pour un bois). Motivé par un cas réel : une terrasse à 1,3 m d'un
+  platane passait de « soleil l'après-midi » à « 0 h par jour » avec le
+  tamponnage opaque (`node/653366336`). Hauteurs : tag `height` s'il existe,
+  sinon repli par type (futaie 18 m, alignement 12 m, broussailles 3 m) —
   63 % des arbres portent la valeur par défaut de 10 m.
-  **Limite assumée** : la canopée est tamponnée comme un volume plein, donc
-  opaque. Juste pour une futaie dense en été, faux pour des feuillus en hiver.
-  Les étapes suivantes sont la hauteur réelle (Meta/WRI CHM ou IGN MNH) puis la
-  transmittance, qui demande un ray marching cumulatif et une classe portée par
-  la DSM.
+  Étapes suivantes : hauteur réelle (Meta/WRI CHM ou IGN MNH), τ saisonnier
+  par `leaf_type` (feuillu d'hiver quasi transparent). Note : `Shaders.metal`
+  (port client de `shadow.rs`) n'a pas la logique canopée — la DSM client est
+  terrain seul, sans donnée de végétation à traverser.
 - **Arbres (backlog)** : Meta/WRI Canopy Height Map v2 (2026, ~1 m, COG
   EPSG:3857 sur AWS) ; OSM `natural=tree` (riche en France via imports
   municipaux), `tree_row`, `wood`/`forest`.

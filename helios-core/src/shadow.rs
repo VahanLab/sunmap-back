@@ -2,8 +2,14 @@
 //!
 //! Pour savoir si un point est à l'ombre, on « marche » depuis ce point en
 //! direction du soleil (projetée au sol). À chaque pas, la hauteur du rayon
-//! monte de `distance · tan(élévation)` ; si la DSM dépasse cette hauteur,
-//! un obstacle bloque le soleil → ombre.
+//! monte de `distance · tan(élévation)` ; si la DSM opaque (terrain +
+//! bâtiments) dépasse cette hauteur, un obstacle bloque le soleil → ombre.
+//!
+//! La canopée, elle, ne bloque pas : elle **atténue**. Chaque mètre de
+//! couronne traversé multiplie la lumière restante par
+//! `canopy_transmittance_per_m` ; le point est réputé à l'ombre quand la
+//! lumière tombe sous `sunlit_light_threshold`. Un arbre isolé laisse donc
+//! passer le soleil sur ses bords, une futaie dense l'éteint.
 
 use crate::dsm::Dsm;
 use crate::sun::SunPosition;
@@ -21,6 +27,13 @@ pub struct ShadowParams {
     /// Pas de marche en fraction de cellule (1.0 = une cellule ; descendre à
     /// 0.5 pour plus de précision au prix de 2× le coût).
     pub step_px: f64,
+    /// Fraction de lumière conservée par mètre de canopée traversé (mesuré le
+    /// long du rayon, pas au sol). 0,6 ≈ feuillu d'alignement en été : ~3 m de
+    /// couronne ne laissent passer que ~20 % — ombre — mais 1 m en bord de
+    /// houppier en laisse 60 % — soleil. 1,0 = végétation transparente.
+    pub canopy_transmittance_per_m: f64,
+    /// Lumière directe en deçà de laquelle le point est réputé à l'ombre.
+    pub sunlit_light_threshold: f64,
 }
 
 impl Default for ShadowParams {
@@ -29,6 +42,8 @@ impl Default for ShadowParams {
             max_distance_m: 1_000.0,
             observer_height_m: 0.0,
             step_px: 1.0,
+            canopy_transmittance_per_m: 0.6,
+            sunlit_light_threshold: 0.25,
         }
     }
 }
@@ -128,6 +143,18 @@ pub fn shadow_hit_from_ground(
     let max_m = params.max_distance_m.min(max_useful_m);
     let max_steps = (max_m / step_m).ceil() as usize;
 
+    // Longueur 3D d'un pas : au soleil haut, chaque mètre horizontal parcourt
+    // bien plus d'un mètre de rayon — c'est cette longueur-là qui traverse la
+    // canopée.
+    let cos_elev = (sun.elevation_deg * rad).cos().max(1e-6);
+    let step_ray_m = step_m / cos_elev;
+    let has_canopy = dsm.canopy_top.is_some();
+    // ln(τ) une fois pour toutes : accumuler `light *= τ^d` pas à pas revient
+    // à sommer `d·ln(τ)` — une addition par pas au lieu d'un `powf`.
+    let ln_tau = params.canopy_transmittance_per_m.max(1e-9).ln();
+    let ln_threshold = params.sunlit_light_threshold.max(1e-9).ln();
+    let mut ln_light = 0.0f64;
+
     let mut x = px;
     let mut y = py;
     for i in 1..=max_steps {
@@ -147,6 +174,26 @@ pub fn shadow_hit_from_ground(
                 obstacle_elevation_m: h,
                 ray_elevation_m: ray_z,
             });
+        }
+
+        // Canopée : pas d'arrêt, une atténuation. Le rayon doit être DANS la
+        // couronne — au-dessus de la base (on passe librement sous le
+        // houppier d'un arbre d'alignement), sous le sommet.
+        if has_canopy {
+            if let Some((base, top)) = dsm.canopy_at(x, y) {
+                if ray_z >= base as f64 && ray_z <= top as f64 {
+                    ln_light += step_ray_m * ln_tau;
+                    if ln_light < ln_threshold {
+                        return Some(ShadowHit {
+                            x: x.round().clamp(0.0, (dsm.width - 1) as f64) as usize,
+                            y: y.round().clamp(0.0, (dsm.height - 1) as f64) as usize,
+                            distance_m: (i as f64) * step_m,
+                            obstacle_elevation_m: top,
+                            ray_elevation_m: ray_z,
+                        });
+                    }
+                }
+            }
         }
     }
     None
@@ -237,6 +284,79 @@ mod tests {
         };
         let mask = render_mask(&dsm, &sun, &ShadowParams::default());
         assert!(mask.iter().all(|&v| v == 255));
+    }
+
+    /// Tamponne une bande de canopée (colonnes x0..=x1, toutes les lignes)
+    /// entre deux altitudes.
+    fn stamp_canopy_band(dsm: &mut Dsm, x0: usize, x1: usize, base: f32, top: f32) {
+        let width = dsm.width;
+        let (tops, bases) = dsm.canopy_layers_mut();
+        for i in 0..tops.len() {
+            let x = i % width;
+            if x >= x0 && x <= x1 {
+                tops[i] = top;
+                bases[i] = base;
+            }
+        }
+    }
+
+    /// Une couronne étroite atténue sans éteindre : soleil. Une bande large
+    /// accumule au-delà du seuil : ombre. C'est toute la différence avec
+    /// l'ancien tamponnage opaque, où le moindre houppier bloquait net.
+    #[test]
+    fn canopy_attenuates_instead_of_blocking() {
+        let sun = SunPosition {
+            azimuth_deg: 270.0, // soleil à l'ouest → rayon marche vers l'ouest
+            elevation_deg: 45.0,
+        };
+        let p = ShadowParams::default(); // τ=0.6/m, seuil 25 %
+
+        // Couronne de 2 m de large (x=48..=49), de 3 à 10 m d'altitude.
+        // Rayon depuis x=52 à 45° : traverse ~2 m horizontaux de couronne
+        // → ~2.8 m de rayon → 0.6^2.8 ≈ 24 %… juste sous le seuil. Prenons
+        // 1 cellule (x=49) : ~1.4 m de rayon → 49 % → soleil.
+        let mut dsm = Dsm::flat(100, 100, 1.0, 0.0);
+        stamp_canopy_band(&mut dsm, 49, 49, 3.0, 10.0);
+        assert!(
+            !is_shadowed(&dsm, &sun, 52.0, 50.0, &ShadowParams { observer_height_m: 1.5, ..p }),
+            "une cellule de couronne doit laisser passer le soleil"
+        );
+
+        // Bande boisée de 20 cellules : extinction garantie.
+        let mut dsm = Dsm::flat(100, 100, 1.0, 0.0);
+        stamp_canopy_band(&mut dsm, 30, 49, 0.0, 18.0);
+        assert!(
+            is_shadowed(&dsm, &sun, 52.0, 50.0, &ShadowParams { observer_height_m: 1.5, ..p }),
+            "20 m de futaie doivent éteindre le rayon"
+        );
+    }
+
+    /// Sous la base de la couronne, le rayon passe librement : un observateur
+    /// dont le rayon file sous le houppier voit le soleil rasant.
+    #[test]
+    fn ray_passes_under_crown_base() {
+        let sun = SunPosition {
+            azimuth_deg: 270.0,
+            elevation_deg: 2.0, // très rasant : le rayon reste bas
+        };
+        let mut dsm = Dsm::flat(100, 100, 1.0, 0.0);
+        stamp_canopy_band(&mut dsm, 40, 45, 4.0, 10.0); // base à 4 m
+        let p = ShadowParams {
+            observer_height_m: 1.5,
+            ..ShadowParams::default()
+        };
+        // Le rayon part de 1.5 m et ne monte qu'à ~1.9 m au niveau de la
+        // bande : sous la base, aucune atténuation.
+        assert!(!is_shadowed(&dsm, &sun, 52.0, 50.0, &p));
+    }
+
+    /// La canopée compte dans `max_elevation` : sans ça, une futaie plus
+    /// haute que tout bâtiment serait ignorée par l'early-exit du rayon.
+    #[test]
+    fn canopy_counts_in_max_elevation() {
+        let mut dsm = Dsm::flat(10, 10, 1.0, 0.0);
+        stamp_canopy_band(&mut dsm, 2, 3, 0.0, 25.0);
+        assert_eq!(dsm.max_elevation(), 25.0);
     }
 
     /// La hauteur d'observateur sort un point de l'ombre limite.
