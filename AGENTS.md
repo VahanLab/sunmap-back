@@ -8,14 +8,59 @@ une ville les endroits au soleil ou à l'ombre. Inspirée du site web
 "Where is the sun" / ShadeMap.
 
 Fonctionnalités cibles :
-- Carte avec ombres projetées tenant compte du **relief ET des bâtiments**
-  (les arbres viendront plus tard, voir "Backlog").
+- Carte avec ombres projetées tenant compte du **relief, des bâtiments ET de
+  la végétation** (canopée semi-transparente, en place côté calcul).
 - **Timeline/slider** : faire défiler les heures et les jours de l'année et
   voir les ombres évoluer de façon fluide.
 - **Objectif final produit** : brancher une API bars/restaurants avec terrasse
   (tag OSM `outdoor_seating=yes`, enrichissable Google Places) et filtrer
   ceux au soleil vs à l'ombre à un instant donné — avec des infos du type
   "au soleil jusqu'à 18h40".
+
+## Qui calcule quoi — répartition des responsabilités (état actuel)
+
+**Serveur (`helios-server`, Rust/axum) — la vérité soleil/ombre.**
+- Assemble la DSM par bbox : tuiles DEM Mapterhorn + rasterisation des
+  bâtiments PostGIS (grille opaque) + végétation en couche canopée séparée
+  (`canopy_top`/`canopy_base`), et la grille `owner` (qui occupe chaque
+  cellule — sert au blocker nommé et au recalage hors bâtiment).
+- Ray marching (`helios-core`) : classification soleil/ombre de chaque lieu,
+  bâtiments opaques, canopée traversée par transmittance (0,6/m, seuil 25 %).
+- **Bitfield `sun_day`** dans `GET /places` : la journée locale entière de
+  chaque lieu (144 tranches de 10 min, 1 bit = soleil), calculée sur la même
+  DSM en un passage. C'est lui qui rend le slider client autonome.
+- Recalage des nœuds d'établissement hors bâtiment (`nudge_out_of_building`),
+  positions de terrasse contribuées prises telles quelles, mobilier jamais
+  recalé.
+- Frise d'un point (`/sun-hours`), debug (`/debug/ray`), contributions
+  (terrasse, mobilier, historiques), traductions (i18n).
+
+**Client (app iOS SunMap) — le rendu, et la relecture locale.**
+- Ombres **visuelles** : lumières Mapbox (`DirectionalLight` pilotée par
+  `SunPosition.swift`, port 1:1 de `sun.rs`) pour les bâtiments et le
+  mobilier 3D, plus le masque d'ombre **terrain** calculé en Metal
+  (`ShadowEngine` + `Shaders.metal`, port du ray marching, terrain seul —
+  ni bâtiments ni végétation dans la DSM client).
+- Classification des lieux : **relue localement** depuis `sun_day`
+  (`Place.reclassified(at:)`) à chaque cran du slider — zéro requête tant
+  qu'on reste sur la même journée et la même zone ; une requête `/places`
+  par (zone, jour). La nuit se déduit de l'élévation solaire locale.
+- Les arbres **visuels** sont ceux du style Mapbox Standard (leur donnée,
+  leur snapshot) — le client n'affiche pas les nôtres. Voir « Écarts
+  rendu/calcul » ci-dessous.
+
+**Écarts rendu/calcul assumés (et leurs limites connues).**
+- Les ombres visibles (Mapbox) et la classification (notre DSM) ne viennent
+  pas des mêmes données : désaccords possibles en bord d'ombre.
+- **Arbres** : le rendu Mapbox et notre base `trees` divergent (snapshots OSM
+  différents) — un lieu peut être classé à l'ombre d'un arbre que la carte ne
+  montre pas. Reprendre l'affichage des arbres à la maison est **différé** :
+  l'exigence de fluidité impose une **vector tile source** maison pour nos
+  arbres (des requêtes bbox au déplacement de carte, comme avant PostGIS,
+  sont exclues), et ce pipeline de tuiles n'existe pas encore. Pistes
+  intermédiaires notées : superposer nos modèles aux leurs (positions OSM
+  identiques pour les arbres partagés), ou n'afficher l'arbre coupable qu'au
+  tap pour expliquer une ombre.
 
 ## Décisions d'architecture (historique et état actuel)
 
@@ -25,27 +70,22 @@ Fonctionnalités cibles :
    n'a pas encore le terrain 3D sur mobile — PR "3d terrain work" encore en
    draft en juillet 2026).
 3. Moteur d'ombres : **crate Rust `helios-core`** (zéro dépendance) —
-   position solaire NOAA + DSM (heightmap) + ray marching. Sert à la fois le
-   rendu (masque raster) et la query ("ce point est-il à l'ombre à t ?").
-4. Stratégie de rendu en cours de validation (POC iOS) :
-   - **Piste A (en test)** : API lumière du SDK Mapbox v11
-     (`DirectionalLight` + `AmbientLight`, `castShadows`) pilotée par la
-     position solaire. Ombres de bâtiments réelles et fluides au slider.
-     Limites connues : le relief ne projette PAS d'ombre portée (seulement
-     hillshade aligné sur la lumière) ; aucune query possible ; données de
-     rendu (Mapbox) ≠ données de query (DSM Rust) → désaccords possibles en
-     bord d'ombre.
-   - **Piste B (fallback/cible si A insuffisante)** : custom layer **Metal**
-     rendant notre propre masque d'ombre (même algo que helios-core) —
-     relief inclus, cohérence parfaite rendu/query.
-   - Si la piste A suffit visuellement, le serveur Rust ne sert **que** les
-     queries terrasses (batch + cumuls).
+   position solaire NOAA + DSM (heightmap + couche canopée) + ray marching
+   à transmittance. Sert à la fois le rendu (masque raster) et la query
+   ("ce point est-il à l'ombre à t ?").
+4. Stratégie de rendu **tranchée : piste A retenue** — API lumière du SDK
+   Mapbox v11 (`DirectionalLight`, `castShadows`) pilotée par la position
+   solaire, complétée d'un masque Metal pour l'ombre portée du relief.
+   Limites assumées : données de rendu (Mapbox) ≠ données de query (DSM
+   Rust) → désaccords possibles en bord d'ombre. Le serveur sert les queries
+   (classification, frises, cumuls), pas de tuiles d'ombre.
+   La piste B (custom layer Metal complet, relief + bâtiments) reste le
+   recours si les désaccords deviennent gênants.
 5. Serveur : Rust/axum, **en place** (cf. `helios-server/README.md`) :
-   - `GET /sunlit` + `POST /sunlit/batch`, `GET /places`,
-     `POST /places/terrace` (contribution utilisateur), `GET /sun-hours`,
-     `GET /trees`, `GET /debug/ray`.
-   - Reste à faire : `GET /shadow/{z}/{x}/{y}.png?t=` (tuile raster, si piste
-     B/web) et le cache CDN clé `(z,x,y,jour,tranche de 5-10 min)`.
+   - `GET /sunlit` + `POST /sunlit/batch`, `GET /places` (avec `sun_day`),
+     `POST/PUT /places/furniture` + `GET /places/furniture/contributions`,
+     `POST /places/terrace` + `GET /places/terrace/contributions`,
+     `GET /sun-hours`, `GET /trees`, `GET /debug/ray`, comptes/profils.
 6. **Géométrie OSM en PostgreSQL/PostGIS**, plus d'Overpass au runtime.
    Overpass met 5-20 s par bbox dense, répond 504 aux heures de pointe et
    impose une politesse incompatible avec une requête par déplacement de
@@ -60,14 +100,15 @@ Fonctionnalités cibles :
    les mêmes identifiants et partagent les mêmes règles tags → hauteur
    (`osm::building_from`, `osm::height_from_tags`) : ne jamais dupliquer ces
    règles, elles ont coûté cher à mettre au point.
-6. Animation fluide du slider (préoccupation UX forte) — options par ordre :
-   1. Cross-fade de rasters préfetchés (pas de 10 min) — MVP, drapé auto sur
-      terrain Mapbox.
-   2. Tuiles "bitfield temporel" (1 bit soleil/ombre par tranche packé en
-      RGBA) + petit shader client — 1 requête par jour, scrub 60 fps.
-   3. Ray marching complet dans un shader client (tuiles DSM servies par le
-      serveur) — fluidité continue, mais custom layer + terrain Mapbox = le
-      point délicat.
+8. Animation fluide du slider — **tranchée par le bitfield `sun_day`**
+   (variante par-lieu de l'option « bitfield temporel » envisagée) : le
+   serveur calcule la journée entière de chaque lieu en un passage de DSM
+   (~6-9 ms pour une centaine de lieux × 144 tranches), le client reclasse
+   localement à chaque cran. Une requête par (zone, jour) au lieu d'une par
+   tranche de 5 min ; 36 octets hex par lieu. Les tuiles raster d'ombre
+   (options cross-fade / shader client) n'ont plus de raison d'être pour la
+   classification — elles ne restent pertinentes que si un masque d'ombre
+   *visuel* complet devenait nécessaire (piste B).
 
 ## Sources de données (toutes open data)
 
@@ -167,29 +208,31 @@ Fonctionnalités cibles :
 - **À évaluer sur device** : fluidité du slider, artefacts au soleil rasant,
   rendu global. Ce test décide entre piste A et piste B.
 
+## Fait (jalons passés, garder pour l'historique)
+
+- helios-core testé (14 tests), serveur axum complet, base PostGIS remplie
+  par extrait PBF (Île-de-France).
+- Piste A validée sur device et retenue ; masque Metal terrain en place.
+- Contributions : terrasses (présence + position), mobilier urbain (ajout +
+  correction), historiques par lieu, comptes/pseudos/paliers.
+- Bitfield `sun_day` (slider sans réseau) et transmittance de canopée.
+
 ## Prochaines étapes (dans l'ordre)
 
-1. `cargo test` sur helios-core, corriger si besoin.
-2. Monter le POC iOS dans Xcode, tester sur device, trancher A vs B.
-3. Serveur axum : endpoint `/sunlit` + batch (query-only d'abord), chargement
-   des tuiles Terrarium avec marge (les casters hors tuile — marge fonction
-   de l'élévation solaire : soleil bas = ombres longues = marge large).
-4. Pipeline data : décodage PNG Terrarium (crate `image`), rasterisation
-   polygone des emprises Overture/OSM, cache DSM (PMTiles ou S3).
-5. **Position de terrasse contribuée par les utilisateurs** (`place_terraces`,
-   table séparée pour survivre aux réimports OSM) : c'est la seule donnée qui
-   situe vraiment une terrasse, OSM ne donnant que le nœud du bâtiment.
-   Échantillonner
-   3–5 points dans un buffer de 3–8 m côté rue plutôt que le centroïde du
-   bâtiment ; renvoyer un % d'ensoleillement plutôt qu'un booléen.
-6. Si piste B retenue : custom layer Metal (drapage sur terrain = le sujet
-   difficile, à prototyper tôt).
+1. Échantillonner la terrasse en surface plutôt qu'au point : 3–5 points dans
+   un buffer de 3–8 m, renvoyer un % d'ensoleillement plutôt qu'un booléen.
+2. **Arbres affichés maison** (différé, cf. « Écarts rendu/calcul ») :
+   demande d'abord un pipeline de **vector tiles** pour nos arbres — les
+   requêtes bbox au déplacement de carte sont exclues. À concevoir : tuilage
+   (tippecanoe ou serveur MVT depuis PostGIS), puis `ModelLayer` sur cette
+   source, en superposition ou en remplacement des arbres Mapbox.
+3. Cache CDN des réponses `/places` (clé zone + jour, le bitfield rend la
+   clé stable une journée entière).
 
 ## Backlog (décidé mais volontairement différé)
 
-- **Arbres** : couche de classes dans la DSM (sol/bâtiment/canopée), ombre de
-  canopée semi-transparente, atténuation saisonnière (feuillus en hiver,
-  tag OSM `leaf_type`). Sources : Meta/WRI CHM v2 + IGN MNS + OSM.
+- **Végétation, suite** : hauteurs réelles de canopée (Meta/WRI CHM v2,
+  IGN MNH), τ saisonnier par `leaf_type` (feuillu d'hiver quasi transparent).
 - Android (Kotlin) après validation iOS.
 - Cumul annuel d'ensoleillement par point ("cette terrasse est au soleil
   220 jours par an à 12h").
