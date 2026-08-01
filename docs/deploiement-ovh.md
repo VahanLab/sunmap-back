@@ -160,27 +160,74 @@ Le rendre **public** (Packages → sunmap-api → Package settings → Change
 visibility) évite ce jeton sur la VM. L'image ne contient que des binaires
 compilés, aucun secret : `DATABASE_URL` arrive par l'environnement.
 
-### Secrets GitHub
+### À faire sur GitHub (une fois)
 
-Settings → Secrets and variables → Actions :
+Tout est dans `github.com/VahanLab/sunmap-back` → onglet **Settings**. Rien de
+tout ceci n'est dans le repo : c'est de la configuration de compte, elle ne
+part pas avec un `git clone` — d'où cette liste.
 
-| Nom | Contenu |
-|---|---|
-| `DEPLOY_HOST` | IP ou DNS de la VM |
-| `DEPLOY_USER` | utilisateur SSH (groupe `docker`) |
-| `DEPLOY_SSH_KEY` | contenu de `~/.ssh/sunmap-deploy` (clé **privée**) |
-| `DEPLOY_KNOWN_HOSTS` | sortie de `ssh-keyscan <ip-vm>` |
+**1. Activer les Actions.** Settings → Actions → General → *Allow all actions
+and reusable workflows* (le workflow tire `actions/checkout`, `docker/*`).
 
-Variable (onglet *Variables*, optionnelle) : `DEPLOY_PATH`, chemin du repo sur
-la VM — défaut `sun-shadow`, relatif au home de `DEPLOY_USER`.
+**2. Autoriser l'écriture sur les packages.** Settings → Actions → General →
+*Workflow permissions*. Le workflow déclare lui-même `packages: write`, ce qui
+suffit tant qu'une politique d'organisation ne plafonne pas le `GITHUB_TOKEN`.
+Si le job `build` échoue en `denied: permission_access` au push de l'image,
+c'est ici — passer sur *Read and write permissions*.
+
+**3. Créer les secrets.** Settings → Secrets and variables → **Actions**,
+onglet *Secrets* → *New repository secret* :
+
+| Nom | Contenu | D'où il sort |
+|---|---|---|
+| `DEPLOY_HOST` | IP ou DNS de la VM | panneau OVH |
+| `DEPLOY_USER` | utilisateur SSH, membre du groupe `docker` | choisi à l'étape « Préparer la VM » |
+| `DEPLOY_SSH_KEY` | clé **privée**, contenu entier de `~/.ssh/sunmap-deploy` | `ssh-keygen` ci-dessus |
+| `DEPLOY_KNOWN_HOSTS` | sortie brute de `ssh-keyscan <ip-vm>` | commande ci-dessus |
+
+`DEPLOY_SSH_KEY` : coller le fichier en entier, lignes `-----BEGIN…` et
+`-----END…` comprises, avec le retour à la ligne final. Une clé tronquée donne
+un `Load key: error in libcrypto` sans autre explication.
 
 `DEPLOY_KNOWN_HOSTS` n'est pas du zèle : sans empreinte connue d'avance, il
 faudrait accepter l'hôte à chaud, et le workflow livrerait ses commandes à
 n'importe quel serveur répondant à cette IP.
 
-Le job `deploy` tourne dans l'environnement GitHub `production` : le créer
-(Settings → Environments) permet d'exiger une approbation manuelle avant
-chaque mise en production, et de limiter la portée des secrets à `main`.
+**4. Variable optionnelle.** Même écran, onglet *Variables* : `DEPLOY_PATH`,
+chemin du repo cloné sur la VM. Défaut `sun-shadow`, relatif au home de
+`DEPLOY_USER` — à définir seulement si le clone est ailleurs.
+
+**5. Environnement `production`.** Settings → Environments → *New environment*,
+nom exact `production`. GitHub le crée tout seul au premier run s'il manque,
+mais le créer à la main permet d'y poser une *required reviewer* (approbation
+manuelle avant chaque mise en production) et de limiter le déploiement à la
+branche `main` (*Deployment branches*).
+
+**6. Visibilité du package.** Le package GHCR n'existe qu'**après le premier
+build réussi**. Une fois créé : page du repo → *Packages* → `sunmap-api` →
+*Package settings*. Soit le passer en **public** (rien à faire sur la VM), soit
+le laisser privé et faire le `docker login ghcr.io` de la VM décrit plus haut.
+Sans l'un des deux, le job `deploy` échoue sur `docker compose pull`.
+
+**7. Protéger `main` (recommandé).** Settings → Rules → Rulesets : exiger une
+PR et le passage du job `build` avant merge. Un push direct sur `main` déploie
+en production sans filet — c'est le comportement voulu, autant décider qui a le
+droit de le déclencher.
+
+### Premier déploiement
+
+Étapes 1 à 5 faites, VM prête, alors :
+
+```bash
+git push origin main
+```
+
+Onglet **Actions** → run *Déploiement VM OVH*. Le job `build` doit passer
+(~5-10 min la première fois, le cache `type=gha` raccourcit les suivantes) ;
+`deploy` échouera tant que l'étape 6 n'est pas faite. Faire l'étape 6, puis
+relancer par *Re-run failed jobs* — pas besoin de recommit.
+
+Ensuite, chaque push sur `main` touchant le serveur redéploie tout seul.
 
 ### Rollback
 
