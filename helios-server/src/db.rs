@@ -67,6 +67,42 @@ pub async fn buildings_in_bbox(
         .collect())
 }
 
+/// Page de bâtiments par keyset (`osm_id > after`), pour parcourir la table
+/// entière sans OFFSET quadratique ni tout tenir en mémoire côté SQL. Sert au
+/// générateur de tuiles (`bin/tilebuild`).
+pub async fn buildings_page(
+    pool: &PgPool,
+    after_osm_id: &str,
+    limit: i64,
+) -> Result<Vec<Building>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT osm_id, name, height_m, height_from_osm, ST_AsText(geom) AS wkt \
+         FROM buildings WHERE osm_id > $1 ORDER BY osm_id LIMIT $2",
+    )
+    .bind(after_osm_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let wkt: String = r.get("wkt");
+            let rings = parse_multipolygon_wkt(&wkt);
+            if rings.is_empty() {
+                return None;
+            }
+            Some(Building {
+                osm_id: r.get("osm_id"),
+                name: r.get("name"),
+                rings,
+                height_m: r.get("height_m"),
+                height_from_osm: r.get("height_from_osm"),
+            })
+        })
+        .collect())
+}
+
 pub async fn trees_in_bbox(
     pool: &PgPool,
     s: f64,

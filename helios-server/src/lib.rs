@@ -6,6 +6,7 @@
 //! le serveur ne lit plus que la base (`db`).
 
 pub mod auth;
+pub mod btiles;
 pub mod db;
 pub mod dem;
 pub mod i18n;

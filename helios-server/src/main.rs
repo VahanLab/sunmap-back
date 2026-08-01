@@ -54,6 +54,10 @@ struct AppState {
     tiles: TileCache,
     buildings: BuildingCache,
     places_results: PlacesResultCache,
+    /// Tuiles bâtiments (`BUILDINGS_TILES=chemin.hbt`). `None` = lecture
+    /// PostGIS classique — c'est aussi le rollback : ne pas définir la
+    /// variable suffit à revenir à l'ancien chemin.
+    btiles: Option<helios_server::btiles::TileStore>,
 }
 
 #[tokio::main]
@@ -112,6 +116,22 @@ async fn main() {
         tiles: RwLock::new(HashMap::new()),
         buildings: RwLock::new(HashMap::new()),
         places_results: RwLock::new(HashMap::new()),
+        btiles: match std::env::var("BUILDINGS_TILES") {
+            Ok(path) => match helios_server::btiles::TileStore::open(&path) {
+                Ok(store) => {
+                    println!("bâtiments : tuiles {path}");
+                    Some(store)
+                }
+                Err(e) => {
+                    // Échouer franchement plutôt que retomber en silence sur
+                    // PostGIS : la variable exprime une intention, un serveur
+                    // qui la contredit sans le dire fausserait tout benchmark.
+                    eprintln!("BUILDINGS_TILES={path} : {e}");
+                    std::process::exit(1);
+                }
+            },
+            Err(_) => None,
+        },
     });
 
     let app = Router::new()
@@ -411,9 +431,27 @@ async fn load_buildings(
         return Ok(hit.clone());
     }
 
-    let buildings = db::buildings_in_bbox(&state.pool, s, w, n, e)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+    let buildings = match &state.btiles {
+        // Tuiles : mêmes bâtiments, découpés sur la grille DEM. L'intervalle
+        // de tuiles couvrant la bbox est le même calcul que pour les tuiles
+        // de terrain (`assemble_grid`).
+        Some(store) => {
+            let (wx0, wy0) = world_px(n, w);
+            let (wx1, wy1) = world_px(s, e);
+            let ts = TILE_SIZE as f64;
+            store
+                .buildings(
+                    (wx0 / ts) as u32,
+                    (wy0 / ts) as u32,
+                    (wx1 / ts) as u32,
+                    (wy1 / ts) as u32,
+                )
+                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("tuiles : {err}")))?
+        }
+        None => db::buildings_in_bbox(&state.pool, s, w, n, e)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?,
+    };
     println!("[buildings] {key} → {} emprises", buildings.len());
 
     let arc = Arc::new(buildings);
