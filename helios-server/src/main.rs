@@ -116,8 +116,10 @@ async fn main() {
         tiles: RwLock::new(HashMap::new()),
         buildings: RwLock::new(HashMap::new()),
         places_results: RwLock::new(HashMap::new()),
-        btiles: match std::env::var("BUILDINGS_TILES") {
-            Ok(path) => match helios_server::btiles::TileStore::open(&path) {
+        // `filter` : docker-compose passe la variable vide quand elle n'est
+        // pas définie dans `.env` — vide vaut absente.
+        btiles: match std::env::var("BUILDINGS_TILES").ok().filter(|p| !p.is_empty()) {
+            Some(path) => match helios_server::btiles::TileStore::open(&path) {
                 Ok(store) => {
                     println!("bâtiments : tuiles {path}");
                     Some(store)
@@ -130,7 +132,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             },
-            Err(_) => None,
+            None => None,
         },
     });
 

@@ -15,6 +15,13 @@ services:
     environment:
       # postgres://user:mdp@hôte-ovh:5432/sunmap?sslmode=require
       DATABASE_URL: ${DATABASE_URL}
+      # Tuiles bâtiments (format HBT, cf. docs/deploiement-ovh.md §4).
+      # Vide ou absent : lecture PostGIS classique — c'est le rollback.
+      BUILDINGS_TILES: ${BUILDINGS_TILES:-}
+    volumes:
+      # Fichiers de tuiles générés par `tilebuild`, sur le disque de la VM —
+      # gros (Go), statiques, rien à faire dans une image ou un volume nommé.
+      - ./tiles:/tiles
     # Pas de port publié sur l'hôte : seul le proxy parle à l'API, via le
     # réseau compose interne (`http://api:8080`). Exposer 8080 en direct
     # contournerait le TLS et le rate limiting du proxy.
