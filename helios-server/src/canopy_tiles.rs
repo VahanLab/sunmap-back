@@ -45,6 +45,11 @@ pub fn tile_bounds(z: u32, x: u32, y: u32) -> (f64, f64, f64, f64) {
 pub struct CanopyTile {
     pub top: Vec<f32>,
     pub base: Vec<f32>,
+    /// Pixel couvert par une **emprise boisée** (`woods`), par opposition à
+    /// un arbre isolé (`natural=tree`). C'est la frontière de partage du
+    /// rendu : le client pose ses bosquets 3D sur les emprises, Mapbox garde
+    /// ses arbres isolés — les deux ne se doublonnent jamais.
+    pub wood: Vec<bool>,
 }
 
 pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> CanopyTile {
@@ -65,6 +70,7 @@ pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> 
 
     let mut top = vec![0.0f32; TILE_SIZE * TILE_SIZE];
     let mut base = vec![0.0f32; TILE_SIZE * TILE_SIZE];
+    let mut wood_mask = vec![false; TILE_SIZE * TILE_SIZE];
 
     // Bois : remplissage scanline pair-impair, tous anneaux ensemble — une
     // clairière (anneau intérieur) rebascule en « dehors » et reste creuse.
@@ -106,6 +112,7 @@ pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> 
                 let cx1 = pair[1].min(TILE_SIZE as f64 - 1.0).round() as usize;
                 for cx in cx0..=cx1.min(TILE_SIZE - 1) {
                     let i = row * TILE_SIZE + cx;
+                    wood_mask[i] = true;
                     if wood.height_m > top[i] {
                         top[i] = wood.height_m;
                         base[i] = 0.0;
@@ -149,15 +156,17 @@ pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> 
         }
     }
 
-    CanopyTile { top, base }
+    CanopyTile { top, base, wood: wood_mask }
 }
 
-/// Encode la tuile en PNG RGB (R = sommet ×2, G = base ×2, B = 0).
+/// Encode la tuile en PNG RGB (R = sommet ×2, G = base ×2, B = 255 sur les
+/// emprises boisées — la frontière de partage bosquets/arbres du rendu).
 pub fn encode_png(tile: &CanopyTile) -> Result<Vec<u8>, image::ImageError> {
     let mut rgb = vec![0u8; TILE_SIZE * TILE_SIZE * 3];
     for i in 0..TILE_SIZE * TILE_SIZE {
         rgb[i * 3] = (tile.top[i] * 2.0).round().clamp(0.0, 255.0) as u8;
         rgb[i * 3 + 1] = (tile.base[i] * 2.0).round().clamp(0.0, 255.0) as u8;
+        rgb[i * 3 + 2] = if tile.wood[i] { 255 } else { 0 };
     }
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out).write_image(
@@ -211,14 +220,17 @@ mod tests {
         let mut tile = CanopyTile {
             top: vec![0.0; TILE_SIZE * TILE_SIZE],
             base: vec![0.0; TILE_SIZE * TILE_SIZE],
+            wood: vec![false; TILE_SIZE * TILE_SIZE],
         };
         tile.top[42] = 18.0;
         tile.base[42] = 2.5;
+        tile.wood[42] = true;
         let png = encode_png(&tile).unwrap();
         let img = image::load_from_memory(&png).unwrap().to_rgb8();
         let px = img.get_pixel(42, 0);
         assert_eq!(px[0], 36, "sommet ×2");
         assert_eq!(px[1], 5, "base ×2");
+        assert_eq!(px[2], 255, "marqueur d'emprise boisée");
         // Une tuile quasi vide doit rester minuscule une fois compressée.
         assert!(png.len() < 10_000, "PNG creux : {} octets", png.len());
     }
