@@ -59,22 +59,22 @@ Fonctionnalités cibles :
   (`Place.reclassified(at:)`) à chaque cran du slider — zéro requête tant
   qu'on reste sur la même journée et la même zone ; une requête `/places`
   par (zone, jour). La nuit se déduit de l'élévation solaire locale.
-- Les arbres **visuels** sont ceux du style Mapbox Standard (leur donnée,
-  leur snapshot) — le client n'affiche pas les nôtres. Voir « Écarts
-  rendu/calcul » ci-dessous.
+- Végétation visuelle, **partage par classe et par zoom** : arbres isolés =
+  modèles 3D du style Mapbox Standard (leur donnée) ; emprises boisées =
+  nos **bosquets 3D** dès z15, implantés depuis les tuiles de canopée
+  (`/canopy/{z}/{x}/{y}`, canal B = marqueur d'emprise) ; sous z15, le
+  masque Metal ombre toute la canopée par transmittance. Détail :
+  `ios/SunMap/AGENTS.md` § « Végétation, partage du rendu ».
 
 **Écarts rendu/calcul assumés (et leurs limites connues).**
 - Les ombres visibles (Mapbox) et la classification (notre DSM) ne viennent
-  pas des mêmes données : désaccords possibles en bord d'ombre.
-- **Arbres** : le rendu Mapbox et notre base `trees` divergent (snapshots OSM
-  différents) — un lieu peut être classé à l'ombre d'un arbre que la carte ne
-  montre pas. Reprendre l'affichage des arbres à la maison est **différé** :
-  l'exigence de fluidité impose une **vector tile source** maison pour nos
-  arbres (des requêtes bbox au déplacement de carte, comme avant PostGIS,
-  sont exclues), et ce pipeline de tuiles n'existe pas encore. Pistes
-  intermédiaires notées : superposer nos modèles aux leurs (positions OSM
-  identiques pour les arbres partagés), ou n'afficher l'arbre coupable qu'au
-  tap pour expliquer une ombre.
+  pas des mêmes données pour les bâtiments : désaccords possibles en bord
+  d'ombre.
+- **Arbres isolés** : le rendu (snapshot Mapbox) et le calcul (notre base
+  `trees`) peuvent diverger — un lieu classé à l'ombre d'un arbre que la
+  carte ne montre pas. Les emprises boisées, elles, sont désormais rendues
+  ET calculées depuis nos données (tuiles de canopée) — écart résorbé sur
+  les forêts.
 
 ## Décisions d'architecture (historique et état actuel)
 
