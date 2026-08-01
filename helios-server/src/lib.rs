@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod btiles;
+pub mod canopy_tiles;
 pub mod db;
 pub mod dem;
 pub mod i18n;

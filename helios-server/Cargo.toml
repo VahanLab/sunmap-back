@@ -9,7 +9,9 @@ helios-core = { path = "../helios-core" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-image = { version = "0.25", default-features = false, features = ["webp"] }
+# webp : décodage des tuiles DEM Mapterhorn. png : encodage des tuiles de
+# canopée servies au client (`/canopy/{z}/{x}/{y}`).
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
 serde = { version = "1", features = ["derive"] }
 # Vérification des jetons d'identité Firebase (JWT RS256). Les clés publiques
 # viennent de Google au format JWK, d'où `from_rsa_components`.

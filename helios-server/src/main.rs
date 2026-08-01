@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -23,6 +23,7 @@ use helios_core::dsm::Dsm;
 use helios_core::shadow::{shadow_hit_from_ground, ShadowHit, ShadowParams};
 use helios_core::sun::sun_position;
 use helios_server::auth;
+use helios_server::canopy_tiles;
 use helios_server::db;
 use helios_server::i18n::{self, Lang};
 use helios_server::opening_hours;
@@ -152,6 +153,7 @@ async fn main() {
         // motif et on chercherait un compte au pseudo « me ».
         .route("/users/{username}/profile", get(user_profile))
         .route("/trees", get(trees))
+        .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
@@ -1821,6 +1823,45 @@ struct Tree {
     lng: f64,
     height_m: f64,
     crown_radius_m: f64,
+}
+
+/// Tuile de canopée pour le masque d'ombre client (PNG RGB : sommet/base de
+/// couronne en demi-mètres au-dessus du sol — cf. `canopy_tiles`).
+///
+/// Les emprises sont requêtées avec une marge d'un rayon de couronne (~30 m) :
+/// un arbre dont le tronc est dans la tuile voisine peut déborder ici.
+async fn canopy_tile(
+    State(state): State<Arc<AppState>>,
+    Path((z, x, y)): Path<(u32, u32, u32)>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+    if !(canopy_tiles::MIN_Z..=canopy_tiles::MAX_Z).contains(&z) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("zoom {z} hors plage {}-{}", canopy_tiles::MIN_Z, canopy_tiles::MAX_Z),
+        ));
+    }
+    let (s, w, n, e) = canopy_tiles::tile_bounds(z, x, y);
+    let pad_lat = 30.0 / 111_320.0;
+    let pad_lon = pad_lat / ((s + n) / 2.0).to_radians().cos();
+    let woods = db::woods_in_bbox(&state.pool, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+    let trees = db::trees_in_bbox(&state.pool, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+
+    let tile = canopy_tiles::rasterize(z, x, y, &woods, &trees);
+    let png = canopy_tiles::encode_png(&tile)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PNG : {err}")))?;
+
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "image/png"),
+            // La canopée ne bouge qu'au réimport OSM : cacheable longtemps.
+            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        png,
+    ))
 }
 
 /// Arbres OSM (`natural=tree`) de la zone — aucun calcul soleil/ombre ici
