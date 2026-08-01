@@ -111,6 +111,101 @@ Notes :
 Arbres, bois et établissements suivent le chemin base classique de l'étape 2 —
 seuls les bâtiments sont tuilés.
 
+## 5. Déploiement continu (GitHub Actions)
+
+`.github/workflows/deploy.yml` déploie à chaque push sur `main` touchant le
+serveur (`helios-*`, `Cargo.*`, `Dockerfile`, `docker-compose.yml`) :
+
+```
+push main ──▶ build image (runner GitHub) ──▶ ghcr.io/vahanlab/sunmap-api:<sha>
+                                                      │
+                                        ssh ──────────▼
+                                   VM : git pull, compose pull, up -d api
+```
+
+**L'image est construite sur les runners, pas sur la VM.** Un
+`cargo build --release` du workspace demande plus de RAM que la VM n'en a à
+donner sans gêner l'API, et le build sur place couperait le service pendant
+plusieurs minutes. La VM ne fait que tirer et redémarrer — quelques secondes.
+
+### Préparer la VM
+
+```bash
+# 1. Clé SSH dédiée au déploiement, générée sur son poste (PAS sur la VM :
+#    la clé privée ne doit exister que dans le secret GitHub).
+ssh-keygen -t ed25519 -f ~/.ssh/sunmap-deploy -C "github-actions" -N ""
+
+# 2. Autoriser la clé publique sur la VM, pour l'utilisateur de déploiement.
+ssh-copy-id -i ~/.ssh/sunmap-deploy.pub <user>@<ip-vm>
+
+# 3. Cet utilisateur doit pouvoir parler à Docker sans sudo.
+ssh <user>@<ip-vm> "sudo usermod -aG docker <user>"
+
+# 4. Empreinte de la VM, pour le secret DEPLOY_KNOWN_HOSTS.
+ssh-keyscan <ip-vm>
+
+# 5. Le repo doit être cloné sur la VM (le workflow y fait `git pull`),
+#    avec un `.env` rempli.
+ssh <user>@<ip-vm> "git clone https://github.com/VahanLab/sunmap-back.git sun-shadow"
+```
+
+Si le package GHCR reste **privé**, connecter une fois la VM au registre avec
+un PAT `read:packages` — sinon `docker compose pull` échoue :
+
+```bash
+echo <PAT> | docker login ghcr.io -u <login-github> --password-stdin
+```
+
+Le rendre **public** (Packages → sunmap-api → Package settings → Change
+visibility) évite ce jeton sur la VM. L'image ne contient que des binaires
+compilés, aucun secret : `DATABASE_URL` arrive par l'environnement.
+
+### Secrets GitHub
+
+Settings → Secrets and variables → Actions :
+
+| Nom | Contenu |
+|---|---|
+| `DEPLOY_HOST` | IP ou DNS de la VM |
+| `DEPLOY_USER` | utilisateur SSH (groupe `docker`) |
+| `DEPLOY_SSH_KEY` | contenu de `~/.ssh/sunmap-deploy` (clé **privée**) |
+| `DEPLOY_KNOWN_HOSTS` | sortie de `ssh-keyscan <ip-vm>` |
+
+Variable (onglet *Variables*, optionnelle) : `DEPLOY_PATH`, chemin du repo sur
+la VM — défaut `sun-shadow`, relatif au home de `DEPLOY_USER`.
+
+`DEPLOY_KNOWN_HOSTS` n'est pas du zèle : sans empreinte connue d'avance, il
+faudrait accepter l'hôte à chaud, et le workflow livrerait ses commandes à
+n'importe quel serveur répondant à cette IP.
+
+Le job `deploy` tourne dans l'environnement GitHub `production` : le créer
+(Settings → Environments) permet d'exiger une approbation manuelle avant
+chaque mise en production, et de limiter la portée des secrets à `main`.
+
+### Rollback
+
+Le workflow écrit `API_TAG=<sha>` dans le `.env` de la VM. Revenir à une
+version antérieure ne demande aucun build :
+
+```bash
+sed -i 's|^API_TAG=.*|API_TAG=<sha-precedent>|' .env
+docker compose up -d --no-deps api
+```
+
+Les images de plus de 7 jours sont purgées à chaque déploiement
+(`docker image prune`) : au-delà, retirer le filtre ou reconstruire depuis le
+commit (`workflow_dispatch` sur le SHA voulu).
+
+### Vérification
+
+Après `up -d`, le workflow attend 10 s et échoue si le conteneur n'est pas
+`running` ou a déjà redémarré — c'est la fenêtre où le serveur rejoue ses
+migrations et ouvre la base, donc là où il tombe s'il doit tomber. Les 100
+dernières lignes de log partent dans la sortie du job en cas d'échec.
+
+Un vrai `GET /health` (sans base) serait plus franc que cette inspection de
+conteneur : à ajouter quand l'endpoint existera.
+
 ## Rappels avant mise en production
 
 - Retirer `/debug/ray` (tâche Notion `[MEP]`).

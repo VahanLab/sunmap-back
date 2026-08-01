@@ -10,6 +10,13 @@
 
 services:
   api:
+    # En production, l'image vient de GHCR : elle est construite par GitHub
+    # Actions à chaque push sur `main`, et `.env` porte le tag déployé (SHA du
+    # commit) — épingler plutôt que `latest` rend le rollback trivial : remettre
+    # l'ancien `API_TAG` dans `.env`, `docker compose up -d api`.
+    image: ${API_IMAGE:-ghcr.io/vahanlab/sunmap-api}:${API_TAG:-latest}
+    # Conservé pour le build local (`docker compose up -d --build`), qui
+    # reconstruit l'image sous ce même nom sans passer par le registre.
     build: .
     restart: unless-stopped
     environment:

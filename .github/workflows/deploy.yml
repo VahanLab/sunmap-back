@@ -1,0 +1,163 @@
+# Déploiement continu sur la VM OVH, à chaque push sur `main`.
+#
+# L'image est construite ICI, sur les runners GitHub, pas sur la VM : un
+# `cargo build --release` du workspace demande plus de RAM et de vCPU que la
+# petite VM n'en a, et la construire sur place couperait l'API pendant tout le
+# build. La VM ne fait que tirer l'image et relancer le conteneur.
+#
+# Secrets à créer (Settings → Secrets and variables → Actions) :
+#   DEPLOY_HOST         IP ou nom DNS de la VM
+#   DEPLOY_USER         utilisateur SSH (membre du groupe docker)
+#   DEPLOY_SSH_KEY      clé privée OpenSSH dédiée au déploiement
+#   DEPLOY_KNOWN_HOSTS  sortie de `ssh-keyscan <host>` (empreinte de la VM)
+# Variable optionnelle :
+#   DEPLOY_PATH         chemin du repo cloné sur la VM (défaut `sun-shadow`,
+#                       relatif au home de DEPLOY_USER)
+#
+# Cf. docs/deploiement-ovh.md §5 pour la préparation de la VM.
+
+name: Déploiement VM OVH
+
+on:
+  push:
+    branches: [main]
+    # Un changement de doc ou de code iOS ne justifie pas un build Rust de
+    # plusieurs minutes suivi d'un redémarrage de l'API.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "helios-core/**"
+      - "helios-server/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "docker-compose.yml"
+      - ".github/workflows/deploy.yml"
+  # Pour redéployer sans commit (rollback, VM réinstallée…).
+  workflow_dispatch:
+
+# Deux pushes rapprochés ne doivent pas déployer en parallèle sur la même VM.
+# `cancel-in-progress: false` : on laisse finir, on ne coupe pas un déploiement
+# à mi-chemin.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR n'accepte que des noms en minuscules ; l'organisation s'écrit
+      # « VahanLab ».
+      - id: image
+        name: Nom de l'image
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=ghcr.io/$owner/sunmap-api" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build et push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # La VM OVH est x86_64 ; pas de build multi-arch à payer.
+          platforms: linux/amd64
+          push: true
+          # Deux tags : `latest` pour lire vite, le SHA pour épingler et
+          # revenir en arrière sans reconstruire.
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: VM
+    needs: build
+    runs-on: ubuntu-latest
+    # Environnement GitHub : permet d'exiger une approbation manuelle et de
+    # restreindre les secrets à `main` (Settings → Environments).
+    environment: production
+    steps:
+      - name: Clé SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # Empreinte connue d'avance : sans elle, un ssh-keyscan à chaud
+          # accepterait n'importe quel hôte se présentant à cette IP.
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Mise à jour du conteneur
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || 'sun-shadow' }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          TAG: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" \
+            "DEPLOY_PATH='$DEPLOY_PATH' IMAGE='$IMAGE' TAG='$TAG' bash -seuo pipefail" <<'REMOTE'
+          cd "$DEPLOY_PATH"
+
+          # Le compose et les scripts viennent du repo ; `--ff-only` refuse de
+          # fusionner si quelqu'un a bricolé sur la VM — mieux vaut échouer
+          # bruyamment que déployer un état inconnu.
+          git fetch origin main
+          git checkout main
+          git pull --ff-only origin main
+
+          # `.env` n'est pas versionné (DATABASE_URL) : on n'y touche que les
+          # lignes d'image, en les créant si elles manquent.
+          touch .env
+          for pair in "API_IMAGE=$IMAGE" "API_TAG=$TAG"; do
+            key=${pair%%=*}
+            if grep -q "^$key=" .env; then
+              sed -i "s|^$key=.*|$pair|" .env
+            else
+              echo "$pair" >> .env
+            fi
+          done
+
+          docker compose pull api
+          # Seul `api` est recréé : le proxy et ses certificats Let's Encrypt
+          # n'ont aucune raison de redémarrer à chaque déploiement.
+          docker compose up -d --no-deps api
+
+          # Le serveur rejoue les migrations au démarrage et ouvre la base
+          # avant d'écouter : s'il tombe, c'est dans ces premières secondes.
+          sleep 10
+          container=$(docker compose ps -q api)
+          state=$(docker inspect -f '{{.State.Status}}' "$container")
+          restarts=$(docker inspect -f '{{.RestartCount}}' "$container")
+          if [ "$state" != "running" ] || [ "$restarts" != "0" ]; then
+            echo "API non démarrée (état=$state, redémarrages=$restarts)"
+            docker compose logs --tail=100 api
+            exit 1
+          fi
+
+          # Les images précédentes s'accumulent (~1 Go chacune) et le disque de
+          # la VM est petit. On ne touche qu'aux images, jamais aux volumes
+          # (données du proxy) ni au bind mount ./tiles.
+          docker image prune -af --filter "until=168h"
+          REMOTE
+
+      - name: Version déployée
+        if: always()
+        run: echo "${{ needs.build.outputs.image }}:${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
