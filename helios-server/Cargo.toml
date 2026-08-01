@@ -25,4 +25,7 @@ sqlx = { version = "0.8", default-features = false, features = [
     # `timestamptz` → `chrono::DateTime<Utc>`, pour dater les contributions
     # affichées sur un profil.
     "chrono",
+    # Migrations embarquées dans le binaire (`sqlx::migrate!`), appliquées au
+    # démarrage : un déploiement ne peut pas oublier une évolution de schéma.
+    "migrate",
 ] }

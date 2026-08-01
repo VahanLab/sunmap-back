@@ -10,10 +10,11 @@
 -- nécessaire : le ray marching travaille en pixels Web Mercator, pas en SRID
 -- métrique.
 --
--- ⚠ Document de RÉFÉRENCE, plus le mécanisme d'application : le schéma vit
--- désormais dans `migrations/` (sqlx), embarqué dans le binaire et appliqué au
--- démarrage du serveur. Toute évolution = `sqlx migrate add <nom>` (CLI 0.8.x,
--- la 0.9.0 est buguée) + report ici pour garder la vue d'ensemble lisible.
+-- Migration de référence : reprend tel quel l'historique de `schema.sql`
+-- (jusqu'ici appliqué à la main via `psql`), au moment de l'adoption de
+-- `sqlx-cli`. Idempotente (`IF NOT EXISTS` partout) : rejouée sur une base
+-- déjà à jour, elle ne fait rien. Toute évolution future passe par
+-- `sqlx migrate add <nom>`, plus par une édition de ce fichier.
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 

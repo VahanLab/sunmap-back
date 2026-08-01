@@ -1,5 +1,19 @@
 # AGENTS.md — Projet SunShadow
 
+## Suivi de projet (Notion)
+
+Le suivi des tâches vit dans la base Notion **« Développements »** (workspace
+Sunmap). **Toute lecture ou écriture Notion passe par le serveur MCP
+`notion-sunmap`** (`.mcp.json`, jeton propre à ce workspace) — jamais par un
+autre connecteur Notion éventuellement configuré par ailleurs, qui pointerait
+sur un workspace différent.
+
+Tâches bloquantes pour la mise en production : préfixe **`[MEP]`** dans le
+titre. Faute d'endpoint de modification de schéma fonctionnel sur ce serveur
+MCP (`API-update-a-data-source` répond `invalid_request_url` quelle que soit
+la version d'API testée), le tag n'est pas une propriété structurée mais ce
+préfixe — à corriger si l'endpoint se débloque un jour.
+
 ## Vision produit
 
 App mobile pour visualiser sur une carte la position du soleil et les ombres

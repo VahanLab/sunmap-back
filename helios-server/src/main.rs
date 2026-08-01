@@ -63,13 +63,23 @@ async fn main() {
         Err(e) => {
             eprintln!("Connexion PostgreSQL impossible : {e}");
             eprintln!(
-                "Attendu : {}. Créer avec `createdb sunmap`, appliquer \
-                 `helios-server/schema.sql`, puis remplir avec `cargo run --bin ingest`.",
+                "Attendu : {}. Créer avec `createdb sunmap`, puis remplir avec \
+                 `cargo run --bin import` (le schéma s'applique tout seul au \
+                 démarrage, cf. migrations/).",
                 db::DEFAULT_URL
             );
             std::process::exit(1);
         }
     };
+
+    // Migrations embarquées dans le binaire (`sqlx migrate add` pour en créer
+    // une). Appliquées à chaque démarrage : déjà passées = no-op, et un déploiement
+    // ne peut plus oublier une évolution de schéma — c'était le risque du
+    // `psql -f schema.sql` à la main.
+    if let Err(e) = sqlx::migrate!("./migrations").run(&pool).await {
+        eprintln!("Migrations SQL impossibles : {e}");
+        std::process::exit(1);
+    }
 
     for (table, label) in [
         ("buildings", "bâtiments"),

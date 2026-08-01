@@ -6,3 +6,9 @@ target/
 
 # App iOS : repo séparé (sunmap-ios)
 ios/
+
+# Config MCP locale : contient un secret d'intégration Notion, jamais commit.
+.mcp.json
+
+# Secrets de déploiement (DATABASE_URL de la base managée OVH).
+.env

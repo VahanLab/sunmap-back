@@ -1,0 +1,40 @@
+# Déploiement VM OVH : l'API + le proxy qui la publie.
+#
+# La base de données n'est PAS ici : PostgreSQL managé OVH (avec PostGIS),
+# joint par `DATABASE_URL` — cf. `.env` (copier `.env.example`).
+#
+#   docker compose up -d --build
+#
+# Premier lancement : configurer Nginx Proxy Manager sur http://<vm>:81
+# (admin@example.com / changeme), cf. docs/deploiement-ovh.md.
+
+services:
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      # postgres://user:mdp@hôte-ovh:5432/sunmap?sslmode=require
+      DATABASE_URL: ${DATABASE_URL}
+    # Pas de port publié sur l'hôte : seul le proxy parle à l'API, via le
+    # réseau compose interne (`http://api:8080`). Exposer 8080 en direct
+    # contournerait le TLS et le rate limiting du proxy.
+    expose:
+      - "8080"
+
+  # Nginx Proxy Manager : reverse proxy avec interface web — création des
+  # hôtes (api.<domaine> → api:8080), certificats Let's Encrypt gérés et
+  # renouvelés automatiquement, redirections HTTP → HTTPS.
+  proxy:
+    image: jc21/nginx-proxy-manager:latest
+    restart: unless-stopped
+    ports:
+      - "80:80"    # HTTP (challenges Let's Encrypt + redirection HTTPS)
+      - "443:443"  # HTTPS public
+      - "81:81"    # Interface d'admin — à restreindre par pare-feu OVH
+    volumes:
+      - npm_data:/data
+      - npm_letsencrypt:/etc/letsencrypt
+
+volumes:
+  npm_data:
+  npm_letsencrypt:

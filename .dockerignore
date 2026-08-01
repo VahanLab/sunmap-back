@@ -1,0 +1,7 @@
+target/
+ios/
+docs/
+scripts/
+.git/
+.mcp.json
+*.md
