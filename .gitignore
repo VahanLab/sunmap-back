@@ -7,6 +7,9 @@ target/
 # App iOS : repo séparé (sunmap-ios)
 ios/
 
+# Site web : repo séparé (sunmap-web)
+web/
+
 # Config MCP locale : contient un secret d'intégration Notion, jamais commit.
 .mcp.json
 
