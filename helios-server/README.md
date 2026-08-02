@@ -429,6 +429,15 @@ carte de tout le monde pour le départ d'une personne, alors que ce qui est
 personnel — le pseudo, le lien vers l'identité Firebase — part bien avec la
 ligne.
 
+**Conséquence sur toutes les réponses : l'auteur d'une contribution est
+optionnel.** `terrace_author`, et les `username` des historiques
+(`/places/terrace/contributions`, `/places/furniture/contributions`) valent
+`null` dans deux cas — contribution d'avant l'authentification, ou compte
+supprimé depuis. Les requêtes concernées passent donc toutes par un
+`LEFT JOIN users` : un `JOIN` ferait silencieusement disparaître ces
+contributions de l'historique alors qu'elles doivent y rester, sans nom. Aux
+clients de n'afficher aucun pseudo dans ce cas plutôt qu'un substitut.
+
 Idempotent : supprimer un compte déjà parti renvoie `204`, pas `404`. Un client
 qui réessaie après une coupure réseau ne doit pas se voir refuser l'état qu'il
 vient justement d'atteindre.
