@@ -1090,3 +1090,196 @@ pub async fn set_username(
         Err(e) => Err(e),
     }
 }
+
+// MARK: - Liaison OpenStreetMap
+
+/// Ce qu'on retient d'un compte OSM lié.
+pub struct OsmLink {
+    pub user_id: i64,
+    pub display_name: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Rattache un compte OSM à un compte SunMap.
+///
+/// Renvoie `false` si ce compte OSM est déjà lié **ailleurs** : deux comptes
+/// SunMap poussant sous la même identité rendraient les changesets illisibles,
+/// et en révoquer un ne révoquerait pas l'autre.
+pub async fn link_osm_account(
+    pool: &PgPool,
+    uid: &str,
+    link: &OsmLink,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE users SET osm_user_id = $2, osm_display_name = $3, \
+                osm_access_token = $4, osm_refresh_token = $5, \
+                osm_token_expires_at = $6, osm_linked_at = now(), updated_at = now() \
+         WHERE uid = $1",
+    )
+    .bind(uid)
+    .bind(link.user_id)
+    .bind(&link.display_name)
+    .bind(&link.access_token)
+    .bind(&link.refresh_token)
+    .bind(link.expires_at)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(done) => Ok(done.rows_affected() > 0),
+        // Violation de `users_osm_user_id_key` : le compte OSM est pris.
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Détache le compte OSM. Le jeton part avec — c'est la seule façon d'être sûr
+/// qu'aucun envoi ne repartira en son nom.
+pub async fn unlink_osm_account(pool: &PgPool, uid: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET osm_user_id = NULL, osm_display_name = NULL, \
+                osm_access_token = NULL, osm_refresh_token = NULL, \
+                osm_token_expires_at = NULL, osm_linked_at = NULL, updated_at = now() \
+         WHERE uid = $1",
+    )
+    .bind(uid)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn osm_link(pool: &PgPool, uid: &str) -> Result<Option<OsmLink>, sqlx::Error> {
+    Ok(sqlx::query(
+        "SELECT osm_user_id, osm_display_name, osm_access_token, osm_refresh_token, \
+                osm_token_expires_at \
+         FROM users WHERE uid = $1 AND osm_access_token IS NOT NULL",
+    )
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?
+    .map(|r| OsmLink {
+        user_id: r.get("osm_user_id"),
+        display_name: r.get("osm_display_name"),
+        access_token: r.get("osm_access_token"),
+        refresh_token: r.get("osm_refresh_token"),
+        expires_at: r.get("osm_token_expires_at"),
+    }))
+}
+
+/// Met à jour le seul jeton, après un rafraîchissement.
+pub async fn update_osm_token(
+    pool: &PgPool,
+    uid: &str,
+    link: &OsmLink,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET osm_access_token = $2, osm_refresh_token = $3, \
+                osm_token_expires_at = $4, updated_at = now() WHERE uid = $1",
+    )
+    .bind(uid)
+    .bind(&link.access_token)
+    .bind(&link.refresh_token)
+    .bind(link.expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Un envoi vers OSM en attente.
+pub struct OsmPush {
+    pub id: i64,
+    pub user_uid: String,
+    pub kind: String,
+    pub place_id: String,
+    pub payload: serde_json::Value,
+    pub attempts: i32,
+}
+
+/// Met un envoi en file. Toujours appelé **après** l'écriture côté SunMap :
+/// la carte doit être juste même si OSM est indisponible.
+pub async fn enqueue_osm_push(
+    pool: &PgPool,
+    uid: &str,
+    kind: &str,
+    place_id: &str,
+    payload: serde_json::Value,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO osm_pushes (user_uid, kind, place_id, payload) \
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(uid)
+    .bind(kind)
+    .bind(place_id)
+    .bind(payload)
+    .fetch_one(pool)
+    .await
+}
+
+/// Les envois à retenter, du plus ancien au plus récent.
+///
+/// Bornés en tentatives : un envoi qui échoue cinq fois échoue pour une raison
+/// qui ne se règlera pas toute seule — élément supprimé d'OSM, jeton révoqué —
+/// et le relancer indéfiniment ne ferait que marteler l'API.
+pub async fn pending_osm_pushes(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<OsmPush>, sqlx::Error> {
+    Ok(sqlx::query(
+        "SELECT id, user_uid, kind, place_id, payload, attempts FROM osm_pushes \
+         WHERE status = 'pending' AND attempts < 5 AND user_uid IS NOT NULL \
+         ORDER BY created_at LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| OsmPush {
+        id: r.get("id"),
+        user_uid: r.get("user_uid"),
+        kind: r.get("kind"),
+        place_id: r.get("place_id"),
+        payload: r.get("payload"),
+        attempts: r.get("attempts"),
+    })
+    .collect())
+}
+
+pub async fn mark_osm_push_sent(
+    pool: &PgPool,
+    id: i64,
+    changeset: i64,
+    element: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE osm_pushes SET status = 'sent', changeset_id = $2, osm_element = $3, \
+                attempts = attempts + 1, last_error = NULL, updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(changeset)
+    .bind(element)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Compte la tentative et retient l'erreur. Le statut ne bascule sur `failed`
+/// qu'au dernier essai : entre-temps l'envoi reste `pending`, donc rejouable.
+pub async fn mark_osm_push_failed(
+    pool: &PgPool,
+    id: i64,
+    error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE osm_pushes SET attempts = attempts + 1, last_error = $2, \
+                status = CASE WHEN attempts + 1 >= 5 THEN 'failed' ELSE 'pending' END, \
+                updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}

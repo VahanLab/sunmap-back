@@ -443,6 +443,77 @@ défilement.
 de recalculer `offset + len < total`, et surtout d'avoir à le refaire s'il
 change de taille de page.
 
+### `GET` · `POST` · `DELETE /users/me/osm`
+
+Liaison du compte à **OpenStreetMap**, pour que les contributions faites dans
+l'app remontent à la source.
+
+`GET` dit où on en est, et donne de quoi démarrer :
+
+```json
+{ "linked": false, "client_id": "…", "authorize_url": "https://www.openstreetmap.org/oauth2/authorize" }
+```
+
+Le `client_id` vient du serveur plutôt que d'être embarqué dans l'app : en
+changer ne doit pas exiger une mise à jour App Store.
+
+`POST` termine la liaison — corps `{ code, code_verifier, redirect_uri }`.
+L'app ouvre la page de consentement et récupère le `code` ; **c'est le serveur
+qui l'échange** contre un jeton. Le jeton d'écriture ne transite donc jamais par
+l'appareil, reste révocable d'un seul endroit, et c'est lui qui pousse — y
+compris en différé après un échec réseau. `409` si ce compte OSM est déjà lié
+ailleurs : deux comptes SunMap poussant sous la même identité rendraient les
+changesets illisibles.
+
+`DELETE` détache et **efface le jeton** : c'est la seule façon d'être sûr
+qu'aucun envoi ne repartira au nom de quelqu'un qui s'est retiré.
+
+#### Ce qui remonte, et comment
+
+| Contribution | Écriture OSM |
+|---|---|
+| Terrasse oui / non | `outdoor_seating=yes\|no` sur l'élément existant |
+| Banc ajouté | nœud `amenity=bench` + `backrest`, `direction` |
+| Table ajoutée | nœud `leisure=picnic_table` + `direction` |
+
+`direction` part en **degrés depuis le nord, sens horaire** — la convention
+OSM, qui est déjà celle de l'app : aucune conversion, donc aucune occasion de
+se tromper de repère. Le cap est arrondi au degré : un relevé au doigt sur un
+curseur n'a pas la précision qui justifierait des décimales.
+
+Une modification d'élément existant **relit sa version courante** juste avant
+d'écrire, et n'ajoute que le tag concerné. L'API refuse une écriture dont la
+version ne correspond plus — c'est ce qui empêche d'écraser le travail de
+quelqu'un d'autre entre-temps.
+
+**Un changeset par contribution**, avec son commentaire et `created_by=SunMap`.
+C'est ce que la communauté attend d'un éditeur tiers : une modification isolée
+se relit et se révoque sans toucher au reste. Le changeset est refermé même
+après un échec d'envoi — laissé ouvert, il bloquerait les suivants du même
+compte pendant une heure.
+
+#### File d'attente
+
+Les envois passent par `osm_pushes` et **jamais** par le chemin de la requête :
+l'API OSM peut être lente ou en maintenance, et rien de cela ne doit faire
+échouer une contribution côté SunMap. La carte reste juste, l'envoi se
+rattrape — à chaque nouvelle contribution, au démarrage, puis toutes les
+5 minutes. Cinq tentatives au plus : au-delà, l'échec ne se réglera pas tout
+seul (élément supprimé d'OSM, jeton révoqué) et marteler l'API n'y changerait
+rien.
+
+#### Configuration
+
+| Variable | Rôle |
+|---|---|
+| `OSM_CLIENT_ID` | Application OAuth 2 déclarée sur openstreetmap.org. **Absente : la fonctionnalité est éteinte**, pas cassée |
+| `OSM_CLIENT_SECRET` | Facultatif — seulement si l'application est déclarée « confidentielle ». Sinon PKCE suffit |
+| `OSM_API_BASE` | Défaut `https://api.openstreetmap.org`. Mettre `https://api.dev.openstreetmap.org` pour essayer |
+| `OSM_WEB_BASE` | Défaut `https://www.openstreetmap.org` (pages OAuth, distinctes de l'API) |
+
+**Essayer sur le bac à sable d'abord.** Une erreur sur l'instance de production
+salit une base que des milliers de gens relisent à la main.
+
 ### `DELETE /users/me`
 
 Supprime le compte du jeton. `204` en cas de succès.

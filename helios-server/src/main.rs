@@ -30,6 +30,8 @@ use helios_server::opening_hours;
 use helios_server::dem::{self, latlon_of_world_px, world_px, TileCache, TILE_SIZE, ZOOM};
 use helios_server::osm::Building;
 use helios_server::tiers;
+use helios_server::osm_api;
+use helios_server::osm_push;
 use helios_server::username;
 
 /// Emprises déjà lues en base pour une bbox de tuiles donnée. PostGIS répond
@@ -137,6 +139,16 @@ async fn main() {
         },
     });
 
+    // Reprise des envois OSM qui ont échoué — au démarrage, puis toutes les
+    // cinq minutes. Sans elle, une panne d'OSM ou un redémarrage laisserait des
+    // contributions en file pour toujours.
+    if osm_push::is_configured() {
+        println!("liaison OpenStreetMap : active ({})", osm_api::api_base());
+        osm_push::spawn_retry_loop(state.pool.clone(), state.http.clone());
+    } else {
+        println!("liaison OpenStreetMap : inactive (OSM_CLIENT_ID absent)");
+    }
+
     let app = Router::new()
         .route("/sunlit", get(sunlit))
         .route("/sunlit/batch", post(sunlit_batch))
@@ -148,6 +160,10 @@ async fn main() {
         .route("/users/me", get(current_user).delete(delete_current_user))
         .route("/users/me/profile", get(current_profile))
         .route("/users/me/contributions", get(current_contributions))
+        .route(
+            "/users/me/osm",
+            get(osm_link_status).post(osm_link_account).delete(osm_unlink_account),
+        )
         .route("/users/username", put(set_username))
         .route("/users/username/available", get(username_availability))
         .route("/users/username/suggestions", get(username_suggestions))
@@ -1270,6 +1286,19 @@ async fn report_terrace(
     // aucun effet à sa contribution.
     state.places_results.write().await.clear();
 
+    // Remontée vers OSM, si le compte y est lié. Après l'écriture locale et
+    // dans une tâche détachée : la carte doit être juste même si OSM est
+    // indisponible, et le contributeur n'a pas à attendre son API.
+    if osm_push::is_configured() {
+        osm_push::enqueue_and_spawn(
+            state.pool.clone(),
+            state.http.clone(),
+            identity.uid.clone(),
+            report.osm_id.clone(),
+            osm_push::PushPayload::Terrace { has_terrace: report.has_terrace },
+        );
+    }
+
     println!(
         "[terrace] {} → has_terrace={} {}",
         report.osm_id,
@@ -1352,6 +1381,32 @@ async fn add_furniture(
     // Comme pour une terrasse : la classification déjà en cache ignore ce
     // nouveau point tant qu'on ne la jette pas.
     state.places_results.write().await.clear();
+
+    // Le meuble n'existe que chez nous (identifiant `user/…`) : on le crée
+    // dans OSM, on ne le modifie pas.
+    if osm_push::is_configured() {
+        let payload = if body.category == "bench" {
+            osm_push::PushPayload::Bench {
+                lat: body.lat,
+                lng: body.lng,
+                direction_deg: body.direction_deg,
+                backrest: body.backrest,
+            }
+        } else {
+            osm_push::PushPayload::PicnicTable {
+                lat: body.lat,
+                lng: body.lng,
+                direction_deg: body.direction_deg,
+            }
+        };
+        osm_push::enqueue_and_spawn(
+            state.pool.clone(),
+            state.http.clone(),
+            identity.uid.clone(),
+            osm_id.clone(),
+            payload,
+        );
+    }
 
     println!("[furniture] {osm_id} ({}) ajouté par {}", body.category, identity.uid);
 
@@ -2003,6 +2058,128 @@ async fn current_user(
         uid: identity.uid,
         username: record.map(|r| r.username),
     }))
+}
+
+// MARK: - Liaison OpenStreetMap
+
+#[derive(Serialize)]
+struct OsmLinkResponse {
+    linked: bool,
+    /// Pseudo OSM, pour que l'app puisse dire à qui elle est reliée.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    /// `client_id` et point d'autorisation, pour que l'app monte l'URL de
+    /// consentement sans les embarquer en dur — les changer ne doit pas exiger
+    /// une mise à jour App Store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorize_url: Option<String>,
+}
+
+/// Où en est la liaison OSM du compte, et de quoi la démarrer.
+async fn osm_link_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<OsmLinkResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    let link = db::osm_link(&state.pool, &identity.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+
+    Ok(Json(OsmLinkResponse {
+        linked: link.is_some(),
+        display_name: link.map(|l| l.display_name),
+        client_id: osm_api::client_id(),
+        authorize_url: osm_api::client_id()
+            .map(|_| format!("{}/oauth2/authorize", osm_api::web_base())),
+    }))
+}
+
+#[derive(Deserialize)]
+struct OsmLinkBody {
+    /// Code d'autorisation rendu par la page de consentement OSM.
+    code: String,
+    /// Pendant PKCE du `code_challenge` : c'est lui qui prouve que l'appareil
+    /// qui termine l'échange est celui qui l'a commencé.
+    code_verifier: String,
+    /// Doit être identique à celui de la demande d'autorisation, l'API le
+    /// revérifie.
+    redirect_uri: String,
+}
+
+/// Termine la liaison : échange le code contre un jeton et le range.
+///
+/// L'échange se fait **ici** et pas sur l'appareil : le jeton d'écriture OSM
+/// reste ainsi côté serveur, révocable d'un seul endroit, et c'est lui qui
+/// pousse — y compris en différé, après un échec réseau.
+async fn osm_link_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<OsmLinkBody>,
+) -> Result<Json<OsmLinkResponse>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    if osm_api::client_id().is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "liaison OSM non configurée sur ce serveur".into(),
+        ));
+    }
+
+    let account = osm_api::exchange_code(
+        &state.http,
+        &body.code,
+        &body.code_verifier,
+        &body.redirect_uri,
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+
+    let link = db::OsmLink {
+        user_id: account.user_id,
+        display_name: account.display_name.clone(),
+        access_token: account.access_token,
+        refresh_token: account.refresh_token,
+        expires_at: account
+            .expires_in
+            .map(|s| chrono::Utc::now() + chrono::Duration::seconds(s)),
+    };
+    let stored = db::link_osm_account(&state.pool, &identity.uid, &link)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    if !stored {
+        return Err((
+            StatusCode::CONFLICT,
+            "ce compte OpenStreetMap est déjà lié à un autre compte SunMap".into(),
+        ));
+    }
+
+    println!("[osm] {} lié à {}", identity.uid, account.display_name);
+
+    // Ce qui attendait un compte lié peut partir maintenant.
+    let pool = state.pool.clone();
+    let http = state.http.clone();
+    tokio::spawn(async move { osm_push::drain(&pool, &http, 50).await });
+
+    Ok(Json(OsmLinkResponse {
+        linked: true,
+        display_name: Some(account.display_name),
+        client_id: osm_api::client_id(),
+        authorize_url: None,
+    }))
+}
+
+/// Détache le compte OSM. Le jeton part avec.
+async fn osm_unlink_account(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    db::unlink_osm_account(&state.pool, &identity.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    println!("[osm] {} délié", identity.uid);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

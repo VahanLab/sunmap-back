@@ -232,6 +232,27 @@ Fonctionnalités cibles :
   correction), historiques par lieu, comptes/pseudos/paliers.
 - Bitfield `sun_day` (slider sans réseau) et transmittance de canopée.
 
+## Remontée vers OpenStreetMap
+
+Un compte peut être **lié à OSM** pour que les contributions corrigent la carte
+source, et pas seulement notre base : `outdoor_seating` sur l'établissement
+existant, nœuds `amenity=bench` et `leisure=picnic_table` pour le mobilier.
+
+Le jeton d'écriture vit **côté serveur** : c'est lui qui pousse, en différé si
+OSM est indisponible, et un jeton baladé dans l'app ne serait plus révocable.
+Les envois passent par une file (`osm_pushes`) et jamais par le chemin de la
+requête — la carte SunMap doit rester juste même quand OSM ne répond pas.
+
+Un **changeset par contribution**, avec commentaire et `created_by=SunMap` :
+c'est ce que la communauté attend d'un éditeur tiers. Une modification
+d'élément existant relit sa version courante avant d'écrire, et n'ajoute que le
+tag concerné — l'API refuse une écriture périmée, ce qui protège du travail
+d'autrui.
+
+**Essayer sur `https://api.dev.openstreetmap.org` d'abord** (`OSM_API_BASE`) :
+une erreur en production salit une base que des milliers de gens relisent à la
+main. Protocole complet : `helios-server/README.md`.
+
 ## Prochaines étapes (dans l'ordre)
 
 1. Échantillonner la terrasse en surface plutôt qu'au point : 3–5 points dans

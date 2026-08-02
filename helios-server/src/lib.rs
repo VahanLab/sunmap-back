@@ -13,6 +13,8 @@ pub mod dem;
 pub mod i18n;
 pub mod opening_hours;
 pub mod osm;
+pub mod osm_api;
+pub mod osm_push;
 pub mod pbf;
 pub mod tiers;
 pub mod username;
