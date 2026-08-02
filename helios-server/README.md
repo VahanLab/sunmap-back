@@ -511,9 +511,11 @@ rien.
 | `OSM_API_BASE` | Cible de l'API — voir le défaut ci-dessous |
 | `OSM_WEB_BASE` | Cible des pages OAuth (distinctes de l'API en production) |
 
-Les variables se lisent aussi depuis un fichier **`.env`** à la racine, ignoré
-par git : un secret passé en ligne de commande resterait dans l'historique du
-shell et dans la liste des processus.
+Les variables se lisent aussi depuis **`helios-server/.env`** (modèle :
+`.env.example`, à côté), ignoré par git : un secret passé en ligne de commande
+resterait dans l'historique du shell et dans la liste des processus. Le fichier
+est trouvé qu'on lance depuis la racine de l'espace de travail ou depuis
+`helios-server/`.
 
 **Un build de développement vise toujours le bac à sable**
 (`https://master.apis.dev.openstreetmap.org`, API *et* pages OAuth sur le même

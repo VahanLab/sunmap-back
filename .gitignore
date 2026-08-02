@@ -13,5 +13,7 @@ web/
 # Config MCP locale : contient un secret d'intégration Notion, jamais commit.
 .mcp.json
 
-# Secrets de déploiement (DATABASE_URL de la base managée OVH).
+# Configuration locale et secrets — `helios-server/.env` (base de données,
+# identifiants OAuth OpenStreetMap) et le `.env` de racine que compose lit pour
+# le tag de l'image. Le motif sans barre oblique couvre les deux.
 .env

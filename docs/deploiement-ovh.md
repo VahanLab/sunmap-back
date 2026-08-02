@@ -34,17 +34,25 @@ vierge est initialisée au premier lancement de l'API.
 1. VM OVH (b2-7 ou équivalent : le ray marching est CPU, 2 vCPU suffisent au
    début, la RAM sert surtout aux caches de tuiles — 4 Go confortable).
 2. Installer Docker + le plugin compose (`curl -fsSL https://get.docker.com | sh`).
-3. Cloner le repo, copier `.env.example` en `.env`, remplir `DATABASE_URL` —
+3. Cloner le repo, copier `helios-server/.env.example` en
+   `helios-server/.env`, remplir `DATABASE_URL` —
    et `OSM_CLIENT_ID` / `OSM_CLIENT_SECRET` si la remontée vers OpenStreetMap
    doit être active (sinon elle reste éteinte, pas cassée).
 4. `docker compose up -d --build`.
 
-`.env` **vit sur la VM et n'est jamais versionné**. Le workflow de déploiement
-n'y réécrit que `API_IMAGE` et `API_TAG` : les secrets qu'on y met à la main y
-restent d'un déploiement à l'autre.
+**Deux fichiers `.env`, deux rôles**, aucun des deux versionné :
+
+| Fichier | Contenu | Lu par |
+|---|---|---|
+| `helios-server/.env` | configuration de l'application : base, tuiles, OAuth OSM | le serveur (et le conteneur, via `env_file`) |
+| `.env` (racine) | `API_IMAGE`, `API_TAG` | compose, pour ses `${…}` |
+
+Le workflow de déploiement ne réécrit que le second : les secrets posés à la
+main dans le premier y restent d'un déploiement à l'autre.
 
 L'image étant construite en `--release`, elle vise **la production OSM**. Pour
-un déploiement de recette, pointer explicitement le bac à sable dans `.env` :
+un déploiement de recette, pointer explicitement le bac à sable dans
+`helios-server/.env` :
 
 ```
 OSM_API_BASE=https://master.apis.dev.openstreetmap.org

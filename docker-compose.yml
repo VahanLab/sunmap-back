@@ -1,7 +1,8 @@
 # Déploiement VM OVH : l'API + le proxy qui la publie.
 #
 # La base de données n'est PAS ici : PostgreSQL managé OVH (avec PostGIS),
-# joint par `DATABASE_URL` — cf. `.env` (copier `.env.example`).
+# joint par `DATABASE_URL` — cf. `helios-server/.env` (copier le `.env.example`
+# qui est à côté).
 #
 #   docker compose up -d --build
 #
@@ -19,23 +20,17 @@ services:
     # reconstruit l'image sous ce même nom sans passer par le registre.
     build: .
     restart: unless-stopped
-    environment:
-      # postgres://user:mdp@hôte-ovh:5432/sunmap?sslmode=require
-      DATABASE_URL: ${DATABASE_URL}
-      # Tuiles bâtiments (format HBT, cf. docs/deploiement-ovh.md §4).
-      # Vide ou absent : lecture PostGIS classique — c'est le rollback.
-      BUILDINGS_TILES: ${BUILDINGS_TILES:-}
-      # Application OAuth 2 OpenStreetMap : c'est le serveur qui échange le
-      # code et garde le jeton d'écriture, donc c'est lui qui a besoin de ces
-      # deux valeurs. Vides : la liaison OSM est éteinte, pas cassée.
-      OSM_CLIENT_ID: ${OSM_CLIENT_ID:-}
-      OSM_CLIENT_SECRET: ${OSM_CLIENT_SECRET:-}
-      # Cible OSM. Vides, l'image étant construite en `--release`, le serveur
-      # vise la PRODUCTION. Renseigner le bac à sable
-      # (https://master.apis.dev.openstreetmap.org, API et pages OAuth sur le
-      # même hôte) pour un déploiement de recette.
-      OSM_API_BASE: ${OSM_API_BASE:-}
-      OSM_WEB_BASE: ${OSM_WEB_BASE:-}
+    # Configuration de l'application, prise là où elle vit : à côté du serveur.
+    # `env_file` passe le fichier au conteneur tel quel — DATABASE_URL,
+    # BUILDINGS_TILES, OSM_CLIENT_ID/SECRET, OSM_API_BASE/WEB_BASE — sans avoir
+    # à énumérer chaque variable ici, donc sans risque d'en oublier une à la
+    # prochaine.
+    #
+    # À ne pas confondre avec le `.env` de CETTE racine, que compose lit pour
+    # ses propres `${…}` (l'image et son tag, réécrits par le déploiement) et
+    # qui ne parle pas de l'application.
+    env_file:
+      - ./helios-server/.env
     volumes:
       # Fichiers de tuiles générés par `tilebuild`, sur le disque de la VM —
       # gros (Go), statiques, rien à faire dans une image ou un volume nommé.

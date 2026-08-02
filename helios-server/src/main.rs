@@ -63,11 +63,31 @@ struct AppState {
     btiles: Option<helios_server::btiles::TileStore>,
 }
 
+/// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
+///
+/// `dotenvy` remonte les dossiers parents à la recherche du chemin donné, mais
+/// ne descend jamais dans un sous-dossier : d'où le chemin **relatif à la
+/// racine de l'espace de travail**, qui se résout aussi bien depuis cette
+/// racine (`cargo run`) que depuis `helios-server/` — dans ce dernier cas la
+/// remontée d'un cran suffit à retrouver le même fichier. Vérifié dans les
+/// deux sens.
+///
+/// `.env` nu en second : dépannage, et cohérence avec l'habitude.
+///
+/// Silencieux quand rien n'est trouvé : en production les variables viennent
+/// du conteneur, pas d'un fichier.
+fn load_dotenv() {
+    for candidate in ["helios-server/.env", ".env"] {
+        if dotenvy::from_filename(candidate).is_ok() {
+            println!("configuration : {candidate}");
+            return;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    // Avant toute lecture d'environnement. Silencieux si le fichier n'existe
-    // pas : en production les variables viennent du conteneur.
-    let _ = dotenvy::dotenv();
+    load_dotenv();
 
     let pool = match db::connect().await {
         Ok(p) => p,
