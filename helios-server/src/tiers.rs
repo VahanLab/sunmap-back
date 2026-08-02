@@ -95,25 +95,6 @@ impl Tier {
             (Tier::Influential, Lang::En) => "Influential",
         }
     }
-
-    /// Une phrase qui dit ce que le palier vaut, à afficher sous le titre.
-    ///
-    /// Elle parle de l'effet de la contribution — des terrasses trouvées par
-    /// d'autres — plutôt que du score : c'est ce qui donne envie de continuer.
-    pub fn tagline(&self, lang: Lang) -> &'static str {
-        match (self, lang) {
-            (Tier::Novice, Lang::Fr) => "Votre premier signalement placera une terrasse sur la carte.",
-            (Tier::Budding, Lang::Fr) => "Vos signalements aident déjà à trouver l'ombre.",
-            (Tier::Established, Lang::Fr) => "Vos terrasses guident les recherches du quartier.",
-            (Tier::Innovator, Lang::Fr) => "Vous cartographiez ce qu'aucune donnée publique ne dit.",
-            (Tier::Influential, Lang::Fr) => "Une part de la carte tient grâce à vous.",
-            (Tier::Novice, Lang::En) => "Your first report will put a terrace on the map.",
-            (Tier::Budding, Lang::En) => "Your reports already help people find shade.",
-            (Tier::Established, Lang::En) => "Your terraces guide searches across the area.",
-            (Tier::Innovator, Lang::En) => "You map what no public dataset records.",
-            (Tier::Influential, Lang::En) => "Part of the map stands thanks to you.",
-        }
-    }
 }
 
 /// Où en est un contributeur : son palier, et ce qui le sépare du suivant.

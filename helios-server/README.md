@@ -371,7 +371,7 @@ vues.
   "contribution_count": 5,
   "tier": {
     "key": "budding", "label": "Contributeur en herbe",
-    "tagline": "Vos signalements aident déjà à trouver l'ombre.", "threshold": 3
+    "threshold": 3
   },
   "next_tier": { "key": "established", "label": "Contributeur affirmé", "threshold": 10 },
   "remaining_to_next": 5,

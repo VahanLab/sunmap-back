@@ -2176,7 +2176,6 @@ struct TierPayload {
     /// couleur sans dépendre d'un libellé traduit.
     key: &'static str,
     label: &'static str,
-    tagline: &'static str,
     /// Contributions nécessaires pour l'atteindre.
     threshold: i64,
 }
@@ -2186,7 +2185,6 @@ impl TierPayload {
         TierPayload {
             key: tier.key(),
             label: tier.label(lang),
-            tagline: tier.tagline(lang),
             threshold: tier.threshold(),
         }
     }
