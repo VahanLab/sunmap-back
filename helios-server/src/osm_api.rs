@@ -19,17 +19,48 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-/// Base de l'API. Surchargeable pour viser le bac à sable
-/// (`https://api.dev.openstreetmap.org`), qui est **le** bon endroit pour
-/// essayer : une erreur sur l'instance de production salit une base que des
-/// milliers de gens relisent à la main.
-pub fn api_base() -> String {
-    std::env::var("OSM_API_BASE").unwrap_or_else(|_| "https://api.openstreetmap.org".to_string())
+/// Instance de secours des développeurs. **API et pages OAuth sur le même
+/// hôte** — contrairement à la production, où le site et l'API sont séparés.
+///
+/// `api.dev.openstreetmap.org` ne répond pas, malgré ce qu'on lit ici et là :
+/// c'est bien `master.apis.dev.…`, vérifié.
+pub const SANDBOX_BASE: &str = "https://master.apis.dev.openstreetmap.org";
+
+/// Un build de développement vise **toujours** le bac à sable, sauf variable
+/// d'environnement contraire.
+///
+/// Ce n'est pas un défaut de confort : une erreur sur l'instance de production
+/// salit une base que des milliers de gens relisent à la main, et les reverts
+/// s'y font aussi à la main. Le risque n'est pas symétrique — se tromper vers
+/// le bac à sable ne coûte qu'un essai à refaire.
+fn default_base(production: &str) -> String {
+    if cfg!(debug_assertions) {
+        SANDBOX_BASE.to_string()
+    } else {
+        production.to_string()
+    }
 }
 
-/// Base du site, qui sert les pages OAuth (distincte de l'API).
+/// Base de l'API.
+pub fn api_base() -> String {
+    std::env::var("OSM_API_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_base("https://api.openstreetmap.org"))
+}
+
+/// Base du site, qui sert les pages OAuth (distincte de l'API en production).
 pub fn web_base() -> String {
-    std::env::var("OSM_WEB_BASE").unwrap_or_else(|_| "https://www.openstreetmap.org".to_string())
+    std::env::var("OSM_WEB_BASE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_base("https://www.openstreetmap.org"))
+}
+
+/// Vise-t-on autre chose que la production ? Sert à le dire au démarrage et
+/// dans l'app — on ne pousse pas sur la vraie carte sans le savoir.
+pub fn is_sandbox() -> bool {
+    !api_base().contains("://api.openstreetmap.org")
 }
 
 pub fn client_id() -> Option<String> {
@@ -461,6 +492,17 @@ fn escape_xml(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn un_build_de_dev_vise_le_bac_a_sable() {
+        // `cargo test` compile en debug : sans variable d'environnement, on ne
+        // doit jamais pointer la production.
+        std::env::remove_var("OSM_API_BASE");
+        std::env::remove_var("OSM_WEB_BASE");
+        assert_eq!(api_base(), SANDBOX_BASE);
+        assert_eq!(web_base(), SANDBOX_BASE);
+        assert!(is_sandbox());
+    }
 
     #[test]
     fn decoupe_un_identifiant_osm() {

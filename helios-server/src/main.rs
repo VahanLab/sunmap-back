@@ -65,6 +65,10 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    // Avant toute lecture d'environnement. Silencieux si le fichier n'existe
+    // pas : en production les variables viennent du conteneur.
+    let _ = dotenvy::dotenv();
+
     let pool = match db::connect().await {
         Ok(p) => p,
         Err(e) => {
@@ -143,7 +147,11 @@ async fn main() {
     // cinq minutes. Sans elle, une panne d'OSM ou un redémarrage laisserait des
     // contributions en file pour toujours.
     if osm_push::is_configured() {
-        println!("liaison OpenStreetMap : active ({})", osm_api::api_base());
+        println!(
+            "liaison OpenStreetMap : active ({}{})",
+            osm_api::api_base(),
+            if osm_api::is_sandbox() { " — BAC À SABLE" } else { "" }
+        );
         osm_push::spawn_retry_loop(state.pool.clone(), state.http.clone());
     } else {
         println!("liaison OpenStreetMap : inactive (OSM_CLIENT_ID absent)");
@@ -2075,6 +2083,10 @@ struct OsmLinkResponse {
     client_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorize_url: Option<String>,
+    /// Vise-t-on le bac à sable plutôt que la vraie carte ? L'app le dit à
+    /// l'écran : on ne doit jamais croire qu'on corrige OpenStreetMap quand on
+    /// écrit dans une instance de test, ni l'inverse.
+    sandbox: bool,
 }
 
 /// Où en est la liaison OSM du compte, et de quoi la démarrer.
@@ -2093,6 +2105,7 @@ async fn osm_link_status(
         client_id: osm_api::client_id(),
         authorize_url: osm_api::client_id()
             .map(|_| format!("{}/oauth2/authorize", osm_api::web_base())),
+        sandbox: osm_api::is_sandbox(),
     }))
 }
 
@@ -2166,6 +2179,7 @@ async fn osm_link_account(
         display_name: Some(account.display_name),
         client_id: osm_api::client_id(),
         authorize_url: None,
+        sandbox: osm_api::is_sandbox(),
     }))
 }
 

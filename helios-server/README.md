@@ -508,11 +508,30 @@ rien.
 |---|---|
 | `OSM_CLIENT_ID` | Application OAuth 2 déclarée sur openstreetmap.org. **Absente : la fonctionnalité est éteinte**, pas cassée |
 | `OSM_CLIENT_SECRET` | Facultatif — seulement si l'application est déclarée « confidentielle ». Sinon PKCE suffit |
-| `OSM_API_BASE` | Défaut `https://api.openstreetmap.org`. Mettre `https://api.dev.openstreetmap.org` pour essayer |
-| `OSM_WEB_BASE` | Défaut `https://www.openstreetmap.org` (pages OAuth, distinctes de l'API) |
+| `OSM_API_BASE` | Cible de l'API — voir le défaut ci-dessous |
+| `OSM_WEB_BASE` | Cible des pages OAuth (distinctes de l'API en production) |
 
-**Essayer sur le bac à sable d'abord.** Une erreur sur l'instance de production
-salit une base que des milliers de gens relisent à la main.
+Les variables se lisent aussi depuis un fichier **`.env`** à la racine, ignoré
+par git : un secret passé en ligne de commande resterait dans l'historique du
+shell et dans la liste des processus.
+
+**Un build de développement vise toujours le bac à sable**
+(`https://master.apis.dev.openstreetmap.org`, API *et* pages OAuth sur le même
+hôte), un build `--release` vise la production. Une variable explicite
+l'emporte dans les deux cas.
+
+Ce n'est pas un défaut de confort : une erreur sur l'instance de production
+salit une base que des milliers de gens relisent à la main, et les reverts s'y
+font aussi à la main. Le risque n'est pas symétrique — se tromper vers le bac à
+sable ne coûte qu'un essai à refaire.
+
+> `api.dev.openstreetmap.org` **ne répond pas**, malgré ce qu'on lit ici et là.
+> C'est bien `master.apis.dev.openstreetmap.org`, vérifié.
+
+**Une application OAuth appartient à son instance.** Un `client_id` déclaré sur
+`openstreetmap.org` est inconnu du bac à sable, et réciproquement : il faut en
+déclarer une de chaque côté, avec le même `redirect_uri`
+(`sunmap://osm-callback`).
 
 ### `DELETE /users/me`
 

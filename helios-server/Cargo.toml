@@ -18,6 +18,10 @@ serde = { version = "1", features = ["derive"] }
 jsonwebtoken = "9"
 
 serde_json = "1"
+# Charge `.env` au démarrage. Les secrets (jeton OSM, base de données) restent
+# ainsi hors de l'historique du shell et de la liste des processus, où une
+# variable passée en ligne de commande serait lisible par tout le monde.
+dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
 # PostGIS : la géométrie OSM vit en base, Overpass n'est plus sur le chemin
 # d'une requête client. `sqlx` en requêtes non vérifiées à la compilation
