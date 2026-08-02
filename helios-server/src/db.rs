@@ -62,6 +62,7 @@ pub async fn buildings_in_bbox(
                 rings,
                 height_m: r.get("height_m"),
                 height_from_osm: r.get("height_from_osm"),
+                leaf_type: None,
             })
         })
         .collect())
@@ -98,6 +99,7 @@ pub async fn buildings_page(
                 rings,
                 height_m: r.get("height_m"),
                 height_from_osm: r.get("height_from_osm"),
+                leaf_type: None,
             })
         })
         .collect())
@@ -111,7 +113,8 @@ pub async fn trees_in_bbox(
     e: f64,
 ) -> Result<Vec<Tree>, sqlx::Error> {
     let sql = format!(
-        "SELECT osm_id, height_m, crown_radius_m, ST_Y(geom) AS lat, ST_X(geom) AS lng \
+        "SELECT osm_id, height_m, crown_radius_m, leaf_type, \
+                ST_Y(geom) AS lat, ST_X(geom) AS lng \
          FROM trees WHERE geom && {}",
         envelope(s, w, n, e)
     );
@@ -125,6 +128,7 @@ pub async fn trees_in_bbox(
             lng: r.get("lng"),
             height_m: r.get("height_m"),
             crown_radius_m: r.get("crown_radius_m"),
+            leaf_type: crate::osm::LeafType::parse(r.get::<Option<String>, _>("leaf_type").as_deref()),
         })
         .collect())
 }
@@ -601,7 +605,7 @@ pub async fn woods_in_bbox(
     e: f64,
 ) -> Result<Vec<Wood>, sqlx::Error> {
     let sql = format!(
-        "SELECT osm_id, name, height_m, height_from_osm, ST_AsText(geom) AS wkt \
+        "SELECT osm_id, name, height_m, height_from_osm, leaf_type, ST_AsText(geom) AS wkt \
          FROM woods WHERE geom && {}",
         envelope(s, w, n, e)
     );
@@ -616,6 +620,9 @@ pub async fn woods_in_bbox(
                 name: r.get("name"),
                 height_m: r.get("height_m"),
                 height_from_osm: r.get("height_from_osm"),
+                leaf_type: Some(crate::osm::LeafType::parse(
+                    r.get::<Option<String>, _>("leaf_type").as_deref(),
+                )),
                 rings: Some(parse_multipolygon_wkt(&wkt)).filter(|r| !r.is_empty())?,
             })
         })
@@ -623,12 +630,13 @@ pub async fn woods_in_bbox(
 }
 
 const INSERT_WOOD: &str =
-    "INSERT INTO woods (osm_id, name, height_m, height_from_osm, geom) \
-     VALUES ($1, $2, $3, $4, \
-       ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromText($5, 4326)), 3))) \
+    "INSERT INTO woods (osm_id, name, height_m, height_from_osm, leaf_type, geom) \
+     VALUES ($1, $2, $3, $4, $5, \
+       ST_Multi(ST_CollectionExtract(ST_MakeValid(ST_GeomFromText($6, 4326)), 3))) \
      ON CONFLICT (osm_id) DO UPDATE SET \
        name = EXCLUDED.name, height_m = EXCLUDED.height_m, \
-       height_from_osm = EXCLUDED.height_from_osm, geom = EXCLUDED.geom";
+       height_from_osm = EXCLUDED.height_from_osm, leaf_type = EXCLUDED.leaf_type, \
+       geom = EXCLUDED.geom";
 
 /// Mêmes précautions que pour les bâtiments : par paquets, avec repli ligne à
 /// ligne — une emprise forestière auto-intersectée ne doit pas coûter la tuile.
@@ -645,6 +653,7 @@ pub async fn upsert_woods(pool: &PgPool, woods: &[Wood]) -> Result<u64, sqlx::Er
                 .bind(&w.name)
                 .bind(w.height_m)
                 .bind(w.height_from_osm)
+                .bind(w.leaf_type.map(|l| l.as_str()))
                 .bind(&wkt)
                 .execute(&mut *tx)
                 .await
@@ -668,6 +677,7 @@ pub async fn upsert_woods(pool: &PgPool, woods: &[Wood]) -> Result<u64, sqlx::Er
                     .bind(&w.name)
                     .bind(w.height_m)
                     .bind(w.height_from_osm)
+                    .bind(w.leaf_type.map(|l| l.as_str()))
                     .bind(&wkt)
                     .execute(pool)
                     .await
@@ -685,15 +695,16 @@ pub async fn upsert_trees(pool: &PgPool, trees: &[Tree]) -> Result<u64, sqlx::Er
         let mut tx = pool.begin().await?;
         for t in chunk {
             written += sqlx::query(
-                "INSERT INTO trees (osm_id, height_m, crown_radius_m, geom) \
-                 VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326)) \
+                "INSERT INTO trees (osm_id, height_m, crown_radius_m, leaf_type, geom) \
+                 VALUES ($1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326)) \
                  ON CONFLICT (osm_id) DO UPDATE SET \
                    height_m = EXCLUDED.height_m, crown_radius_m = EXCLUDED.crown_radius_m, \
-                   geom = EXCLUDED.geom",
+                   leaf_type = EXCLUDED.leaf_type, geom = EXCLUDED.geom",
             )
             .bind(&t.osm_id)
             .bind(t.height_m)
             .bind(t.crown_radius_m)
+            .bind(t.leaf_type.as_str())
             .bind(t.lng)
             .bind(t.lat)
             .execute(&mut *tx)

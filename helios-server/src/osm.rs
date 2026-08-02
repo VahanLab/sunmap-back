@@ -37,6 +37,9 @@ pub struct Building {
     pub height_m: f32,
     /// `false` = hauteur devinée, pas taggée dans OSM.
     pub height_from_osm: bool,
+    /// Renseigné pour une emprise boisée (`Wood` est un alias de ce type),
+    /// `None` pour un vrai bâtiment — un immeuble n'a pas de feuillage.
+    pub leaf_type: Option<LeafType>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +49,77 @@ pub struct Tree {
     pub lng: f64,
     pub height_m: f64,
     pub crown_radius_m: f64,
+    pub leaf_type: LeafType,
+}
+
+/// Silhouette de l'arbre, pour choisir le modèle 3D à l'affichage.
+///
+/// Trois classes et pas davantage : c'est ce que `leaf_type` distingue dans
+/// OSM, et c'est déjà ce qui décide de la silhouette vue de loin. Le genre
+/// (`genus`) est bien plus fin mais très inégalement rempli — il ne sert ici
+/// qu'à rattraper un `leaf_type` absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafType {
+    /// Feuillu, et repli par défaut : ~80 % des arbres urbains d'Europe.
+    Broadleaved,
+    Needleleaved,
+    Palm,
+}
+
+/// Genres à aiguilles les plus fréquents en Europe — l'ordre n'a pas
+/// d'importance, la comparaison est exacte et en minuscules.
+const NEEDLE_GENERA: &[&str] = &[
+    "pinus", "picea", "abies", "cedrus", "larix", "pseudotsuga", "taxus", "thuja",
+    "cupressus", "chamaecyparis", "juniperus", "sequoia", "sequoiadendron", "tsuga",
+    "cryptomeria", "metasequoia", "calocedrus",
+];
+
+/// Palmiers d'ornement du pourtour méditerranéen.
+const PALM_GENERA: &[&str] = &[
+    "phoenix", "washingtonia", "trachycarpus", "chamaerops", "butia", "livistona",
+    "syagrus", "howea", "cocos", "sabal",
+];
+
+impl LeafType {
+    /// Depuis les tags OSM : `leaf_type` d'abord (le tag prévu pour ça), puis
+    /// repli sur le genre — les imports municipaux français (Paris, Lyon,
+    /// Bordeaux) renseignent souvent `genus`/`species` sans `leaf_type`.
+    pub fn from_tags(tags: &HashMap<String, String>) -> Self {
+        match tags.get("leaf_type").map(String::as_str) {
+            Some("needleleaved") => return Self::Needleleaved,
+            Some("palm") => return Self::Palm,
+            Some("broadleaved") => return Self::Broadleaved,
+            _ => {}
+        }
+        // `species` commence par le genre ("Pinus nigra") : le premier mot
+        // suffit dans les deux cas.
+        let genus = tags
+            .get("genus")
+            .or_else(|| tags.get("species"))
+            .map(|g| g.split_whitespace().next().unwrap_or("").to_lowercase());
+        match genus.as_deref() {
+            Some(g) if NEEDLE_GENERA.contains(&g) => Self::Needleleaved,
+            Some(g) if PALM_GENERA.contains(&g) => Self::Palm,
+            _ => Self::Broadleaved,
+        }
+    }
+
+    /// Valeur stockée en base et relue telle quelle.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Broadleaved => "broadleaved",
+            Self::Needleleaved => "needleleaved",
+            Self::Palm => "palm",
+        }
+    }
+
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw {
+            Some("needleleaved") => Self::Needleleaved,
+            Some("palm") => Self::Palm,
+            _ => Self::Broadleaved,
+        }
+    }
 }
 
 /// Catégories d'établissements retenues.
@@ -235,6 +309,7 @@ pub fn building_from(
         rings,
         height_m: tagged.unwrap_or(f32::NAN),
         height_from_osm: tagged.is_some(),
+        leaf_type: None,
     })
 }
 
@@ -293,6 +368,7 @@ pub fn wood_from(
         rings,
         height_m: tagged.unwrap_or_else(|| default_canopy_height(tags)) as f32,
         height_from_osm: tagged.is_some(),
+        leaf_type: Some(LeafType::from_tags(tags)),
     })
 }
 
@@ -315,6 +391,7 @@ pub fn tree_from(osm_id: String, lat: f64, lng: f64, tags: &HashMap<String, Stri
         lng,
         height_m,
         crown_radius_m,
+        leaf_type: LeafType::from_tags(tags),
     }
 }
 

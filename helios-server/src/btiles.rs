@@ -270,6 +270,9 @@ fn decode_tile(
                 rings,
                 height_m,
                 height_from_osm,
+                // Les tuiles ne portent que des bâtiments — la végétation a
+                // ses propres tuiles (`canopy_tiles`).
+                leaf_type: None,
             });
         }
     }
@@ -293,6 +296,7 @@ mod tests {
             ]],
             height_m: 12.5,
             height_from_osm: true,
+            leaf_type: None,
         }
     }
 

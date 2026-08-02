@@ -1,0 +1,2 @@
+ALTER TABLE trees DROP COLUMN IF EXISTS leaf_type;
+ALTER TABLE woods DROP COLUMN IF EXISTS leaf_type;

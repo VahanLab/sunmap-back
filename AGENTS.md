@@ -59,22 +59,20 @@ Fonctionnalités cibles :
   (`Place.reclassified(at:)`) à chaque cran du slider — zéro requête tant
   qu'on reste sur la même journée et la même zone ; une requête `/places`
   par (zone, jour). La nuit se déduit de l'élévation solaire locale.
-- Végétation visuelle, **partage par classe et par zoom** : arbres isolés =
-  modèles 3D du style Mapbox Standard (leur donnée) ; emprises boisées =
-  nos **bosquets 3D** dès z15, implantés depuis les tuiles de canopée
-  (`/canopy/{z}/{x}/{y}`, canal B = marqueur d'emprise) ; sous z15, le
-  masque Metal ombre toute la canopée par transmittance. Détail :
-  `ios/SunMap/AGENTS.md` § « Végétation, partage du rendu ».
+- Végétation visuelle **entièrement maison** (les arbres 3D du style Mapbox
+  sont éteints) : arbres isolés et bosquets d'emprises boisées, silhouette
+  choisie par `leaf_type` (feuillu / conifère / palmier), implantés dès z15
+  depuis les tuiles de canopée (`/canopy/{z}/{x}/{y}`, canal B = classe) ;
+  sous z15, le masque Metal ombre toute la canopée par transmittance.
+  Détail : `ios/SunMap/AGENTS.md` § « Végétation, partage du rendu ».
 
 **Écarts rendu/calcul assumés (et leurs limites connues).**
 - Les ombres visibles (Mapbox) et la classification (notre DSM) ne viennent
   pas des mêmes données pour les bâtiments : désaccords possibles en bord
   d'ombre.
-- **Arbres isolés** : le rendu (snapshot Mapbox) et le calcul (notre base
-  `trees`) peuvent diverger — un lieu classé à l'ombre d'un arbre que la
-  carte ne montre pas. Les emprises boisées, elles, sont désormais rendues
-  ET calculées depuis nos données (tuiles de canopée) — écart résorbé sur
-  les forêts.
+- **Végétation : écart résorbé.** Arbres isolés comme emprises boisées sont
+  désormais rendus ET calculés depuis nos données (tables `trees`/`woods`,
+  servies en tuiles de canopée) — ce qu'on voit est ce qui fait l'ombre.
 
 ## Décisions d'architecture (historique et état actuel)
 
@@ -164,7 +162,10 @@ Fonctionnalités cibles :
   platane passait de « soleil l'après-midi » à « 0 h par jour » avec le
   tamponnage opaque (`node/653366336`). Hauteurs : tag `height` s'il existe,
   sinon repli par type (futaie 18 m, alignement 12 m, broussailles 3 m) —
-  63 % des arbres portent la valeur par défaut de 10 m.
+  63 % des arbres portent la valeur par défaut de 10 m. **Silhouette** :
+  tag `leaf_type` (`broadleaved`/`needleleaved`/`palm`), à défaut déduite du
+  `genus`/`species` — les imports municipaux français renseignent souvent le
+  genre sans le type de feuillage. Sert à choisir le modèle 3D côté client.
   Étapes suivantes : hauteur réelle (Meta/WRI CHM ou IGN MNH), τ saisonnier
   par `leaf_type` (feuillu d'hiver quasi transparent). Note : `Shaders.metal`
   (port client de `shadow.rs`) n'a pas la logique canopée — la DSM client est

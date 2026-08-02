@@ -46,10 +46,25 @@ pub struct CanopyTile {
     pub top: Vec<f32>,
     pub base: Vec<f32>,
     /// Pixel couvert par une **emprise boisée** (`woods`), par opposition à
-    /// un arbre isolé (`natural=tree`). C'est la frontière de partage du
-    /// rendu : le client pose ses bosquets 3D sur les emprises, Mapbox garde
-    /// ses arbres isolés — les deux ne se doublonnent jamais.
+    /// un arbre isolé (`natural=tree`). Décide du modèle 3D posé côté client :
+    /// bosquet sur une emprise, arbre seul sinon.
     pub wood: Vec<bool>,
+    /// Silhouette dominante du pixel (0 feuillu, 1 conifère, 2 palmier) —
+    /// celle de la végétation la plus haute qui l'occupe.
+    pub leaf: Vec<u8>,
+}
+
+/// Code du canal B : `0` = pas de canopée, sinon
+/// `40 × (1 + type de feuillage + 3 × emprise boisée)`.
+///
+/// Valeurs espacées de 40 et décodées au multiple le plus proche : le PNG est
+/// sans perte, mais il traverse un contexte CoreGraphics côté client — un
+/// champ de bits serait corrompu par le moindre décalage d'un LSB, un
+/// intervalle de 40 ne l'est pas.
+pub const CLASS_STEP: u8 = 40;
+
+fn class_code(wood: bool, leaf: u8) -> u8 {
+    CLASS_STEP * (1 + leaf + if wood { 3 } else { 0 })
 }
 
 pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> CanopyTile {
@@ -71,6 +86,7 @@ pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> 
     let mut top = vec![0.0f32; TILE_SIZE * TILE_SIZE];
     let mut base = vec![0.0f32; TILE_SIZE * TILE_SIZE];
     let mut wood_mask = vec![false; TILE_SIZE * TILE_SIZE];
+    let mut leaf = vec![0u8; TILE_SIZE * TILE_SIZE];
 
     // Bois : remplissage scanline pair-impair, tous anneaux ensemble — une
     // clairière (anneau intérieur) rebascule en « dehors » et reste creuse.
@@ -116,6 +132,7 @@ pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> 
                     if wood.height_m > top[i] {
                         top[i] = wood.height_m;
                         base[i] = 0.0;
+                        leaf[i] = wood.leaf_type.map(leaf_code).unwrap_or(0);
                     }
                 }
             }
@@ -151,22 +168,35 @@ pub fn rasterize(z: u32, x: u32, y: u32, woods: &[Building], trees: &[Tree]) -> 
                 if t_top > top[i] {
                     top[i] = t_top;
                     base[i] = if had_canopy { base[i].min(t_base) } else { t_base };
+                    leaf[i] = leaf_code(t.leaf_type);
                 }
             }
         }
     }
 
-    CanopyTile { top, base, wood: wood_mask }
+    CanopyTile { top, base, wood: wood_mask, leaf }
 }
 
-/// Encode la tuile en PNG RGB (R = sommet ×2, G = base ×2, B = 255 sur les
-/// emprises boisées — la frontière de partage bosquets/arbres du rendu).
+fn leaf_code(l: crate::osm::LeafType) -> u8 {
+    match l {
+        crate::osm::LeafType::Broadleaved => 0,
+        crate::osm::LeafType::Needleleaved => 1,
+        crate::osm::LeafType::Palm => 2,
+    }
+}
+
+/// Encode la tuile en PNG RGB : R = sommet ×2, G = base ×2, B = classe de
+/// végétation (cf. `class_code`) — emprise ou arbre isolé, et silhouette.
 pub fn encode_png(tile: &CanopyTile) -> Result<Vec<u8>, image::ImageError> {
     let mut rgb = vec![0u8; TILE_SIZE * TILE_SIZE * 3];
     for i in 0..TILE_SIZE * TILE_SIZE {
         rgb[i * 3] = (tile.top[i] * 2.0).round().clamp(0.0, 255.0) as u8;
         rgb[i * 3 + 1] = (tile.base[i] * 2.0).round().clamp(0.0, 255.0) as u8;
-        rgb[i * 3 + 2] = if tile.wood[i] { 255 } else { 0 };
+        rgb[i * 3 + 2] = if tile.top[i] > 0.0 {
+            class_code(tile.wood[i], tile.leaf[i])
+        } else {
+            0
+        };
     }
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out).write_image(
@@ -206,6 +236,7 @@ mod tests {
             lng: lon,
             height_m: 10.0,
             crown_radius_m: 3.0,
+            leaf_type: crate::osm::LeafType::Broadleaved,
         };
         let tile = rasterize(15, 16596, 11273, &[], &[tree]);
         let lit: Vec<usize> = (0..tile.top.len()).filter(|&i| tile.top[i] > 0.0).collect();
@@ -221,6 +252,7 @@ mod tests {
             top: vec![0.0; TILE_SIZE * TILE_SIZE],
             base: vec![0.0; TILE_SIZE * TILE_SIZE],
             wood: vec![false; TILE_SIZE * TILE_SIZE],
+            leaf: vec![0; TILE_SIZE * TILE_SIZE],
         };
         tile.top[42] = 18.0;
         tile.base[42] = 2.5;
@@ -230,7 +262,7 @@ mod tests {
         let px = img.get_pixel(42, 0);
         assert_eq!(px[0], 36, "sommet ×2");
         assert_eq!(px[1], 5, "base ×2");
-        assert_eq!(px[2], 255, "marqueur d'emprise boisée");
+        assert_eq!(px[2], class_code(true, 0), "emprise boisée feuillue");
         // Une tuile quasi vide doit rester minuscule une fois compressée.
         assert!(png.len() < 10_000, "PNG creux : {} octets", png.len());
     }
