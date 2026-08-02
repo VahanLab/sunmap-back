@@ -34,8 +34,25 @@ vierge est initialisée au premier lancement de l'API.
 1. VM OVH (b2-7 ou équivalent : le ray marching est CPU, 2 vCPU suffisent au
    début, la RAM sert surtout aux caches de tuiles — 4 Go confortable).
 2. Installer Docker + le plugin compose (`curl -fsSL https://get.docker.com | sh`).
-3. Cloner le repo, copier `.env.example` en `.env`, remplir `DATABASE_URL`.
+3. Cloner le repo, copier `.env.example` en `.env`, remplir `DATABASE_URL` —
+   et `OSM_CLIENT_ID` / `OSM_CLIENT_SECRET` si la remontée vers OpenStreetMap
+   doit être active (sinon elle reste éteinte, pas cassée).
 4. `docker compose up -d --build`.
+
+`.env` **vit sur la VM et n'est jamais versionné**. Le workflow de déploiement
+n'y réécrit que `API_IMAGE` et `API_TAG` : les secrets qu'on y met à la main y
+restent d'un déploiement à l'autre.
+
+L'image étant construite en `--release`, elle vise **la production OSM**. Pour
+un déploiement de recette, pointer explicitement le bac à sable dans `.env` :
+
+```
+OSM_API_BASE=https://master.apis.dev.openstreetmap.org
+OSM_WEB_BASE=https://master.apis.dev.openstreetmap.org
+```
+
+Une application OAuth appartient à son instance : celle du bac à sable et celle
+de production sont deux déclarations distinctes, avec deux `client_id`.
 
 Pare-feu OVH (ou `ufw`) : ouvrir 80 et 443 au monde, **restreindre 81**
 (admin du proxy) à son IP, fermer tout le reste — 8080 n'est pas publié sur

@@ -25,6 +25,17 @@ services:
       # Tuiles bâtiments (format HBT, cf. docs/deploiement-ovh.md §4).
       # Vide ou absent : lecture PostGIS classique — c'est le rollback.
       BUILDINGS_TILES: ${BUILDINGS_TILES:-}
+      # Application OAuth 2 OpenStreetMap : c'est le serveur qui échange le
+      # code et garde le jeton d'écriture, donc c'est lui qui a besoin de ces
+      # deux valeurs. Vides : la liaison OSM est éteinte, pas cassée.
+      OSM_CLIENT_ID: ${OSM_CLIENT_ID:-}
+      OSM_CLIENT_SECRET: ${OSM_CLIENT_SECRET:-}
+      # Cible OSM. Vides, l'image étant construite en `--release`, le serveur
+      # vise la PRODUCTION. Renseigner le bac à sable
+      # (https://master.apis.dev.openstreetmap.org, API et pages OAuth sur le
+      # même hôte) pour un déploiement de recette.
+      OSM_API_BASE: ${OSM_API_BASE:-}
+      OSM_WEB_BASE: ${OSM_WEB_BASE:-}
     volumes:
       # Fichiers de tuiles générés par `tilebuild`, sur le disque de la VM —
       # gros (Go), statiques, rien à faire dans une image ou un volume nommé.
