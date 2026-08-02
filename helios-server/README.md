@@ -318,6 +318,37 @@ Volume à connaître avant d'afficher : ~49 500 bancs et ~2 900 tables pour la
 seule Île-de-France. Le client les laisse **éteints par défaut** — des milliers
 de pastilles par arrondissement noieraient les établissements.
 
+### `GET /users/username/available`
+
+Le pseudo est-il libre ? Sans authentification — c'est une question sur l'état
+du monde, pas sur un compte.
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `username` | string | oui | Le pseudo à tester |
+
+```json
+{ "available": false, "reason": "pseudo déjà pris" }
+```
+
+`reason` est absent quand le pseudo est libre. Une forme invalide répond `200`
+avec `available: false` et sa raison, **pas** `400` : c'est une question, et
+« non, parce que la forme est invalide » en est une réponse valable — un `400`
+forcerait le client à traiter une saisie en cours comme une erreur réseau.
+
+La comparaison est insensible à la casse (colonne `username_key`), donc
+`Karl` et `karl` sont le même pseudo.
+
+**Indicatif, jamais une réservation.** Entre cette réponse et le `PUT`,
+quelqu'un peut prendre le même pseudo : c'est la contrainte d'unicité en base
+qui tranche, et le `409` de `PUT /users/username` qui fait foi. Cet endpoint
+n'existe que pour le confort de saisie.
+
+Le compte connecté n'est pas exclu du test : redemander son propre pseudo
+répond `available: false`. C'est voulu — le client désactive de toute façon la
+validation quand rien n'a changé, et prétendre le contraire ferait croire à un
+renommage qui n'en est pas un.
+
 ### `GET /users/me/profile` · `GET /users/{username}/profile`
 
 Profil d'un contributeur : son palier, son avancement, ses signalements. Le

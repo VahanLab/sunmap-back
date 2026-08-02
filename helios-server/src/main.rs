@@ -149,6 +149,7 @@ async fn main() {
         .route("/users/me/profile", get(current_profile))
         .route("/users/me/contributions", get(current_contributions))
         .route("/users/username", put(set_username))
+        .route("/users/username/available", get(username_availability))
         .route("/users/username/suggestions", get(username_suggestions))
         // Après les routes littérales : sinon `/users/me` tomberait dans le
         // motif et on chercherait un compte au pseudo « me ».
@@ -2028,6 +2029,60 @@ async fn set_username(
         Ok(Err(_)) => Err((StatusCode::CONFLICT, "pseudo déjà pris".into())),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}"))),
     }
+}
+
+#[derive(Deserialize)]
+struct UsernameAvailabilityQuery {
+    username: String,
+}
+
+#[derive(Serialize)]
+struct UsernameAvailabilityResponse {
+    available: bool,
+    /// Pourquoi le pseudo est refusé — forme invalide ou déjà pris. `None`
+    /// quand il est libre.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+/// Le pseudo est-il libre ?
+///
+/// **Indicatif, jamais une réservation.** Entre cette réponse et le `PUT`,
+/// quelqu'un d'autre peut prendre le même pseudo : c'est la contrainte
+/// d'unicité en base qui tranche, et le 409 de `PUT /users/username` qui fait
+/// foi. Cet endpoint n'existe que pour le confort de saisie — dire « déjà
+/// pris » pendant qu'on tape vaut mieux que de le découvrir en validant.
+///
+/// Le compte connecté n'est pas exclu du test : redemander son propre pseudo
+/// répond donc `available: false`. C'est voulu — l'app désactive de toute façon
+/// la validation quand rien n'a changé, et prétendre le contraire ferait
+/// croire à un renommage qui n'en est pas un.
+async fn username_availability(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<UsernameAvailabilityQuery>,
+) -> Result<Json<UsernameAvailabilityResponse>, (StatusCode, String)> {
+    let username = match username::validate(&q.username) {
+        Ok(name) => name,
+        // 200 et non 400 : c'est une question, et « non, parce que la forme
+        // est invalide » en est une réponse valable. Un 400 obligerait l'app à
+        // traiter la saisie en cours comme une erreur réseau.
+        Err(e) => {
+            return Ok(Json(UsernameAvailabilityResponse {
+                available: false,
+                reason: Some(e.message()),
+            }))
+        }
+    };
+
+    let taken = db::user_by_username(&state.pool, &username)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?
+        .is_some();
+
+    Ok(Json(UsernameAvailabilityResponse {
+        available: !taken,
+        reason: taken.then(|| "pseudo déjà pris".to_string()),
+    }))
 }
 
 #[derive(Serialize)]
