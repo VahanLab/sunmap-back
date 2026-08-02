@@ -145,13 +145,15 @@ async fn main() {
         .route("/places/furniture", post(add_furniture).put(edit_furniture))
         .route("/places/furniture/contributions", get(furniture_contributions))
         .route("/places/terrace/contributions", get(terrace_contributions))
-        .route("/users/me", get(current_user))
+        .route("/users/me", get(current_user).delete(delete_current_user))
         .route("/users/me/profile", get(current_profile))
+        .route("/users/me/contributions", get(current_contributions))
         .route("/users/username", put(set_username))
         .route("/users/username/suggestions", get(username_suggestions))
         // Après les routes littérales : sinon `/users/me` tomberait dans le
         // motif et on chercherait un compte au pseudo « me ».
         .route("/users/{username}/profile", get(user_profile))
+        .route("/users/{username}/contributions", get(user_contributions))
         .route("/trees", get(trees))
         .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
         .route("/sun-hours", get(sun_hours))
@@ -2072,13 +2074,21 @@ async fn username_suggestions(
 
 // ------------------------------------------------------------------ profils
 
-/// Nombre de contributions listées sur un profil.
+/// Contributions jointes au profil : un aperçu, pas la liste.
 ///
-/// Plafond et non pagination : au-delà, la liste n'est plus consultée mais
-/// parcourue, et c'est le compteur — qui, lui, n'est pas plafonné — qui porte
-/// l'information. Une pagination viendra si quelqu'un dépasse vraiment ce
-/// volume.
-const PROFILE_CONTRIBUTIONS_LIMIT: i64 = 200;
+/// Le profil sert à situer quelqu'un — son palier, son avancement — et quelques
+/// lignes suffisent à l'illustrer. La liste complète a son propre écran et son
+/// propre endpoint paginé (`/users/{…}/contributions`) : la charger d'office
+/// ferait payer à chaque ouverture de profil un volume que presque personne ne
+/// déroule.
+const PROFILE_CONTRIBUTIONS_PREVIEW: i64 = 5;
+
+/// Taille de page par défaut de la liste complète.
+const CONTRIBUTIONS_PAGE_SIZE: i64 = 25;
+
+/// Plafond dur d'une page, quoi que demande le client : au-delà, une requête
+/// suffit à mobiliser la base pour un écran que personne ne lira d'un coup.
+const CONTRIBUTIONS_MAX_PAGE_SIZE: i64 = 100;
 
 #[derive(Serialize)]
 struct ProfileResponse {
@@ -2093,8 +2103,16 @@ struct ProfileResponse {
     remaining_to_next: i64,
     /// Avancement dans le palier courant, de 0 à 1.
     progress: f64,
-    /// Tronquée à `PROFILE_CONTRIBUTIONS_LIMIT`, contrairement au compteur.
+    /// Aperçu seulement — `PROFILE_CONTRIBUTIONS_PREVIEW` lignes au plus. La
+    /// suite se demande à `/users/{…}/contributions`.
     contributions: Vec<ContributionPayload>,
+    /// Total **affichable**, celui que la liste paginée sait réellement
+    /// atteindre. Il diffère de `contribution_count` quand un établissement a
+    /// disparu d'OSM depuis la contribution : le palier compte celle-ci, la
+    /// liste ne peut pas la montrer. C'est ce nombre-là qui décide d'afficher
+    /// « Voir plus », sinon le bouton mènerait à une liste plus courte que
+    /// promis.
+    listable_count: i64,
 }
 
 #[derive(Serialize)]
@@ -2157,9 +2175,13 @@ async fn build_profile(
     let count = db::contribution_count(&state.pool, &user.uid)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
-    let records = db::contributions_by_user(&state.pool, &user.uid, PROFILE_CONTRIBUTIONS_LIMIT)
+    let listable_count = db::listable_contribution_count(&state.pool, &user.uid)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    let records =
+        db::contributions_by_user(&state.pool, &user.uid, PROFILE_CONTRIBUTIONS_PREVIEW, 0)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
 
     let progress = tiers::Progress::of(count);
     Ok(ProfileResponse {
@@ -2171,17 +2193,83 @@ async fn build_profile(
         progress: progress.fraction,
         contributions: records
             .into_iter()
-            .map(|r| ContributionPayload {
-                category_label: r.amenity.as_deref().map(|a| i18n::amenity_label(a, lang)),
-                osm_id: r.osm_id,
-                name: r.name,
-                amenity: r.amenity,
-                has_terrace: r.has_terrace,
-                lat: r.lat,
-                lng: r.lng,
-                updated_at: r.updated_at.to_rfc3339(),
-            })
+            .map(|r| contribution_payload(r, lang))
             .collect(),
+        listable_count,
+    })
+}
+
+/// Conversion enregistrement → charge utile, partagée par le profil et la liste
+/// paginée : deux formes différentes de la même ligne divergeraient au premier
+/// champ ajouté.
+fn contribution_payload(r: db::ContributionRecord, lang: Lang) -> ContributionPayload {
+    ContributionPayload {
+        category_label: r.amenity.as_deref().map(|a| i18n::amenity_label(a, lang)),
+        osm_id: r.osm_id,
+        name: r.name,
+        amenity: r.amenity,
+        has_terrace: r.has_terrace,
+        lat: r.lat,
+        lng: r.lng,
+        updated_at: r.updated_at.to_rfc3339(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ContributionsQuery {
+    lang: Option<String>,
+    /// Numéro de page, à partir de 1. Une valeur absurde (0, négative) est
+    /// ramenée à la première page plutôt que refusée : c'est une liste, pas un
+    /// virement.
+    page: Option<i64>,
+    per_page: Option<i64>,
+}
+
+impl ContributionsQuery {
+    /// `(limit, offset)` assainis.
+    fn window(&self) -> (i64, i64) {
+        let per_page = self
+            .per_page
+            .unwrap_or(CONTRIBUTIONS_PAGE_SIZE)
+            .clamp(1, CONTRIBUTIONS_MAX_PAGE_SIZE);
+        let page = self.page.unwrap_or(1).max(1);
+        (per_page, (page - 1) * per_page)
+    }
+}
+
+#[derive(Serialize)]
+struct ContributionsPage {
+    items: Vec<ContributionPayload>,
+    /// Total affichable, pour que le client sache dimensionner sans avoir à
+    /// deviner d'après la dernière page reçue.
+    total: i64,
+    /// Épargne au client le calcul `offset + items.len() < total`, et surtout
+    /// le fait de devoir le refaire juste s'il change de taille de page.
+    has_more: bool,
+}
+
+/// Liste paginée des contributions d'un compte, du plus récent au plus ancien.
+async fn contributions_page(
+    state: &Arc<AppState>,
+    uid: &str,
+    q: &ContributionsQuery,
+) -> Result<ContributionsPage, (StatusCode, String)> {
+    let (limit, offset) = q.window();
+    let lang = Lang::parse(q.lang.as_deref());
+    let total = db::listable_contribution_count(&state.pool, uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    let records = db::contributions_by_user(&state.pool, uid, limit, offset)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+
+    Ok(ContributionsPage {
+        has_more: (offset + records.len() as i64) < total,
+        items: records
+            .into_iter()
+            .map(|r| contribution_payload(r, lang))
+            .collect(),
+        total,
     })
 }
 
@@ -2224,4 +2312,59 @@ async fn user_profile(
         .ok_or((StatusCode::NOT_FOUND, "pseudo inconnu".to_string()))?;
     let profile = build_profile(&state, user, Lang::parse(q.lang.as_deref())).await?;
     Ok(Json(profile))
+}
+
+/// Liste paginée des contributions du compte connecté.
+async fn current_contributions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<ContributionsQuery>,
+) -> Result<Json<ContributionsPage>, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    let page = contributions_page(&state, &identity.uid, &q).await?;
+    Ok(Json(page))
+}
+
+/// Liste paginée des contributions d'un contributeur, désigné par son pseudo.
+///
+/// Sans authentification, comme le profil public qui y mène : ce sont les mêmes
+/// contributions, faites pour être vues.
+async fn user_contributions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(username): axum::extract::Path<String>,
+    Query(q): Query<ContributionsQuery>,
+) -> Result<Json<ContributionsPage>, (StatusCode, String)> {
+    let user = db::user_by_username(&state.pool, &username)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?
+        .ok_or((StatusCode::NOT_FOUND, "pseudo inconnu".to_string()))?;
+    let page = contributions_page(&state, &user.uid, &q).await?;
+    Ok(Json(page))
+}
+
+/// Supprime le compte connecté.
+///
+/// Ne touche qu'à **notre** base : l'identité Firebase, elle, est supprimée par
+/// le client, seul à pouvoir le faire — le serveur ne fait que vérifier des
+/// jetons signés (cf. `auth.rs`), il n'a pas de SDK Admin et n'appelle jamais
+/// Firebase. L'ordre côté client est donc : cet appel d'abord, tant que le
+/// jeton est valable, la suppression Firebase ensuite.
+///
+/// Idempotent : supprimer un compte déjà parti renvoie 204, pas 404. Un client
+/// qui réessaie après une coupure réseau ne doit pas se voir refuser un état
+/// qu'il a justement atteint.
+async fn delete_current_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let identity = authenticate(&state, &headers).await?;
+    let existed = db::delete_user(&state.pool, &identity.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    println!(
+        "[account] suppression {} ({})",
+        identity.uid,
+        if existed { "compte effacé" } else { "déjà absent" }
+    );
+    Ok(StatusCode::NO_CONTENT)
 }

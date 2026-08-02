@@ -949,16 +949,62 @@ pub async fn contribution_count(pool: &PgPool, uid: &str) -> Result<i64, sqlx::E
         .await
 }
 
+/// Nombre de contributions **affichables**, c'est-à-dire dont l'établissement
+/// existe encore.
+///
+/// Distinct de `contribution_count`, et pas par excès de zèle : ce dernier
+/// compte tout, y compris les contributions dont l'établissement a disparu
+/// d'OSM depuis, que `contributions_by_user` écarte par son `JOIN`. Servir le
+/// total brut comme total de pagination promettrait des pages qu'on n'atteint
+/// jamais — le défilement s'arrêterait sur un chargement perpétuel.
+pub async fn listable_contribution_count(pool: &PgPool, uid: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM place_terraces t \
+         JOIN places p USING (osm_id) \
+         WHERE t.user_uid = $1",
+    )
+    .bind(uid)
+    .fetch_one(pool)
+    .await
+}
+
+/// Supprime le compte, et lui seul.
+///
+/// Les contributions **restent** : toutes les clés étrangères qui pointent sur
+/// `users(uid)` sont en `ON DELETE SET NULL` (cf. `schema.sql`), donc les
+/// terrasses signalées, le mobilier ajouté et les historiques survivent,
+/// simplement désolidarisés de leur auteur. C'est voulu — les effacer
+/// dégraderait la carte de tout le monde pour le départ d'une personne, alors
+/// que ce qui est personnel (le pseudo, le lien vers l'identité Firebase) part
+/// bien avec la ligne.
+///
+/// Renvoie `false` si aucun compte ne portait cet uid : supprimer deux fois
+/// n'est pas une erreur, l'état visé est atteint dans les deux cas.
+pub async fn delete_user(pool: &PgPool, uid: &str) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM users WHERE uid = $1")
+        .bind(uid)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Établissements auxquels un compte a contribué, du plus récent au plus ancien.
 ///
 /// `JOIN places` et non `LEFT JOIN` : une contribution dont l'établissement a
 /// disparu d'OSM depuis n'a plus rien à montrer — ni nom, ni catégorie, ni
 /// position. Elle reste comptée dans le total, mais n'a pas sa place dans une
 /// liste dont chaque ligne est censée être cliquable.
+///
+/// Tri sur `(updated_at, osm_id)` et non sur la seule date : deux contributions
+/// enregistrées dans la même transaction partagent la même horodate, et
+/// PostgreSQL est alors libre de les rendre dans un ordre différent d'une page
+/// à l'autre — de quoi voir une ligne deux fois et en perdre une autre au
+/// défilement. `osm_id` est unique par utilisateur, il tranche donc toujours.
 pub async fn contributions_by_user(
     pool: &PgPool,
     uid: &str,
     limit: i64,
+    offset: i64,
 ) -> Result<Vec<ContributionRecord>, sqlx::Error> {
     Ok(sqlx::query(
         "SELECT t.osm_id, t.has_terrace, t.updated_at, \
@@ -966,11 +1012,12 @@ pub async fn contributions_by_user(
          FROM place_terraces t \
          JOIN places p USING (osm_id) \
          WHERE t.user_uid = $1 \
-         ORDER BY t.updated_at DESC \
-         LIMIT $2",
+         ORDER BY t.updated_at DESC, t.osm_id DESC \
+         LIMIT $2 OFFSET $3",
     )
     .bind(uid)
     .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await?
     .into_iter()

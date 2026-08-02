@@ -352,7 +352,8 @@ vues.
       "has_terrace": true, "lat": 48.8426051, "lng": 2.2779253,
       "updated_at": "2026-07-29T10:19:17.507222+00:00"
     }
-  ]
+  ],
+  "listable_count": 5
 }
 ```
 
@@ -361,12 +362,76 @@ seuils bougeront avec l'usage, et une app déjà installée afficherait sinon
 l'ancien. Le client n'accroche son décor qu'à `key`, jamais au libellé traduit.
 
 `next_tier` est absent au sommet du barème, `remaining_to_next` vaut alors `0` et
-`progress` vaut `1`. `contribution_count` est le total réel ; `contributions` est
-tronquée à 200 — le compteur, lui, ne l'est jamais, puisque c'est lui qui décide
-du palier.
+`progress` vaut `1`.
+
+**Trois nombres, et ils ne disent pas la même chose.** `contribution_count` est
+le total réel, celui qui décide du palier. `contributions` n'est qu'un **aperçu
+de 5 lignes** — la liste complète a son endpoint paginé ci-dessous.
+`listable_count` est le total que cette liste sait réellement atteindre : il est
+plus petit dès qu'un établissement a disparu d'OSM depuis la contribution, que
+le palier compte mais que la liste ne peut plus montrer (elle joint `places`).
+C'est `listable_count` qui doit décider d'afficher un « Voir plus », sinon le
+bouton mènerait à une liste plus courte qu'annoncé.
 
 `404` si le pseudo est inconnu, ou si le compte du jeton n'a pas encore choisi le
 sien.
+
+### `GET /users/me/contributions` · `GET /users/{username}/contributions`
+
+Liste complète et paginée des signalements, du plus récent au plus ancien. Même
+partage que les profils : le premier lit le jeton, le second est public.
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `page` | int | non | À partir de `1` (défaut). Une valeur absurde retombe sur la première page |
+| `per_page` | int | non | `25` par défaut, borné à `100` |
+| `lang` | string | non | `fr` (défaut) ou `en` |
+
+```json
+{
+  "items": [
+    {
+      "osm_id": "node/2267752285", "name": "Epifani",
+      "amenity": "restaurant", "category_label": "Restaurant",
+      "has_terrace": true, "lat": 48.8426051, "lng": 2.2779253,
+      "updated_at": "2026-07-29T10:19:17.507222+00:00"
+    }
+  ],
+  "total": 42,
+  "has_more": true
+}
+```
+
+Le tri porte sur `(updated_at, osm_id)` et pas sur la seule date : deux
+contributions enregistrées dans la même transaction partagent la même horodate,
+et PostgreSQL est alors libre de les rendre dans un ordre différent d'une page à
+l'autre — de quoi voir une ligne deux fois et en perdre une autre au
+défilement.
+
+`total` est le même `listable_count` que le profil. `has_more` évite au client
+de recalculer `offset + len < total`, et surtout d'avoir à le refaire s'il
+change de taille de page.
+
+### `DELETE /users/me`
+
+Supprime le compte du jeton. `204` en cas de succès.
+
+**Ne touche qu'à notre base.** L'identité Firebase est supprimée par le client,
+seul à pouvoir le faire : le serveur ne fait que vérifier des jetons signés
+(cf. `src/auth.rs`), il n'a pas de SDK Admin et n'appelle jamais Firebase.
+L'ordre côté client est donc cet appel d'abord, tant que le jeton est valable,
+puis la suppression Firebase.
+
+**Les contributions restent.** Toutes les clés étrangères vers `users(uid)` sont
+en `ON DELETE SET NULL` : terrasses signalées, mobilier ajouté et historiques
+survivent, simplement désolidarisés de leur auteur. Les effacer dégraderait la
+carte de tout le monde pour le départ d'une personne, alors que ce qui est
+personnel — le pseudo, le lien vers l'identité Firebase — part bien avec la
+ligne.
+
+Idempotent : supprimer un compte déjà parti renvoie `204`, pas `404`. Un client
+qui réessaie après une coupure réseau ne doit pas se voir refuser l'état qu'il
+vient justement d'atteindre.
 
 ### `GET /trees`
 
