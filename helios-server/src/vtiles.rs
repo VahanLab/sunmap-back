@@ -126,8 +126,10 @@ impl VectorStore {
         self.zoom
     }
 
-    /// Octets MVT (décompressés) de la tuile, `None` si elle est vide.
-    fn tile_bytes(&self, x: u32, y: u32) -> std::io::Result<Option<Vec<u8>>> {
+    /// Octets de la tuile **tels que stockés** (gzip chez notre générateur),
+    /// `None` si elle est vide. C'est ce que sert `GET /vtiles/{z}/{x}/{y}` :
+    /// le client HTTP dégzippe lui-même via `Content-Encoding`.
+    pub fn tile_stored(&self, x: u32, y: u32) -> std::io::Result<Option<Vec<u8>>> {
         let id = zxy_to_tileid(self.zoom, x, y);
         let pos = match self.index.binary_search_by_key(&id, |e| e.tile_id) {
             Ok(i) => i,
@@ -144,6 +146,20 @@ impl VectorStore {
             file.seek(SeekFrom::Start(self.tile_data_offset + e.offset))?;
             file.read_exact(&mut buf)?;
         }
+        Ok(Some(buf))
+    }
+
+    /// La compression déclarée pour les tuiles est-elle gzip ? (Décide de
+    /// l'en-tête `Content-Encoding` côté endpoint.)
+    pub fn tiles_gzipped(&self) -> bool {
+        self.tile_compression == 2
+    }
+
+    /// Octets MVT (décompressés) de la tuile, `None` si elle est vide.
+    fn tile_bytes(&self, x: u32, y: u32) -> std::io::Result<Option<Vec<u8>>> {
+        let Some(buf) = self.tile_stored(x, y)? else {
+            return Ok(None);
+        };
         match self.tile_compression {
             1 => Ok(Some(buf)),
             2 => Ok(Some(gunzip(&buf)?)),

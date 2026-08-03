@@ -221,6 +221,7 @@ async fn main() {
         .route("/users/{username}/contributions", get(user_contributions))
         .route("/trees", get(trees))
         .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
+        .route("/vtiles/{z}/{x}/{y}", get(vector_tile))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
@@ -2160,6 +2161,43 @@ async fn canopy_tile(
         ],
         png,
     ))
+}
+
+/// Tuile MVT brute de l'archive vectorielle — le pont vers le client tant que
+/// R2 n'est pas branché : mêmes octets que `sunmap.pmtiles`, adressés en
+/// `/z/x/y` pour épargner au client un lecteur PMTiles. Le client y lit les
+/// couches `trees` et `woods` pour poser sa végétation 3D.
+///
+/// 404 sans `VECTOR_TILES` : l'endpoint n'existe que si l'archive est là,
+/// et une tuile vide est un 404 aussi (comme une clé absente sur R2).
+async fn vector_tile(
+    State(state): State<Arc<AppState>>,
+    Path((z, x, y)): Path<(u32, u32, u32)>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+    let Some(store) = &state.vstore else {
+        return Err((StatusCode::NOT_FOUND, "VECTOR_TILES non configuré".into()));
+    };
+    if z != store.zoom() {
+        return Err((StatusCode::NOT_FOUND, format!("zoom {z} ≠ z{}", store.zoom())));
+    }
+    let Some(bytes) = store
+        .tile_stored(x, y)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?
+    else {
+        return Err((StatusCode::NOT_FOUND, "tuile vide".into()));
+    };
+    let mut headers = vec![
+        (axum::http::header::CONTENT_TYPE, "application/vnd.mapbox-vector-tile".to_string()),
+        // La géométrie ne bouge qu'au réimport : cacheable longtemps.
+        (axum::http::header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+    ];
+    if store.tiles_gzipped() {
+        // Tuiles stockées gzip : servies telles quelles, le client dégzippe.
+        headers.push((axum::http::header::CONTENT_ENCODING, "gzip".to_string()));
+    }
+    Ok((axum::http::HeaderMap::from_iter(
+        headers.into_iter().map(|(k, v)| (k, v.parse().unwrap())),
+    ), bytes))
 }
 
 /// Arbres OSM (`natural=tree`) de la zone — aucun calcul soleil/ombre ici
