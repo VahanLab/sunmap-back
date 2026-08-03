@@ -219,9 +219,17 @@ retrait reste toujours grand devant la largeur d'une rue.
 `view_bearing_deg` regarde **le long** de la rue plutôt qu'à travers : 36 rayons
 sont lancés depuis le point analysé sur la grille de bâtiments déjà assemblée,
 et le plus dégagé l'emporte. Les directions à moins de 20 % du meilleur sont
-départagées par le cadrage idéal (façade de l'établissement en toile de fond),
-faute de quoi les deux sens d'une rue droite s'échangeraient au moindre pixel de
-différence et le cadrage sauterait d'un tap à l'autre.
+départagées par le cadrage idéal, faute de quoi les deux sens d'une rue droite
+s'échangeraient au moindre pixel de différence et le cadrage sauterait d'un tap
+à l'autre.
+
+Ce cadrage idéal dépend de ce qu'on regarde : pour un établissement, sa façade
+en toile de fond (donc le cap du point analysé vers le nœud OSM) ; pour un banc
+orienté, le voir de face (donc l'opposé de son `direction`). Ce n'est qu'une
+préférence — elle départage des directions également dégagées, elle n'en impose
+aucune. Le mobilier a d'abord été exclu du calcul, à tort : il souffre du même
+retrait de caméra qu'une terrasse, et le client vole désormais vers les deux de
+la même façon.
 
 C'est le cap **de la caméra**, pas la direction dégagée : la caméra se tient à
 l'opposé de son cap, les deux sont à 180° l'un de l'autre, et les confondre

@@ -1952,15 +1952,25 @@ async fn places(
             let (snapped_lat, snapped_lng) =
                 latlon_of_world_px(origin_x + px, origin_y + py);
 
-            // Cap de caméra conseillé — seulement pour ce qui se regarde de
-            // près. Un banc n'a pas de façade à mettre en toile de fond, et le
-            // client ne vole que vers les terrasses.
-            let view = (!is_furniture).then(|| {
-                // Cadrage idéal : la façade de l'établissement derrière la
-                // terrasse, donc le cap du point analysé vers le nœud OSM.
-                let preferred = bearing_deg(snapped_lat, snapped_lng, p.lat, p.lng);
-                open_view_bearing(&dsm, &owner, px, py, preferred, VIEW_MAX_DISTANCE_M)
-            });
+            // Cap de caméra conseillé, mobilier compris : un banc souffre du
+            // même retrait de caméra qu'une terrasse, et le client vole vers
+            // les deux.
+            //
+            // Le cadrage idéal diffère : pour un établissement c'est sa façade
+            // en toile de fond, donc le cap du point analysé vers le nœud OSM ;
+            // pour un banc orienté, c'est le voir de face, donc l'opposé de son
+            // `direction`. Ce n'est qu'une préférence — elle départage des
+            // directions également dégagées, elle ne les impose pas.
+            let preferred = if is_furniture {
+                p.direction_deg
+                    .map(|d| (d + 180.0).rem_euclid(360.0))
+                    .unwrap_or(0.0)
+            } else {
+                bearing_deg(snapped_lat, snapped_lng, p.lat, p.lng)
+            };
+            let view = Some(open_view_bearing(
+                &dsm, &owner, px, py, preferred, VIEW_MAX_DISTANCE_M,
+            ));
 
             Place {
                 id: p.osm_id.clone(),
