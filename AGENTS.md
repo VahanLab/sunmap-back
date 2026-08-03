@@ -257,17 +257,22 @@ main. Protocole complet : `helios-server/README.md`.
 
 Ajouter une zone = **une commande**, qui enchaîne téléchargement PBF →
 extraction osmium → import PostGIS (bâtiments, végétation, établissements,
-mobilier urbain) → génération des tuiles PMTiles (bâtiments + canopée) :
+mobilier urbain) → génération de `tiles/sunmap.pmtiles`, l'archive
+vectorielle unique (MVT z14, couches `buildings`/`woods`/`trees`) :
 
-    scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--hbt]
+    scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--purge]
 
 Procédure détaillée, vérifications et configuration R2 :
-**`docs/import-zone.md`**. Formats et service des tuiles :
+**`docs/import-zone.md`**. Format et service de l'archive :
 `docs/tuiles-pmtiles.md`. À savoir : l'import est un upsert (relançable) ;
-les archives PMTiles couvrent toute la base, pas la seule zone importée ;
-`--upload` pousse sur Cloudflare R2 (variables `R2_*` dans
-`helios-server/.env`) ; `--hbt` régénère les tuiles internes serveur
-(`BUILDINGS_TILES`, requis pour un déploiement).
+l'archive couvre toute la base, pas la seule zone importée ; `--upload`
+pousse sur Cloudflare R2 (variables `R2_*` dans `helios-server/.env`) ;
+`--purge` vide les tables géométriques — PostGIS ne garde que lieux et
+contributions, à ne faire que si le serveur tourne avec
+`VECTOR_TILES=tiles/sunmap.pmtiles`. Le serveur lit l'archive
+(`vtiles.rs`) en priorité, sinon `BUILDINGS_TILES` (HBT, déprécié), sinon
+PostGIS — parité mesurée : `/sunlit` identique, `/canopy` à ~0,1 % de pixels
+d'écart (quantification ~0,6 m), arbres à ±0,2 m.
 
 ## Prochaines étapes (dans l'ordre)
 
@@ -280,10 +285,11 @@ les archives PMTiles couvrent toute la base, pas la seule zone importée ;
    source, en superposition ou en remplacement des arbres Mapbox.
 3. Cache CDN des réponses `/places` (clé zone + jour, le bitfield rend la
    clé stable une journée entière).
-4. Tuiles statiques sur Cloudflare R2 : `buildings.pmtiles` et
-   `canopy.pmtiles` générés par le pipeline d'import (cf. § « Importer une
-   nouvelle zone », vérifiés à parité pixel avec `/canopy/{z}/{x}/{y}`) ;
-   reste à brancher le client dessus.
+4. Tuiles statiques sur Cloudflare R2 : `sunmap.pmtiles` (vectoriel, cf.
+   § « Importer une nouvelle zone ») alimente déjà le serveur via
+   `VECTOR_TILES` ; reste à brancher le client dessus — masque Metal
+   (rasterisation GPU de la même géométrie) et arbres 3D (`ModelLayer`),
+   ce qui couvre aussi l'étape 2 ci-dessus.
 
 ## Backlog (décidé mais volontairement différé)
 

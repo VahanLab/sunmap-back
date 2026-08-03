@@ -10,23 +10,27 @@ Procédure de référence : `docs/import-zone.md` (la lire avant d'agir).
 ## Commande unique
 
 ```bash
-scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--hbt]
+scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--purge]
 ```
 
 - URL des extraits : https://download.geofabrik.de/ (prendre le
   `-latest.osm.pbf` de la plus petite région couvrant la zone demandée).
-- `--upload` : pousse les archives sur Cloudflare R2 — demander confirmation
-  à l'utilisateur avant, c'est un envoi vers un service externe.
-- `--hbt` : tuiles internes serveur (`BUILDINGS_TILES`) — seulement si un
-  déploiement serveur est visé.
+- `--upload` : pousse `tiles/sunmap.pmtiles` sur Cloudflare R2 — demander
+  confirmation à l'utilisateur avant, c'est un envoi vers un service externe.
+- `--purge` : vide les tables `buildings`/`trees`/`woods` après génération —
+  UNIQUEMENT si le serveur tourne avec `VECTOR_TILES=tiles/sunmap.pmtiles`,
+  et demander confirmation à l'utilisateur (destructif).
 
 ## Points de vigilance
 
 - L'import PostGIS est un upsert : relançable, réimporter rafraîchit.
 - Les règles tags → hauteur vivent dans `helios-server/src/osm.rs` — ne
   jamais les dupliquer dans un script.
-- Les archives PMTiles couvrent l'emprise TOTALE de la base (`ST_Extent`),
-  pas seulement la zone importée. Compter ~30–60 min pour l'Île-de-France.
+- L'archive `sunmap.pmtiles` (MVT z14, couches buildings/woods/trees) couvre
+  l'emprise TOTALE de la base (`ST_Extent`), pas seulement la zone importée.
+- Toute évolution du schéma des couches MVT = `scripts/build-pmtiles.py` ET
+  `helios-server/src/vtiles.rs` ET la fixture
+  (`build-pmtiles.py --fixture helios-server/testdata/mini.pmtiles`).
 - `DATABASE_URL` : défaut `postgres://localhost/sunmap` ; vérifier quelle
   base est visée avant d'importer (locale vs OVH).
 

@@ -61,6 +61,11 @@ struct AppState {
     /// PostGIS classique — c'est aussi le rollback : ne pas définir la
     /// variable suffit à revenir à l'ancien chemin.
     btiles: Option<helios_server::btiles::TileStore>,
+    /// Archive vectorielle `sunmap.pmtiles` (`VECTOR_TILES=chemin.pmtiles`) :
+    /// bâtiments ET végétation, prioritaire sur `btiles` comme sur PostGIS.
+    /// `None` = replis dans cet ordre. C'est elle qui permet de purger les
+    /// tables `buildings`/`trees`/`woods` (cf. docs/import-zone.md).
+    vstore: Option<helios_server::vtiles::VectorStore>,
 }
 
 /// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
@@ -161,6 +166,21 @@ async fn main() {
             },
             None => None,
         },
+        vstore: match std::env::var("VECTOR_TILES").ok().filter(|p| !p.is_empty()) {
+            Some(path) => match helios_server::vtiles::VectorStore::open(&path) {
+                Ok(store) => {
+                    println!("géométrie : archive vectorielle {path} (z{})", store.zoom());
+                    Some(store)
+                }
+                Err(e) => {
+                    // Même politique que BUILDINGS_TILES : mourir plutôt que
+                    // de retomber en silence sur un autre chemin de données.
+                    eprintln!("VECTOR_TILES={path} : {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => None,
+        },
     });
 
     // Reprise des envois OSM qui ont échoué — au démarrage, puis toutes les
@@ -205,7 +225,12 @@ async fn main() {
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
 
-    let addr = "0.0.0.0:8080";
+    // Surchargeable pour faire tourner deux instances côte à côte (comparer
+    // un chemin de données à l'autre) sans toucher au serveur de dev.
+    let addr = format!(
+        "0.0.0.0:{}",
+        std::env::var("PORT").ok().filter(|p| !p.is_empty()).unwrap_or_else(|| "8080".into())
+    );
     println!("helios-server sur http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -448,10 +473,7 @@ async fn add_buildings(
     // sans ombre de feuillage qu'une erreur, la végétation étant un raffinement
     // par-dessus le relief et le bâti.
     let phase = std::time::Instant::now();
-    let woods = db::woods_in_bbox(&state.pool, south, west, north, east)
-        .await
-        .unwrap_or_default();
-    let trees = db::trees_in_bbox(&state.pool, south, west, north, east)
+    let (woods, trees) = load_canopy(state, south, west, north, east)
         .await
         .unwrap_or_default();
     let t_canopy_query_ms = phase.elapsed().as_secs_f64() * 1000.0;
@@ -482,7 +504,14 @@ async fn load_buildings(
         return Ok(hit.clone());
     }
 
-    let buildings = match &state.btiles {
+    let buildings = if let Some(store) = &state.vstore {
+        // Archive vectorielle : le chemin cible (les tables PostGIS peuvent
+        // être purgées quand elle est en place).
+        store
+            .buildings(s, w, n, e)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?
+    } else {
+        match &state.btiles {
         // Tuiles : mêmes bâtiments, découpés sur la grille DEM. L'intervalle
         // de tuiles couvrant la bbox est le même calcul que pour les tuiles
         // de terrain (`assemble_grid`).
@@ -502,12 +531,36 @@ async fn load_buildings(
         None => db::buildings_in_bbox(&state.pool, s, w, n, e)
             .await
             .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?,
+        }
     };
     println!("[buildings] {key} → {} emprises", buildings.len());
 
     let arc = Arc::new(buildings);
     state.buildings.write().await.insert(key, arc.clone());
     Ok(arc)
+}
+
+/// Végétation de la zone : archive vectorielle si elle est en place, PostGIS
+/// sinon — même bascule que `load_buildings`, mêmes données que le rendu.
+async fn load_canopy(
+    state: &AppState,
+    s: f64,
+    w: f64,
+    n: f64,
+    e: f64,
+) -> Result<(Vec<Building>, Vec<helios_server::osm::Tree>), String> {
+    if let Some(store) = &state.vstore {
+        let woods = store.woods(s, w, n, e).map_err(|err| format!("vtiles : {err}"))?;
+        let trees = store.trees(s, w, n, e).map_err(|err| format!("vtiles : {err}"))?;
+        return Ok((woods, trees));
+    }
+    let woods = db::woods_in_bbox(&state.pool, s, w, n, e)
+        .await
+        .map_err(|err| format!("PostGIS : {err}"))?;
+    let trees = db::trees_in_bbox(&state.pool, s, w, n, e)
+        .await
+        .map_err(|err| format!("PostGIS : {err}"))?;
+    Ok((woods, trees))
 }
 
 /// Ce qui bloque le soleil sur un point donné, tel que renvoyé aux clients.
@@ -2090,12 +2143,10 @@ async fn canopy_tile(
     let (s, w, n, e) = canopy_tiles::tile_bounds(z, x, y);
     let pad_lat = 30.0 / 111_320.0;
     let pad_lon = pad_lat / ((s + n) / 2.0).to_radians().cos();
-    let woods = db::woods_in_bbox(&state.pool, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
-    let trees = db::trees_in_bbox(&state.pool, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?;
+    let (woods, trees) =
+        load_canopy(&state, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     let tile = canopy_tiles::rasterize(z, x, y, &woods, &trees);
     let png = canopy_tiles::encode_png(&tile)
@@ -2133,9 +2184,15 @@ async fn trees(
         return Err((StatusCode::BAD_REQUEST, "bbox invalide".into()));
     }
 
-    let trees: Vec<Tree> = db::trees_in_bbox(&state.pool, s, w, n, e)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?
+    let raw = match &state.vstore {
+        Some(store) => store
+            .trees(s, w, n, e)
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?,
+        None => db::trees_in_bbox(&state.pool, s, w, n, e)
+            .await
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?,
+    };
+    let trees: Vec<Tree> = raw
         .into_iter()
         .map(|t| Tree {
             id: t.osm_id,

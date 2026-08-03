@@ -586,6 +586,7 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "flate2",
  "helios-core",
  "image",
  "jsonwebtoken",

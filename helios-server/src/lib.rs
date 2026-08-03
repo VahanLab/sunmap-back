@@ -18,3 +18,4 @@ pub mod osm_push;
 pub mod pbf;
 pub mod tiers;
 pub mod username;
+pub mod vtiles;

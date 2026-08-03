@@ -1,71 +1,75 @@
-# Tuiles statiques PMTiles sur Cloudflare R2
+# `sunmap.pmtiles` — l'artefact vectoriel unique, servi depuis Cloudflare R2
 
-Objectif : sortir les tuiles bâtiments et canopée du chemin de requête du
-serveur. Une archive PMTiles est un fichier unique, adressé par requêtes HTTP
-Range — R2 le sert tel quel, sans Worker ni serveur de tuiles, et le CDN
-Cloudflare cache les plages lues. Les données ne bougent qu'au réimport OSM :
-du statique versionné convient parfaitement.
+Une seule archive PMTiles, tuiles **MVT** (Mapbox Vector Tiles), qui porte
+toute la géométrie qui fait de l'ombre. Trois consommateurs, mêmes octets :
 
-## Les deux archives
+1. **le serveur** (`helios-server/src/vtiles.rs`, `VECTOR_TILES=`) — la
+   rasterisation DSM pour la classification soleil/ombre ;
+2. **le masque Metal client** (à venir) — rasterisation GPU de la même
+   géométrie ;
+3. **l'affichage Mapbox** (à venir) — arbres 3D (`ModelLayer`), extrusions.
 
-Générées par `scripts/build-pmtiles.py` (voir son en-tête pour le détail),
-raster PNG 512 px, z12–15 — les mêmes bornes que le masque Metal client.
-Une tuile sans donnée n'est pas écrite : l'absence (404 sur un `get`) signifie
-« vide ».
+Ce qu'on voit est ce qui fait l'ombre, par construction. C'est cette archive
+qui remplace les tables PostGIS `buildings`/`trees`/`woods` au runtime —
+PostGIS n'est plus que la zone de transit de l'import
+(cf. `docs/import-zone.md`, option `--purge`).
 
-| Archive | Contenu | Encodage PNG (RGB) |
+## Format
+
+- **Un seul zoom : z14**, extent 4096 → pas de quantification ~0,6 m, petit
+  devant le pixel DSM (~1,57 m). Les lecteurs sur/sous-échantillonnent
+  librement — le vectoriel n'a pas de résolution. Vérifié en parité contre le
+  chemin PostGIS : `/canopy` à 0,08–0,19 % de pixels d'écart (bords de
+  polygones), positions d'arbres ≤ 0,2 m, `/sunlit` identique.
+- **Aucune simplification, aucun élagage** (tippecanoe est exclu pour ça) :
+  ces tuiles nourrissent un calcul, pas seulement un rendu.
+- **Objets entiers, jamais découpés** : un objet à cheval sur plusieurs
+  tuiles est écrit en entier dans chacune, le lecteur dédoublonne par `id`
+  (convention héritée de `btiles.rs`).
+- Tuiles gzip (déclaré dans l'en-tête PMTiles), tuiles vides absentes.
+
+| Couche | Géométrie | Attributs |
 |---|---|---|
-| `canopy.pmtiles` | canopée (bois + arbres isolés) | identique à `GET /canopy/{z}/{x}/{y}` : R = sommet ×2, G = base ×2 (m au-dessus du sol, pas 0,5 m), B = classe (pas de 40 : silhouette × emprise/isolé) |
-| `buildings.pmtiles` | hauteurs de bâtiments | hauteur en décimètres : `h_m = (R×256 + G) / 10` (plafond 6 553,5 m — le pas ×2 de la canopée plafonnerait à 127,5 m, trop bas pour La Défense) ; B = 255 si la hauteur vient d'un tag OSM, 0 si estimée (médiane locale) |
+| `buildings` | polygones (trous conservés) | `id` (osm_id), `name`, `height_m`, `height_from_osm` |
+| `woods` | polygones (clairières conservées) | `id`, `name`, `height_m`, `height_from_osm`, `leaf_type` |
+| `trees` | points | `id`, `height_m`, `crown_radius_m`, `leaf_type` |
 
-La rasterisation est un **port exact** de `canopy_tiles.rs` (scanline
-pair-impair au centre du pixel, disques de couronne, mêmes règles de fusion) :
-vérifié pixel à pixel contre le serveur sur Paris — zéro écart. Toute modif de
-`canopy_tiles.rs` se répercute ici (et `--selftest` rejoue ses tests
-unitaires).
+## Génération et lecture
 
-## Pipeline (local, Île-de-France)
+- Écriture : `scripts/build-pmtiles.py` (encodage via `mapbox-vector-tile`,
+  container via `pmtiles`). `--selftest` fait l'aller-retour d'encodage sans
+  base ; `--fixture` régénère `helios-server/testdata/mini.pmtiles`.
+- Lecture serveur : `vtiles.rs` — décodeurs PMTiles v3 et MVT maison
+  (~200 lignes, pas de dépendance protobuf), testés contre la fixture écrite
+  par le générateur Python : deux implémentations indépendantes doivent se
+  lire, c'est le test de non-dérive du format.
+- Toute évolution du schéma des couches = les deux côtés + la fixture.
 
-La source est PostGIS, jamais le PBF en direct : les règles tags → hauteur
-vivent dans le Rust (`osm::building_from`, `osm::height_from_tags`) et ne
-doivent pas être dupliquées.
+## Servir depuis R2
 
-```
-scripts/osm-extract.sh                    # Geofabrik PBF → GeoJSON filtré
-cargo run --release --bin import -- …     # → PostGIS (règles canoniques)
+L'archive se sert **telle quelle** : un lecteur PMTiles fait des requêtes
+HTTP Range (annuaire racine puis tuile), R2 les sert nativement, le CDN
+Cloudflare cache les plages lues. Pas de Worker nécessaire pour un client
+natif ; le Worker protomaps n'est utile que pour exposer des URLs `/z/x/y`
+classiques (ce que Mapbox iOS peut préférer pour ses sources vectorielles).
 
-python3 -m venv .venv-tiles
-.venv-tiles/bin/pip install numpy pillow "psycopg[binary]" pmtiles boto3
-.venv-tiles/bin/python scripts/build-pmtiles.py --selftest   # sans base
-.venv-tiles/bin/python scripts/build-pmtiles.py --out-dir tiles/
-```
-
-Options utiles : `--layer buildings|canopy`, `--bbox S,W,N,E` (défaut :
-`ST_Extent` des tables), `--min-zoom/--max-zoom`, `--jobs`.
-
-## Envoi vers R2
-
-Au choix :
+Upload : `scripts/build-pmtiles.py --upload` (variables `R2_*`, cf.
+`docs/import-zone.md`) ou rclone :
 
 ```
-# rclone (remote `r2` configuré : type s3, provider Cloudflare)
-rclone copyto tiles/canopy.pmtiles    r2:sunmap-tiles/canopy.pmtiles
-rclone copyto tiles/buildings.pmtiles r2:sunmap-tiles/buildings.pmtiles
-
-# ou le flag intégré (boto3, multipart géré)
-export R2_ACCOUNT_ID=… R2_ACCESS_KEY_ID=… R2_SECRET_ACCESS_KEY=… R2_BUCKET=sunmap-tiles
-.venv-tiles/bin/python scripts/build-pmtiles.py --out-dir tiles/ --upload
+rclone copyto tiles/sunmap.pmtiles r2:sunmap-tiles/sunmap.pmtiles
 ```
 
-Côté bucket : exposer via un domaine public R2 (ou un domaine custom), activer
-CORS si un client web doit lire, et laisser le cache CDN faire — le fichier ne
-change qu'au réimport, un `Cache-Control` long est sain. Un remplacement
-d'archive est atomique du point de vue du client (nouvel upload = nouvel etag).
+Le fichier ne change qu'au réimport : `Cache-Control` long côté bucket, et un
+remplacement d'archive est atomique du point de vue du client (nouvel etag).
 
-## Côté client (pas encore branché)
+## Côté serveur
 
-Un lecteur PMTiles fait deux lectures Range (annuaire racine puis tuile) ;
-l'annuaire se cache en mémoire, ensuite c'est une lecture par tuile. Pour
-l'app iOS, un petit lecteur Swift du format v3 suffit (header 127 octets +
-annuaires gzip) — ou exposer des URL `/z/x/y` classiques via le Worker
-protomaps si on préfère ne rien changer au code de fetch existant.
+```
+VECTOR_TILES=tiles/sunmap.pmtiles   # helios-server/.env
+```
+
+Priorité des chemins de données : `VECTOR_TILES` > `BUILDINGS_TILES` (HBT,
+legacy — bâtiments seuls) > PostGIS. Ne pas définir la variable = rollback
+immédiat vers l'ancien chemin. Une archive illisible fait mourir le serveur
+au démarrage plutôt que de retomber en silence sur un autre chemin.
