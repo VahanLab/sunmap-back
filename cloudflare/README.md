@@ -62,38 +62,57 @@ pas, ils ne donnent aucun droit sur les Workers.
 
 Vérifier sans déployer : `npm run build` (compile et affiche les bindings).
 
-## Libérer le domaine avant la première mise en ligne
+## Le domaine (fait le 2026-08-03)
 
-`tiles.sunmap.tech` est aujourd'hui un **domaine custom du bucket R2**.
-Cloudflare refuse que le bucket et le Worker revendiquent le même nom
-d'hôte : il faut le retirer du bucket avant de le donner au Worker.
+`tiles.sunmap.tech` a d'abord été un **domaine custom du bucket R2**.
+Cloudflare refusant que le bucket et le Worker revendiquent le même nom
+d'hôte, il a fallu le retirer du bucket (Dashboard → R2 → `sunmap-tiles` →
+Settings → Custom Domains) avant de le déclarer dans le bloc `[[routes]]` de
+`wrangler.toml`. À refaire à l'identique si le domaine change.
 
-1. Dashboard → **R2** → bucket `sunmap-tiles` → **Settings** → **Custom
-   Domains** → retirer `tiles.sunmap.tech`.
-2. Décommenter le bloc `[[routes]]` de `wrangler.toml`.
-3. `npm run deploy` — wrangler crée la route et le certificat.
-4. Vérifier :
-   ```bash
-   curl -I https://tiles.sunmap.tech/sunmap/14/8412/5844.mvt
-   ```
-   Attendu : `200`, `content-type: application/x-protobuf`, et un en-tête
-   `cf-cache-status` (`MISS` au premier appel, `HIT` ensuite).
+Vérification :
 
-Sans le bloc `[[routes]]`, le Worker est quand même déployé et joignable sur
-son URL `*.workers.dev` — pratique pour tester avant de toucher au domaine.
+```bash
+curl -I https://tiles.sunmap.tech/sunmap/14/8412/5844.mvt
+```
 
-## Après un réimport
+Attendu : `200`, `content-type: application/x-protobuf`, et un en-tête
+`cf-cache-status` (`MISS` au premier appel, `HIT` ensuite).
 
-Le cache du Worker est indexé sur l'URL et **ne se périme pas** quand
-l'archive est remplacée : une tuile déjà servie reste servie dans sa version
-précédente jusqu'à expiration du `CACHE_CONTROL` (1 jour par défaut). Après
-un `scripts/import-zone.sh … --upload`, soit on attend, soit on purge le
-cache de la zone (dashboard → Caching → Configuration → Purge Everything).
+Sans bloc `[[routes]]`, le Worker reste déployé et joignable sur son URL
+`*.workers.dev` — pratique pour tester avant de toucher au domaine.
 
-## Côté client
+## Après un réimport — ⚠ le cache ne se périme pas tout seul
 
-`VegetationTileRepository` (repo iOS) lit encore
-`GET /vtiles/{z}/{x}/{y}` du serveur helios. Une fois le Worker en ligne,
-l'URL devient `https://tiles.sunmap.tech/sunmap/{z}/{x}/{y}.mvt` — le
-décodage ne change pas (mêmes octets MVT), et le `Content-Encoding: gzip`
-du Worker est géré de façon transparente par URLSession, comme aujourd'hui.
+Le cache du Worker est indexé sur l'URL de la tuile et **ignore le
+remplacement de l'archive** : une tuile déjà servie continue de l'être dans
+sa version précédente jusqu'à expiration du `CACHE_CONTROL` (1 jour par
+défaut). Après un `scripts/import-zone.sh … --upload`, il faut donc purger :
+dashboard → **Caching → Configuration → Purge Everything**.
+
+(Le jeton OAuth de wrangler ne porte que `zone (read)` : la purge ne peut pas
+être scriptée avec lui. Il faudrait un jeton API dédié avec la permission
+*Cache Purge*.)
+
+**La parade durable serait de versionner le nom de l'archive** — téléverser
+`sunmap-20260803.pmtiles` plutôt que d'écraser `sunmap.pmtiles`, puis pointer
+`TILES_URL` dessus. Les URLs changent, donc aucune tuile périmée, la bascule
+est atomique et le retour arrière consiste à remettre l'ancienne valeur. Pas
+encore fait : à décider quand les réimports deviendront réguliers.
+
+## Côté client — rien à changer dans l'app
+
+`VegetationTileRepository` (repo iOS) tape toujours
+`GET /vtiles/{z}/{x}/{y}` sur le serveur helios, qui **redirige (308)** vers
+`$TILES_URL/sunmap/{z}/{x}/{y}.mvt` dès que `TILES_URL` est défini dans
+`helios-server/.env`. URLSession suit la redirection sans rien demander : le
+trafic passe par le CDN sans publier de version de l'app, et changer de
+source (ou revenir en arrière) est un réglage serveur.
+
+Le Worker renvoie du MVT **déjà décompressé** (`application/x-protobuf`,
+sans `Content-Encoding`), là où l'archive locale du serveur sert les octets
+gzip tels quels — dans les deux cas `MVTDecoder` reçoit du MVT en clair.
+
+Le jour où l'app consommera les tuiles avec Mapbox (`VectorSource`,
+extrusions et `ModelLayer`), c'est l'URL du Worker qu'il faudra donner
+directement au SDK — pas la redirection.

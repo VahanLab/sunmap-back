@@ -781,7 +781,11 @@ fn polygon_geometry(rings: &[Vec<(f64, f64)>], z: u32, tx: u32, ty: u32) -> Vec<
             out.push(zigzag_enc(py - cy));
             (cx, cy) = (px, py);
         }
-        out.push(7); // ClosePath
+        // ClosePath : `(1 << 3) | 7`. La spec 2.1 EXIGE un compteur de 1 —
+        // un `7` nu (compteur 0) est toléré par nos décodeurs, qui ignorent
+        // le compteur de cette commande, mais rejeté par un décodeur strict
+        // (Mapbox, mapbox-vector-tile côté Python).
+        out.push(15);
     }
     out
 }

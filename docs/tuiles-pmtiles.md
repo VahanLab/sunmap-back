@@ -50,13 +50,26 @@ contributions (cf. `docs/import-zone.md`).
 - Toute évolution du schéma des couches = `vtiles.rs` (encode + decode),
   `MVTDecoder`/`VegetationTileRepository` côté iOS, et la fixture.
 
-## Servir depuis R2
+## Servir depuis R2 — Worker Cloudflare
 
-L'archive se sert **telle quelle** : un lecteur PMTiles fait des requêtes
-HTTP Range (annuaire racine puis tuile), R2 les sert nativement, le CDN
-Cloudflare cache les plages lues. Pas de Worker nécessaire pour un client
-natif ; le Worker protomaps n'est utile que pour exposer des URLs `/z/x/y`
-classiques (ce que Mapbox iOS peut préférer pour ses sources vectorielles).
+Un **Worker Cloudflare** (`cloudflare/`, source protomaps vendorée) traduit
+`/{name}/{z}/{x}/{y}.mvt` en lecture Range sur `{name}.pmtiles`, avec cache
+au bord :
+
+```
+https://tiles.sunmap.tech/sunmap/14/8412/5844.mvt
+https://tiles.sunmap.tech/sunmap.json          # TileJSON
+```
+
+Ce choix plutôt qu'un lecteur PMTiles côté client : un template
+`{z}/{x}/{y}` se donne directement à un `VectorSource` Mapbox — c'est déjà
+ainsi que le relief est chargé — alors que le SDK iOS ne sait pas ouvrir une
+archive PMTiles sans gestionnaire de protocole custom. Le bucket reste
+**privé**, le Worker y accédant par binding interne.
+
+Le serveur redirige `/vtiles/{z}/{x}/{y}` vers ce CDN quand `TILES_URL` est
+défini : l'app suit la redirection sans mise à jour. Détails et procédure de
+déploiement : `cloudflare/README.md`.
 
 Upload : `scripts/r2-upload.py` (variables `R2_*`, cf.
 `docs/import-zone.md`) ou rclone :

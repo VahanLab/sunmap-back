@@ -62,6 +62,10 @@ struct AppState {
     /// PostGIS correspondantes n'existent plus (cf. docs/tuiles-pmtiles.md),
     /// un serveur sans archive classerait tout au soleil.
     vstore: helios_server::vtiles::VectorStore,
+    /// Base du CDN de tuiles (`TILES_URL`, sans barre oblique finale), vers
+    /// laquelle `/vtiles/{z}/{x}/{y}` redirige. `None` = tuiles servies
+    /// depuis l'archive locale.
+    tiles_url: Option<String>,
 }
 
 /// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
@@ -163,6 +167,18 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        },
+        tiles_url: {
+            let url = std::env::var("TILES_URL")
+                .ok()
+                .filter(|u| !u.is_empty())
+                // Barre oblique finale retirée : la redirection la remet.
+                .map(|u| u.trim_end_matches('/').to_string());
+            match &url {
+                Some(u) => println!("tuiles client : redirigées vers {u}"),
+                None => println!("tuiles client : servies depuis l'archive locale"),
+            }
+            url
         },
     });
 
@@ -2108,16 +2124,35 @@ async fn canopy_tile(
     ))
 }
 
-/// Tuile MVT brute de l'archive vectorielle — le pont vers le client tant que
-/// R2 n'est pas branché : mêmes octets que `sunmap.pmtiles`, adressés en
-/// `/z/x/y` pour épargner au client un lecteur PMTiles. Le client y lit les
-/// couches `trees` et `woods` pour poser sa végétation 3D.
+/// Tuile MVT de l'archive vectorielle, pour la végétation 3D du client
+/// (couches `trees` et `woods`).
+///
+/// **Redirige vers le CDN** dès que `TILES_URL` est défini : les tuiles sont
+/// les mêmes octets, mais servies par le Worker Cloudflare depuis R2
+/// (cf. `cloudflare/README.md`) — la VM cesse d'en payer la bande passante,
+/// et le cache au bord absorbe les déplacements de carte. La redirection
+/// évite d'avoir à publier une version de l'app pour changer de source.
+///
+/// Sans `TILES_URL`, l'archive locale est servie directement — c'est le
+/// chemin de développement, et le rollback si le CDN pose problème.
 ///
 /// Une tuile vide est un 404 (comme une clé absente sur R2).
 async fn vector_tile(
     State(state): State<Arc<AppState>>,
     Path((z, x, y)): Path<(u32, u32, u32)>,
-) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
+
+    if let Some(base) = &state.tiles_url {
+        // Redirection permanente (308) : la cible ne changera pas d'une
+        // requête à l'autre, et un client qui la mémorise nous épargne le
+        // rebond suivant.
+        return Ok(axum::response::Redirect::permanent(&format!(
+            "{base}/sunmap/{z}/{x}/{y}.mvt"
+        ))
+        .into_response());
+    }
+
     let store = &state.vstore;
     if z != store.zoom() {
         return Err((StatusCode::NOT_FOUND, format!("zoom {z} ≠ z{}", store.zoom())));
@@ -2137,9 +2172,13 @@ async fn vector_tile(
         // Tuiles stockées gzip : servies telles quelles, le client dégzippe.
         headers.push((axum::http::header::CONTENT_ENCODING, "gzip".to_string()));
     }
-    Ok((axum::http::HeaderMap::from_iter(
-        headers.into_iter().map(|(k, v)| (k, v.parse().unwrap())),
-    ), bytes))
+    Ok((
+        axum::http::HeaderMap::from_iter(
+            headers.into_iter().map(|(k, v)| (k, v.parse().unwrap())),
+        ),
+        bytes,
+    )
+        .into_response())
 }
 
 /// Arbres OSM (`natural=tree`) de la zone — aucun calcul soleil/ombre ici

@@ -19,12 +19,12 @@ bucket_name = "sunmap-tiles"
 # géométrie est de l'open data, rien de sensible à isoler.
 preview_bucket_name = "sunmap-tiles"
 
-# Domaine servant les tuiles. À décommenter APRÈS avoir retiré le domaine
-# custom du bucket R2 (Cloudflare refuse que les deux revendiquent le même
-# nom d'hôte) — cf. README, § « Libérer le domaine ».
-# [[routes]]
-# pattern = "tiles.sunmap.tech/*"
-# custom_domain = true
+# Domaine servant les tuiles. Le domaine custom a été retiré du bucket R2 au
+# préalable : Cloudflare refuse que le bucket et le Worker revendiquent le
+# même nom d'hôte (cf. README, § « Libérer le domaine »).
+[[routes]]
+pattern = "tiles.sunmap.tech"
+custom_domain = true
 
 [vars]
 # CORS. `*` convient : les tuiles sont de l'open data OSM, et l'app native
