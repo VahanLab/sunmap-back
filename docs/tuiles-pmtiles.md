@@ -41,6 +41,17 @@ contributions (cf. `docs/import-zone.md`).
   MVT et writer PMTiles maison dans `vtiles.rs`, à côté du lecteur : une
   évolution de schéma ne peut pas en oublier un. Testé en aller-retour
   (`cargo test vtiles`).
+- **Fusion** : `tilegen --merge base.pmtiles` réunit un extrait et une
+  archive existante — les identifiants de tuile étant triés des deux côtés,
+  c'est une jointure linéaire ; à identifiant OSM égal, le nouvel extrait
+  l'emporte. C'est ce qui permet d'ajouter une région sans effacer les
+  précédentes (`scripts/import-zone.sh` l'active tout seul).
+- ⚠ **Conformité de l'encodeur** : nos décodeurs sont tolérants là où Mapbox
+  est strict. Un `ClosePath` de compteur 0 (au lieu de 1, soit la commande
+  15) a passé tous les aller-retours maison en rendant les tuiles illisibles
+  par le SDK — d'où `closepath_command_is_spec_compliant`, qui inspecte les
+  octets produits. Modifier l'encodeur = se relire contre la spec MVT 2.1,
+  pas contre nos décodeurs.
 - Lecture serveur : `vtiles.rs` — décodeurs PMTiles v3 et MVT maison
   (pas de dépendance protobuf). `helios-server/testdata/mini.pmtiles`
   (écrite par l'ancien générateur Python) reste la fixture de non-dérive :

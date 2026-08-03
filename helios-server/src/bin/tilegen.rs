@@ -24,9 +24,9 @@
 //! Le pic mémoire est le plus gros bucket (la conurbation la plus dense),
 //! pas le pays.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use helios_server::osm::{self, Building, LeafType, Tree};
 use helios_server::pbf::{self, StreamedFeature};
@@ -37,11 +37,29 @@ use helios_server::vtiles::{self, zxy_to_tileid};
 const BUCKETS: u64 = 256;
 
 fn main() {
+    // `--merge <archive>` : fusionner par-dessus une archive existante.
+    let mut positional: Vec<String> = Vec::new();
+    let mut merge_path: Option<String> = None;
     let mut args = std::env::args().skip(1);
-    let (Some(input), Some(output)) = (args.next(), args.next()) else {
-        eprintln!("Usage : tilegen <extrait.geojsonl> <sortie.pmtiles>");
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--merge" => match args.next() {
+                Some(p) => merge_path = Some(p),
+                None => {
+                    eprintln!("--merge attend un chemin d'archive");
+                    std::process::exit(1);
+                }
+            },
+            _ => positional.push(a),
+        }
+    }
+    let [input, output] = &positional[..] else {
+        eprintln!(
+            "Usage : tilegen [--merge base.pmtiles] <extrait.geojsonl> <sortie.pmtiles>"
+        );
         std::process::exit(1);
     };
+    let (input, output) = (input.clone(), output.clone());
 
     let open = |path: &str| -> BufReader<File> {
         match File::open(path) {
@@ -143,24 +161,53 @@ fn main() {
         }
     }
 
-    // ------------------------------------- passe 3 : encodage par bucket
+    // --------------------------- passe 3 : encodage (et fusion) par bucket
+    //
+    // L'archive de base, si elle est donnée, est parcourue en parallèle :
+    // ses identifiants de tuile sont triés comme les nôtres, la fusion est
+    // donc une jointure linéaire. Une tuile qu'elle seule possède est
+    // recopiée telle quelle ; une tuile commune voit ses objets fusionnés,
+    // le nouvel extrait l'emportant sur l'ancien à identifiant OSM égal.
+    let base = match &merge_path {
+        Some(p) => match vtiles::VectorStore::open(p) {
+            Ok(store) => {
+                if store.zoom() != vtiles::ZOOM {
+                    fail("--merge", &format!("archive en z{}, attendu z{}", store.zoom(), vtiles::ZOOM));
+                }
+                println!("fusion par-dessus {p} ({} tuiles)", store.tile_ids().len());
+                Some(store)
+            }
+            Err(e) => fail("--merge", &e),
+        },
+        None => None,
+    };
+    let base_ids: Vec<u64> = base.as_ref().map(|s| s.tile_ids()).unwrap_or_default();
+    let mut base_cursor = 0usize;
+    let mut merged_tiles = 0usize;
+
     let mut writer = match vtiles::ArchiveWriter::new() {
         Ok(w) => w,
         Err(e) => fail("ArchiveWriter", &e),
     };
-    let mut bbox = (f64::MAX, f64::MAX, f64::MIN, f64::MIN); // s, w, n, e
-    for idx in 0..BUCKETS as usize {
-        if buckets[idx].is_none() {
-            continue;
-        }
-        let path = spill_dir.join(format!("{idx:03}.bin"));
-        let mut raw = Vec::new();
-        if let Err(e) = File::open(&path).and_then(|mut f| f.read_to_end(&mut raw)) {
-            fail("Lecture de bucket", &e);
-        }
-        std::fs::remove_file(&path).ok();
+    // L'emprise part de celle de la base : les tuiles recopiées comptent.
+    let mut bbox = match &base {
+        Some(s) => s.bounds(),
+        None => (f64::MAX, f64::MAX, f64::MIN, f64::MIN), // s, w, n, e
+    };
 
-        // Regroupe les enregistrements par tuile (BTreeMap : ordre croissant).
+    for idx in 0..BUCKETS as usize {
+        let lo = id_base + idx as u64 * per_bucket;
+        let hi = lo + per_bucket;
+
+        // Nouvelles tuiles de ce bucket.
+        let mut raw = Vec::new();
+        if buckets[idx].is_some() {
+            let path = spill_dir.join(format!("{idx:03}.bin"));
+            if let Err(e) = File::open(&path).and_then(|mut f| f.read_to_end(&mut raw)) {
+                fail("Lecture de bucket", &e);
+            }
+            std::fs::remove_file(&path).ok();
+        }
         let mut tiles: BTreeMap<u64, Vec<&[u8]>> = BTreeMap::new();
         let mut p = 0usize;
         while p + 12 <= raw.len() {
@@ -171,17 +218,59 @@ fn main() {
             p += len;
         }
 
-        for (tile_id, records) in tiles {
+        // Identifiants à écrire : ceux du neuf, plus ceux que la base
+        // possède dans la même tranche.
+        let mut ids: BTreeSet<u64> = tiles.keys().copied().collect();
+        while base_cursor < base_ids.len() && base_ids[base_cursor] < hi {
+            if base_ids[base_cursor] >= lo {
+                ids.insert(base_ids[base_cursor]);
+            }
+            base_cursor += 1;
+        }
+        if ids.is_empty() {
+            continue;
+        }
+
+        for tile_id in ids {
             let mut buildings = Vec::new();
             let mut woods = Vec::new();
             let mut trees = Vec::new();
-            for r in records {
-                match r[0] {
-                    0 => buildings.push(decode_polygon(r)),
-                    1 => woods.push(decode_polygon(r)),
-                    _ => trees.push(decode_tree(r)),
+            if let Some(records) = tiles.get(&tile_id) {
+                for r in records {
+                    match r[0] {
+                        0 => buildings.push(decode_polygon(r)),
+                        1 => woods.push(decode_polygon(r)),
+                        _ => trees.push(decode_tree(r)),
+                    }
                 }
             }
+
+            if let Some(store) = &base {
+                let (x, y) = vtiles::tileid_to_zxy(tile_id, vtiles::ZOOM);
+                match store.tile_features(x, y) {
+                    Ok((ob, ow, ot)) => {
+                        // Le neuf gagne : un objet réimporté écrase sa version
+                        // précédente, sans quoi une correction OSM ne
+                        // prendrait jamais effet.
+                        let kb: HashSet<&str> = buildings.iter().map(|b| b.osm_id.as_str()).collect();
+                        let kw: HashSet<&str> = woods.iter().map(|b| b.osm_id.as_str()).collect();
+                        let kt: HashSet<&str> = trees.iter().map(|t| t.osm_id.as_str()).collect();
+                        let (add_b, add_w, add_t) = (
+                            ob.into_iter().filter(|b| !kb.contains(b.osm_id.as_str())).collect::<Vec<_>>(),
+                            ow.into_iter().filter(|b| !kw.contains(b.osm_id.as_str())).collect::<Vec<_>>(),
+                            ot.into_iter().filter(|t| !kt.contains(t.osm_id.as_str())).collect::<Vec<_>>(),
+                        );
+                        if !add_b.is_empty() || !add_w.is_empty() || !add_t.is_empty() {
+                            merged_tiles += 1;
+                        }
+                        buildings.extend(add_b);
+                        woods.extend(add_w);
+                        trees.extend(add_t);
+                    }
+                    Err(e) => fail("lecture de l'archive de base", &e),
+                }
+            }
+
             for b in buildings.iter().chain(woods.iter()) {
                 for ring in &b.rings {
                     for &(lat, lon) in ring {
@@ -198,7 +287,8 @@ fn main() {
                 bbox.2 = bbox.2.max(t.lat);
                 bbox.3 = bbox.3.max(t.lng);
             }
-            let (x, y) = tileid_to_xy(tile_id);
+
+            let (x, y) = vtiles::tileid_to_zxy(tile_id, vtiles::ZOOM);
             let b_refs: Vec<&Building> = buildings.iter().collect();
             let w_refs: Vec<&Building> = woods.iter().collect();
             let t_refs: Vec<&Tree> = trees.iter().collect();
@@ -213,6 +303,9 @@ fn main() {
         }
     }
     std::fs::remove_dir_all(&spill_dir).ok();
+    if base.is_some() {
+        println!("{merged_tiles} tuiles ont reçu des objets de l'archive de base");
+    }
 
     let count = writer.tile_count();
     let out = match File::create(&output) {
@@ -224,32 +317,6 @@ fn main() {
     }
     let size = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
     println!("{count} tuiles écrites → {output} ({:.1} Mo)", size as f64 / 1e6);
-}
-
-/// Inverse de `zxy_to_tileid` au zoom de l'archive (Hilbert d → xy).
-fn tileid_to_xy(tile_id: u64) -> (u32, u32) {
-    let d = tile_id - zxy_to_tileid(vtiles::ZOOM, 0, 0);
-    let n: u64 = 1 << vtiles::ZOOM;
-    let (mut x, mut y) = (0u64, 0u64);
-    let mut t = d;
-    let mut s = 1u64;
-    while s < n {
-        let rx = 1 & (t / 2);
-        let ry = 1 & (t ^ rx);
-        // Rotation inverse.
-        if ry == 0 {
-            if rx == 1 {
-                x = s - 1 - x;
-                y = s - 1 - y;
-            }
-            std::mem::swap(&mut x, &mut y);
-        }
-        x += s * rx;
-        y += s * ry;
-        t /= 4;
-        s *= 2;
-    }
-    (x as u32, y as u32)
 }
 
 // --------------------------- sérialisation compacte des records de spill

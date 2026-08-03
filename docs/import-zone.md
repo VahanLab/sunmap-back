@@ -27,13 +27,18 @@ scripts/import-zone.sh pbf/ile-de-france-latest.osm.pbf
 Extraits Geofabrik : <https://download.geofabrik.de/europe/france.html>
 (Île-de-France ~330 Mo, France entière ~5 Go).
 
-`--upload` : pousse l'archive sur Cloudflare R2 après génération
-(`scripts/r2-upload.py`, variables `R2_*`, cf. plus bas).
+Options :
 
-⚠ **L'archive ne couvre que l'extrait donné.** Il n'y a plus de base
-cumulative : pour couvrir plusieurs zones, partir d'un extrait qui les
-contient toutes (ex. `france-latest`). L'import des lieux, lui, reste un
-upsert cumulatif — relançable sans risque.
+- `--upload` : pousse l'archive sur Cloudflare R2 (`scripts/r2-upload.py`)
+  **puis purge le cache** (`scripts/cf-purge.py`) — cf. § Cloudflare ;
+- `--replace` : repart d'une archive vide au lieu de fusionner.
+
+**Les zones s'accumulent.** Chaque import fusionne l'extrait dans
+`tiles/sunmap.pmtiles` s'il existe déjà : ajouter Rhône-Alpes ne fait pas
+disparaître l'Île-de-France. À identifiant OSM égal, le nouvel extrait
+l'emporte — c'est ce qui fait qu'un réimport applique bien les corrections
+d'OSM. L'import des lieux est un upsert, de même esprit. Tout est donc
+relançable sans risque.
 
 ## Ce que fait chaque étape
 
@@ -45,7 +50,10 @@ upsert cumulatif — relançable sans risque.
    (`amenity=bar|pub|restaurant|cafe|fast_food|biergarten`), mobilier urbain
    (`amenity=bench`, `leisure=picnic_table`).
 3. **`cargo run --release --bin tilegen`** — extrait → `tiles/sunmap.pmtiles`
-   (MVT z14, couches `buildings`/`woods`/`trees`, sans simplification). Les
+   (MVT z14, couches `buildings`/`woods`/`trees`, sans simplification),
+   **fusionné** dans l'archive existante (`--merge`) : les tuiles que le
+   nouvel extrait ne touche pas sont recopiées, les tuiles communes voient
+   leurs objets réunis et dédoublonnés par identifiant OSM. Les
    règles tags → hauteur (`osm::building_from`, `osm::height_from_tags`,
    médiane locale des bâtiments non taggés) s'appliquent ICI, dans le Rust —
    ne jamais les dupliquer ailleurs. Aucune base de données, et une
@@ -65,10 +73,29 @@ psql sunmap -c "SELECT count(*) FROM places;"
 ```
 
 Ordres de grandeur Île-de-France : ~84 500 lieux (dont ~49 500 bancs et
-~2 900 tables de pique-nique). Côté archive : `tilegen` affiche les comptes
-(~2,4 M de bâtiments IdF) ; lancer le serveur et comparer `/canopy/{z}/{x}/{y}`
-et `/trees` à la version précédente — les tests `vtiles` (`cargo test`)
-couvrent l'aller-retour encodeur/lecteur.
+~2 900 tables de pique-nique).
+
+Côté archive, `tilegen` affiche ses comptes et, en fusion, le nombre de
+tuiles ayant reçu des objets de l'archive de base. **Le contrôle qui compte
+après un ajout de zone : vérifier qu'une tuile de l'ANCIENNE zone répond
+encore.** Une régression de fusion se voit là, pas dans les compteurs :
+
+```
+curl -s -o /dev/null -w "%{http_code}\n" \
+  https://tiles.sunmap.tech/sunmap/14/8298/5636.mvt   # Paris
+curl -s -o /dev/null -w "%{http_code}\n" \
+  https://tiles.sunmap.tech/sunmap/14/8412/5844.mvt   # Lyon
+```
+
+**Conformité MVT** : `cargo test -p helios-server vtiles` couvre
+l'aller-retour encodeur/lecteur *et* la conformité des commandes de
+géométrie (`closepath_command_is_spec_compliant`). Ce dernier test existe
+parce que nos décodeurs sont tolérants là où Mapbox ne l'est pas : un
+`ClosePath` mal encodé passait inaperçu tout en rendant les tuiles
+illisibles par le SDK. Toute modification de l'encodeur MVT
+(`helios-server/src/vtiles.rs`) doit garder ces tests verts — et, en cas de
+doute, se relire contre la spec 2.1 plutôt que contre nos propres
+décodeurs.
 
 ## Cloudflare R2
 
@@ -86,9 +113,36 @@ R2_BUCKET=sunmap-tiles
 
 Création côté dashboard Cloudflare : R2 Object Storage → créer le bucket
 (région Europe) → « Manage R2 API Tokens » → jeton limité au bucket en
-lecture/écriture. Pour que le client lise les tuiles : activer l'accès
-public du bucket (URL `r2.dev` pour les tests ; domaine custom en
-production — le `r2.dev` est bridé en débit et sans cache paramétrable).
+lecture/écriture. Le bucket reste **privé** : les tuiles sont servies par le
+Worker (`cloudflare/README.md`), qui y accède par binding interne.
+
+### Purge du cache — indispensable après chaque upload
+
+Le cache du Worker est indexé sur l'URL de la tuile et **ignore le
+remplacement de l'archive**. Sans purge, les tuiles déjà servies restent
+servies dans leur version précédente jusqu'à un jour. `--upload` enchaîne
+donc automatiquement sur `scripts/cf-purge.py`, qui a besoin de deux
+variables (mêmes emplacements que les `R2_*`) :
+
+```
+CLOUDFLARE_ZONE_ID=…      # dashboard → sunmap.tech → Overview, colonne de droite
+CLOUDFLARE_PURGE_TOKEN=…  # jeton API dédié, cf. ci-dessous
+```
+
+Créer le jeton : dashboard → icône de profil → **API Tokens** → *Create
+Token* → *Create Custom Token* :
+
+- **Permissions** : `Zone` → `Cache Purge` → `Purge`
+- **Zone Resources** : `Include` → `Specific zone` → `sunmap.tech`
+
+Ni le jeton R2 (identifiants S3, aucun droit sur le cache) ni celui de
+wrangler (OAuth, `zone (read)` seulement) ne conviennent — il en faut un
+dédié. Variables absentes : le script le signale et laisse passer, l'import
+n'échoue pas pour autant.
+
+La purge est **totale sur la zone** : purger par nom d'hôte ou par préfixe
+est réservé aux offres Enterprise. Sans conséquence ici, `sunmap.tech` et
+`www` étant en « DNS only » (Vercel), les tuiles sont seules en cache.
 
 ## Limites connues
 
@@ -99,5 +153,8 @@ production — le `r2.dev` est bridé en débit et sans cache paramétrable).
 - L'ingestion Overpass (`bin/ingest`) a disparu avec les tables
   géométriques : rafraîchir une zone = retélécharger son extrait PBF (les
   extraits Geofabrik sont quotidiens).
-- Le client lit les tuiles via `GET /vtiles/{z}/{x}/{y}` du serveur tant
-  qu'il n'est pas branché directement sur R2.
+- Le client lit les tuiles via `GET /vtiles/{z}/{x}/{y}` du serveur, qui
+  redirige vers le CDN quand `TILES_URL` est défini.
+- La fusion relit l'archive de base tuile par tuile : le temps de
+  génération croît avec la couverture déjà en place, pas seulement avec le
+  nouvel extrait.

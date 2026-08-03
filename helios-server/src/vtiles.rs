@@ -50,6 +50,9 @@ pub struct VectorStore {
     tile_compression: u8,
     /// Zoom unique de l'archive (min_zoom = max_zoom chez notre générateur).
     zoom: u32,
+    /// Emprise déclarée dans l'en-tête (s, w, n, e) — sert à recalculer
+    /// l'emprise d'une archive fusionnée.
+    bounds: (f64, f64, f64, f64),
 }
 
 fn bad(msg: &str) -> std::io::Error {
@@ -73,6 +76,8 @@ impl VectorStore {
         let tile_compression = header[98];
         let min_zoom = header[100];
         let max_zoom = header[101];
+        let i32_at = |i: usize| i32::from_le_bytes(header[i..i + 4].try_into().unwrap()) as f64 / 1e7;
+        let bounds = (i32_at(106), i32_at(102), i32_at(114), i32_at(110)); // s, w, n, e
         if min_zoom != max_zoom {
             // Le générateur écrit un seul niveau ; un multi-zoom signalerait
             // une archive d'une autre provenance, qu'on refuse plutôt que de
@@ -119,6 +124,7 @@ impl VectorStore {
             tile_data_offset,
             tile_compression,
             zoom: min_zoom as u32,
+            bounds,
         })
     }
 
@@ -245,6 +251,86 @@ impl VectorStore {
             })
             .collect())
     }
+
+    /// Identifiants de toutes les tuiles de l'archive, par ordre croissant.
+    ///
+    /// Sert à la fusion (`bin/tilegen --merge`) : les deux sources étant
+    /// triées, la fusion est une jointure linéaire.
+    pub fn tile_ids(&self) -> Vec<u64> {
+        self.index.iter().map(|e| e.tile_id).collect()
+    }
+
+    /// Contenu brut d'une tuile, décodé mais **ni filtré ni dédoublonné** :
+    /// la tuile telle qu'elle est stockée, avec ses objets débordants.
+    /// C'est ce qu'il faut pour réécrire une tuile à l'identique.
+    pub fn tile_features(
+        &self,
+        x: u32,
+        y: u32,
+    ) -> std::io::Result<(Vec<Building>, Vec<Building>, Vec<Tree>)> {
+        let Some(bytes) = self.tile_bytes(x, y)? else {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        };
+        let layers = decode_mvt(&bytes, self.zoom, x, y)?;
+        let take = |name: &str| layers.get(name).cloned().unwrap_or_default();
+
+        let buildings = take("buildings")
+            .into_iter()
+            .filter_map(|f| f.into_building(None))
+            .collect();
+        let woods = take("woods")
+            .into_iter()
+            .filter_map(|f| {
+                let leaf = LeafType::parse(f.prop_str("leaf_type"));
+                f.into_building(Some(leaf))
+            })
+            .collect();
+        let trees = take("trees")
+            .into_iter()
+            .filter_map(|f| {
+                let &(lat, lng) = f.rings.first()?.first()?;
+                Some(Tree {
+                    osm_id: f.id.clone(),
+                    lat,
+                    lng,
+                    height_m: f.prop_f64("height_m")?,
+                    crown_radius_m: f.prop_f64("crown_radius_m")?,
+                    leaf_type: LeafType::parse(f.prop_str("leaf_type")),
+                })
+            })
+            .collect();
+        Ok((buildings, woods, trees))
+    }
+
+    /// Emprise déclarée dans l'en-tête (s, w, n, e), en degrés.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        self.bounds
+    }
+}
+
+/// Coordonnées de tuile d'un identifiant PMTiles, au zoom donné.
+pub fn tileid_to_zxy(tile_id: u64, z: u32) -> (u32, u32) {
+    let d = tile_id - zxy_to_tileid(z, 0, 0);
+    let n: u64 = 1 << z;
+    let (mut x, mut y) = (0u64, 0u64);
+    let mut t = d;
+    let mut s = 1u64;
+    while s < n {
+        let rx = 1 & (t / 2);
+        let ry = 1 & (t ^ rx);
+        if ry == 0 {
+            if rx == 1 {
+                x = s - 1 - x;
+                y = s - 1 - y;
+            }
+            std::mem::swap(&mut x, &mut y);
+        }
+        x += s * rx;
+        y += s * ry;
+        t /= 4;
+        s *= 2;
+    }
+    (x as u32, y as u32)
 }
 
 fn gunzip(raw: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -335,7 +421,7 @@ fn parse_directory(bytes: &[u8]) -> std::io::Result<Vec<Entry>> {
 /// Objet décodé d'une couche : identifiant, attributs, anneaux (lat, lon).
 /// Un point est un anneau d'un seul sommet.
 #[derive(Clone)]
-struct Feature {
+pub(crate) struct Feature {
     id: String,
     props: HashMap<String, PropValue>,
     rings: Vec<Vec<(f64, f64)>>,
@@ -1192,6 +1278,78 @@ mod tests {
         assert_eq!(t.leaf_type, LeafType::Palm);
         assert!((t.lat - 48.8530).abs() < 2e-5, "lat {}", t.lat);
         assert!((t.lng - 2.3499).abs() < 2e-5, "lng {}", t.lng);
+    }
+
+    /// Garde-fou de conformité MVT : chaque anneau se termine par un
+    /// `ClosePath` de **compteur 1** (`(1 << 3) | 7 = 15`), comme l'exige la
+    /// spec 2.1.
+    ///
+    /// Nos décodeurs (Rust, Swift) ignorent le compteur de cette commande :
+    /// un `7` nu passait donc tous les tests d'aller-retour, tout en étant
+    /// rejeté par un décodeur strict — et Mapbox en est un, ce qui aurait
+    /// bloqué l'affichage des bâtiments et des arbres par le SDK. D'où ce
+    /// test sur l'octet lui-même plutôt que sur un aller-retour.
+    #[test]
+    fn closepath_command_is_spec_compliant() {
+        let square = Building {
+            osm_id: "way/1".into(),
+            name: None,
+            rings: vec![vec![
+                (48.8525, 2.3480),
+                (48.8525, 2.3500),
+                (48.8535, 2.3500),
+                (48.8535, 2.3480),
+            ]],
+            height_m: 10.0,
+            height_from_osm: true,
+            leaf_type: None,
+        };
+        let (tx, ty) = tile_of(48.853, 2.349, ZOOM);
+        let mvt = encode_tile(tx, ty, &[&square], &[], &[]).unwrap();
+
+        // Descente protobuf jusqu'à la géométrie : tuile → couche (champ 3)
+        // → objet (champ 2) → géométrie (champ 4, varints empaquetés).
+        let mut geometry: Vec<u64> = Vec::new();
+        let mut p = 0usize;
+        while p < mvt.len() {
+            let (field, wire) = read_tag(&mvt, &mut p).unwrap();
+            if field != 3 || wire != 2 {
+                skip_field(&mvt, &mut p, wire).unwrap();
+                continue;
+            }
+            let layer = read_bytes(&mvt, &mut p).unwrap().to_vec();
+            let mut q = 0usize;
+            while q < layer.len() {
+                let (lf, lw) = read_tag(&layer, &mut q).unwrap();
+                if lf != 2 || lw != 2 {
+                    skip_field(&layer, &mut q, lw).unwrap();
+                    continue;
+                }
+                let feature = read_bytes(&layer, &mut q).unwrap().to_vec();
+                let mut r = 0usize;
+                while r < feature.len() {
+                    let (ff, fw) = read_tag(&feature, &mut r).unwrap();
+                    if ff == 4 && fw == 2 {
+                        read_packed(&feature, &mut r, &mut geometry).unwrap();
+                    } else {
+                        skip_field(&feature, &mut r, fw).unwrap();
+                    }
+                }
+            }
+        }
+
+        assert!(!geometry.is_empty(), "géométrie introuvable");
+        let last = *geometry.last().unwrap();
+        assert_eq!(
+            last & 0x7,
+            7,
+            "un anneau doit se terminer par ClosePath, trouvé {last}"
+        );
+        assert_eq!(
+            last >> 3,
+            1,
+            "ClosePath doit avoir un compteur de 1 (commande 15), trouvé {last}"
+        );
     }
 
     #[test]
