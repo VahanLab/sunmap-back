@@ -101,9 +101,10 @@ docker compose up -d api
 ```
 
 Notes :
-- **Ordre RAM** : `tilegen` tient l'extrait et l'archive en mémoire — la
-  France entière demande ~20 Go. Sur une VM plus petite, générer l'archive
-  en local et l'y copier (`scp`), ou passer par un sous-extrait régional.
+- **Ordre RAM** : `tilegen` est borné en mémoire (flux + buckets disque,
+  pic = le plus gros bucket, ~1 Go sur la France). C'est `osmium`
+  (assemblage des aires à l'extraction) qui demande le plus — si la VM
+  sature, extraire en local et copier le `.geojsonl` (`scp`).
 - **Couverture** : l'archive ne couvre que l'extrait donné (plus de base
   cumulative) — prendre un extrait englobant toutes les zones voulues.
 - **R2** : la même archive se pousse sur Cloudflare R2

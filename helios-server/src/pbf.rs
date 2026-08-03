@@ -55,13 +55,51 @@ pub struct Extract {
     pub places: Vec<Place>,
 }
 
-/// Trie chaque feature dans sa couche selon ses tags.
-///
-/// Une même feature peut être bâtiment ET terrasse (un restaurant cartographié
-/// comme bâtiment) : les deux couches la reçoivent, chacune l'utilisant pour ce
-/// qu'elle vaut — l'emprise d'un côté, le POI de l'autre.
+/// Une feature de l'extrait, typée par couche. Une même ligne GeoJSON peut en
+/// produire plusieurs : un restaurant cartographié comme bâtiment est à la
+/// fois une emprise et un POI.
+pub enum StreamedFeature {
+    /// ⚠ `height_m` vaut `NaN` quand rien n'est taggé : le consommateur
+    /// applique lui-même la médiane du lot (cf. `osm::fill_missing_heights`) —
+    /// c'est ce qui permet de streamer sans tout retenir.
+    Building(Building),
+    Wood(Wood),
+    Tree(Tree),
+    Place(Place),
+}
+
+/// Trie chaque feature dans sa couche selon ses tags — tout en mémoire, avec
+/// les hauteurs manquantes comblées. Pour un flux borné en RAM, préférer
+/// [`stream_geojsonseq`].
 pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
     let mut out = Extract::default();
+    let ignored = stream_geojsonseq(reader, |f| match f {
+        StreamedFeature::Building(b) => out.buildings.push(b),
+        StreamedFeature::Wood(w) => out.woods.push(w),
+        StreamedFeature::Tree(t) => out.trees.push(t),
+        StreamedFeature::Place(p) => out.places.push(p),
+    })?;
+
+    let fallback = fill_missing_heights(&mut out.buildings);
+    let tagged = out.buildings.iter().filter(|b| b.height_from_osm).count();
+    println!(
+        "extrait : {} emprises ({tagged} avec hauteur OSM, {} au défaut {fallback:.1} m), \
+         {} arbres, {} établissements — {ignored} features ignorées",
+        out.buildings.len(),
+        out.buildings.len() - tagged,
+        out.trees.len(),
+        out.places.len(),
+    );
+    Ok(out)
+}
+
+/// Variante en flux : chaque feature est remise au callback puis oubliée —
+/// la mémoire ne dépend pas de la taille de l'extrait. Renvoie le nombre de
+/// lignes ignorées.
+pub fn stream_geojsonseq<R: BufRead>(
+    reader: R,
+    mut sink: impl FnMut(StreamedFeature),
+) -> Result<usize, String> {
     let mut ignored = 0usize;
 
     for (n, line) in reader.lines().enumerate() {
@@ -105,12 +143,12 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
 
         if wood {
             if let Some(w) = wood_from(osm_id.clone(), &tags, rings(&geometry)) {
-                out.woods.push(w);
+                sink(StreamedFeature::Wood(w));
             }
         }
         if is_building {
             if let Some(b) = building_from(osm_id.clone(), &tags, rings(&geometry)) {
-                out.buildings.push(b);
+                sink(StreamedFeature::Building(b));
             }
         }
         // Arbres et terrasses sont ponctuels : un objet surfacique (un
@@ -119,26 +157,16 @@ pub fn read_geojsonseq<R: BufRead>(reader: R) -> Result<Extract, String> {
         if is_tree || is_terrace || is_furniture {
             if let Some((lat, lng)) = representative_point(&geometry) {
                 if is_tree {
-                    out.trees.push(tree_from(osm_id.clone(), lat, lng, &tags));
+                    sink(StreamedFeature::Tree(tree_from(osm_id.clone(), lat, lng, &tags)));
                 }
                 if is_terrace || is_furniture {
-                    out.places.push(place_from(osm_id, lat, lng, &tags));
+                    sink(StreamedFeature::Place(place_from(osm_id, lat, lng, &tags)));
                 }
             }
         }
     }
 
-    let fallback = fill_missing_heights(&mut out.buildings);
-    let tagged = out.buildings.iter().filter(|b| b.height_from_osm).count();
-    println!(
-        "extrait : {} emprises ({tagged} avec hauteur OSM, {} au défaut {fallback:.1} m), \
-         {} arbres, {} établissements — {ignored} features ignorées",
-        out.buildings.len(),
-        out.buildings.len() - tagged,
-        out.trees.len(),
-        out.places.len(),
-    );
-    Ok(out)
+    Ok(ignored)
 }
 
 /// Identifiant osmium → identifiant OSM canonique, pour rester recoupable avec

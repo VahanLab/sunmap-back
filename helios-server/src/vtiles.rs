@@ -1,10 +1,10 @@
 //! Lecture de `sunmap.pmtiles` : l'artefact vectoriel unique de la géométrie.
 //!
-//! Remplace les tables PostGIS `buildings`/`woods`/`trees` au runtime
-//! (variable `VECTOR_TILES=chemin.pmtiles`) : l'archive est générée par
-//! `scripts/build-pmtiles.py` à l'import d'une zone, et les mêmes octets
-//! servent le calcul serveur, le masque Metal client et l'affichage Mapbox —
-//! ce qu'on voit est ce qui fait l'ombre, par construction.
+//! LA géométrie du serveur (variable `VECTOR_TILES=chemin.pmtiles`,
+//! obligatoire) : l'archive est générée par `bin/tilegen` à l'import d'une
+//! zone, et les mêmes octets servent le calcul serveur, le masque Metal
+//! client et l'affichage Mapbox — ce qu'on voit est ce qui fait l'ombre,
+//! par construction.
 //!
 //! Deux décodeurs maison, volontairement minimaux :
 //!
@@ -23,7 +23,7 @@
 //! aval est en règle pair-impair, l'orientation MVT n'a pas d'importance.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 
 use crate::osm::{Building, LeafType, Tree};
@@ -864,17 +864,31 @@ pub fn encode_tile(
 
 /// Écrit une archive PMTiles v3 complète : tuiles gzip, annuaires gzip,
 /// en-tête de 127 octets — le miroir exact de `VectorStore::open`.
+///
+/// Les blobs de tuiles partent au fil de l'eau dans un fichier de débord
+/// (recopié à la fin derrière l'en-tête et les annuaires) : la mémoire ne
+/// porte que l'index, jamais les gigaoctets de tuiles — c'est ce qui permet
+/// de générer un pays sur une petite VM.
 pub struct ArchiveWriter {
     entries: Vec<Entry>,
-    tile_data: Vec<u8>,
+    spill: std::io::BufWriter<std::fs::File>,
+    spill_path: std::path::PathBuf,
+    offset: u64,
 }
 
 impl ArchiveWriter {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> std::io::Result<Self> {
+        let spill_path = std::env::temp_dir().join(format!(
+            "sunmap-tiles-spill-{}.bin",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&spill_path)?;
+        Ok(Self {
             entries: Vec::new(),
-            tile_data: Vec::new(),
-        }
+            spill: std::io::BufWriter::new(file),
+            spill_path,
+            offset: 0,
+        })
     }
 
     /// Les tuiles doivent arriver par `tile_id` croissant (archive
@@ -889,10 +903,11 @@ impl ArchiveWriter {
         self.entries.push(Entry {
             tile_id,
             run_length: 1,
-            offset: self.tile_data.len() as u64,
+            offset: self.offset,
             length: blob.len() as u64,
         });
-        self.tile_data.extend_from_slice(&blob);
+        self.spill.write_all(&blob)?;
+        self.offset += blob.len() as u64;
         Ok(())
     }
 
@@ -901,13 +916,15 @@ impl ArchiveWriter {
     }
 
     pub fn finish(
-        self,
+        mut self,
         mut out: impl std::io::Write,
         bbox: (f64, f64, f64, f64), // (s, w, n, e)
     ) -> std::io::Result<()> {
         if self.entries.is_empty() {
+            std::fs::remove_file(&self.spill_path).ok();
             return Err(bad("archive sans tuile"));
         }
+        self.spill.flush()?;
         // Annuaire racine : toutes les entrées si ça tient sous la limite de
         // 16 384 − 127 octets de la spec, sinon des feuilles de 4 096 entrées
         // pointées par la racine (un seul niveau, comme le lecteur).
@@ -951,7 +968,7 @@ impl ArchiveWriter {
             leaf_offset,
             leaves_bytes.len() as u64,
             tile_data_offset,
-            self.tile_data.len() as u64,
+            self.offset,
             self.entries.len() as u64, // addressed
             self.entries.len() as u64, // entries
             self.entries.len() as u64, // contents (pas de dédup)
@@ -978,7 +995,9 @@ impl ArchiveWriter {
         out.write_all(&root_bytes)?;
         out.write_all(&metadata)?;
         out.write_all(&leaves_bytes)?;
-        out.write_all(&self.tile_data)?;
+        let mut spill = std::fs::File::open(&self.spill_path)?;
+        std::io::copy(&mut spill, &mut out)?;
+        std::fs::remove_file(&self.spill_path).ok();
         Ok(())
     }
 }
@@ -1147,7 +1166,7 @@ mod tests {
 
         let (tx, ty) = tile_of(48.853, 2.348, ZOOM);
         let mvt = encode_tile(tx, ty, &[&square], &[&wood], &[&tree]).unwrap();
-        let mut writer = ArchiveWriter::new();
+        let mut writer = ArchiveWriter::new().unwrap();
         writer.add_tile(zxy_to_tileid(ZOOM, tx, ty), &mvt).unwrap();
         let path = std::env::temp_dir().join("vtiles_roundtrip.pmtiles");
         let file = std::fs::File::create(&path).unwrap();

@@ -48,9 +48,10 @@ upsert cumulatif — relançable sans risque.
    (MVT z14, couches `buildings`/`woods`/`trees`, sans simplification). Les
    règles tags → hauteur (`osm::building_from`, `osm::height_from_tags`,
    médiane locale des bâtiments non taggés) s'appliquent ICI, dans le Rust —
-   ne jamais les dupliquer ailleurs. Aucune base de données. Tout tient en
-   mémoire : l'Île-de-France passe large, la France entière demande ~20 Go
-   de RAM.
+   ne jamais les dupliquer ailleurs. Aucune base de données, et une
+   **mémoire bornée** (deux passes en flux + buckets disque par plage de
+   tuiles Hilbert, blobs débordés dans un fichier temporaire) : le pic est
+   le plus gros bucket, pas le pays — une VM de 4 Go passe la France.
 4. **`cargo run --release --bin import`** — lieux vers PostgreSQL (upsert).
 
 Le serveur consomme l'archive via `VECTOR_TILES=tiles/sunmap.pmtiles`
@@ -91,9 +92,10 @@ production — le `r2.dev` est bridé en débit et sans cache paramétrable).
 
 ## Limites connues
 
-- `tilegen` tient l'extrait et l'archive en mémoire : pour un territoire
-  plus grand que la France, générer par sous-extraits et fusionner (à
-  outiller le jour venu).
+- `tilegen` est borné en mémoire (buckets disque), mais `osmium`
+  (l'assemblage des aires de l'étape d'extraction) reste le passage le plus
+  gourmand sur un très gros extrait — surveiller la RAM de la VM sur la
+  France entière.
 - L'ingestion Overpass (`bin/ingest`) a disparu avec les tables
   géométriques : rafraîchir une zone = retélécharger son extrait PBF (les
   extraits Geofabrik sont quotidiens).
