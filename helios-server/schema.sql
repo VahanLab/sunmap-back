@@ -17,51 +17,14 @@
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- ---------------------------------------------------------------- bâtiments
+-- --------------------------------------------------------- géométrie (aucune)
 
--- Un enregistrement par objet OSM porteur d'un volume : `way[building]`,
--- `way[building:part]` et `relation[building]`. Les relations arrivent en
--- MultiPolygon avec leurs anneaux intérieurs — c'est ce qui garde les cours
--- creuses au moment de la rasterisation.
-CREATE TABLE IF NOT EXISTS buildings (
-    osm_id           text PRIMARY KEY,          -- "way/123", "relation/456"
-    name             text,
-    height_m         real NOT NULL,
-    -- false = hauteur déduite (médiane locale) faute de tag OSM. Conservé pour
-    -- pouvoir signaler dans l'app qu'une ombre repose sur une estimation.
-    height_from_osm  boolean NOT NULL,
-    geom             geometry(MultiPolygon, 4326) NOT NULL
-);
-
--- ------------------------------------------------------------------ arbres
-
-CREATE TABLE IF NOT EXISTS trees (
-    osm_id           text PRIMARY KEY,
-    height_m         double precision NOT NULL,
-    crown_radius_m   double precision NOT NULL,
-    geom             geometry(Point, 4326) NOT NULL
-);
-
--- ------------------------------------------------------------------ bois
-
--- Emprises boisées : forêts, bois, alignements d'arbres.
---
--- Table à part des bâtiments malgré une forme identique — un contour et une
--- hauteur — parce que leur ombre n'est pas de même nature : un bâtiment est
--- opaque, une canopée laisse passer une partie du soleil. La distinction est
--- portée par la table plutôt que par une colonne, pour que rien ne puisse
--- confondre les deux en chemin.
---
--- OSM ne donne jamais la hauteur d'une forêt ; celle stockée ici est un repli
--- par type, à remplacer par un modèle de hauteur de canopée (Meta/WRI CHM ou
--- IGN MNH).
-CREATE TABLE IF NOT EXISTS woods (
-    osm_id           text PRIMARY KEY,
-    name             text,
-    height_m         real NOT NULL,
-    height_from_osm  boolean NOT NULL,
-    geom             geometry(MultiPolygon, 4326) NOT NULL
-);
+-- Les tables `buildings`, `trees` et `woods` ont existé ici jusqu'en août
+-- 2026, puis ont été supprimées (migration `drop_geometry_tables`) : la
+-- géométrie vit dans l'archive vectorielle `sunmap.pmtiles`, générée par
+-- `bin/tilegen` directement depuis l'extrait OSM et lue par le serveur via
+-- `VECTOR_TILES` (cf. docs/tuiles-pmtiles.md). PostgreSQL ne porte que le
+-- métier : lieux, comptes, contributions.
 
 -- --------------------------------------------------------------- terrasses
 
@@ -214,21 +177,5 @@ CREATE INDEX IF NOT EXISTS place_furniture_contributions_place_idx
 
 -- GIST sur chaque géométrie : c'est ce qui rend le `&&` par bounding box
 -- utilisable à chaque déplacement de carte.
-CREATE INDEX IF NOT EXISTS buildings_geom_idx ON buildings USING GIST (geom);
-CREATE INDEX IF NOT EXISTS trees_geom_idx     ON trees     USING GIST (geom);
-CREATE INDEX IF NOT EXISTS woods_geom_idx     ON woods     USING GIST (geom);
 CREATE INDEX IF NOT EXISTS places_geom_idx  ON places  USING GIST (geom);
 CREATE INDEX IF NOT EXISTS place_terraces_geom_idx ON place_terraces USING GIST (geom);
-
--- ------------------------------------------------------ suivi d'ingestion
-
--- L'init de Paris passe par plusieurs dizaines de requêtes Overpass. Tracer
--- les tuiles déjà absorbées rend l'ingestion reprenable après un 504 ou une
--- coupure, au lieu de tout refaire.
-CREATE TABLE IF NOT EXISTS ingest_log (
-    layer        text NOT NULL,   -- 'buildings' | 'trees' | 'places'
-    chunk_key    text NOT NULL,   -- bbox arrondie de la tuile Overpass
-    ingested_at  timestamptz NOT NULL DEFAULT now(),
-    feature_count integer NOT NULL,
-    PRIMARY KEY (layer, chunk_key)
-);

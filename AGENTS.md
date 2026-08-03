@@ -98,20 +98,23 @@ Fonctionnalités cibles :
      `POST/PUT /places/furniture` + `GET /places/furniture/contributions`,
      `POST /places/terrace` + `GET /places/terrace/contributions`,
      `GET /sun-hours`, `GET /trees`, `GET /debug/ray`, comptes/profils.
-6. **Géométrie OSM en PostgreSQL/PostGIS**, plus d'Overpass au runtime.
-   Overpass met 5-20 s par bbox dense, répond 504 aux heures de pointe et
-   impose une politesse incompatible avec une requête par déplacement de
-   carte. Requêtes par bbox servies par index GIST. Schéma :
-   `helios-server/schema.sql`.
-7. **Remplissage de la base par extrait PBF + osmium** (`scripts/osm-extract.sh`
-   puis `bin/import`), pas par Overpass. Overpass par tuiles demandait 192
-   requêtes et ~45 min pour Paris seul, avec 27 échecs au premier essai —
-   irréaliste à l'échelle de la France, et abusif envers un service gratuit
-   partagé. L'extrait Geofabrik se traite en local en ~1 min. `bin/ingest`
-   (Overpass) est conservé pour rafraîchir une petite zone. Les deux écrivent
-   les mêmes identifiants et partagent les mêmes règles tags → hauteur
-   (`osm::building_from`, `osm::height_from_tags`) : ne jamais dupliquer ces
-   règles, elles ont coûté cher à mettre au point.
+6. Géométrie OSM d'abord en **PostgreSQL/PostGIS** (plus d'Overpass au
+   runtime — 5-20 s par bbox dense, 504 fréquents), puis **sortie de la base
+   au profit de l'archive vectorielle** `sunmap.pmtiles` (2026-08) : les
+   tables `buildings`/`trees`/`woods` sont supprimées, la géométrie va de
+   l'extrait OSM à l'archive (`bin/tilegen`) et le serveur la lit là
+   (`vtiles.rs`, `VECTOR_TILES` obligatoire). PostgreSQL ne garde que le
+   métier : lieux, comptes, contributions. Schéma : `helios-server/schema.sql`.
+7. **Alimentation par extrait PBF + osmium** (`scripts/osm-extract.sh`),
+   jamais par Overpass. Overpass par tuiles demandait 192 requêtes et
+   ~45 min pour Paris seul, avec 27 échecs au premier essai — irréaliste à
+   l'échelle de la France, et abusif envers un service gratuit partagé.
+   L'extrait Geofabrik se traite en local en quelques minutes ; rafraîchir
+   une zone = reprendre l'extrait du jour (quotidien chez Geofabrik —
+   `bin/ingest` a disparu avec les tables). Les règles tags → hauteur
+   (`osm::building_from`, `osm::height_from_tags`) vivent dans `osm.rs`/
+   `pbf.rs` : ne jamais les dupliquer, elles ont coûté cher à mettre au
+   point.
 8. Animation fluide du slider — **tranchée par le bitfield `sun_day`**
    (variante par-lieu de l'option « bitfield temporel » envisagée) : le
    serveur calcule la journée entière de chaque lieu en un passage de DSM
@@ -256,23 +259,24 @@ main. Protocole complet : `helios-server/README.md`.
 ## Importer une nouvelle zone (procédure réutilisable)
 
 Ajouter une zone = **une commande**, qui enchaîne téléchargement PBF →
-extraction osmium → import PostGIS (bâtiments, végétation, établissements,
-mobilier urbain) → génération de `tiles/sunmap.pmtiles`, l'archive
-vectorielle unique (MVT z14, couches `buildings`/`woods`/`trees`) :
+extraction osmium → `bin/tilegen` (extrait → `tiles/sunmap.pmtiles`,
+l'archive vectorielle unique, MVT z14, couches `buildings`/`woods`/`trees`,
+**sans base de données**) → `bin/import` (lieux seuls vers PostgreSQL) :
 
-    scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--purge]
+    scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload]
 
 Procédure détaillée, vérifications et configuration R2 :
 **`docs/import-zone.md`**. Format et service de l'archive :
-`docs/tuiles-pmtiles.md`. À savoir : l'import est un upsert (relançable) ;
-l'archive couvre toute la base, pas la seule zone importée ; `--upload`
-pousse sur Cloudflare R2 (variables `R2_*` dans `helios-server/.env`) ;
-`--purge` vide les tables géométriques — PostGIS ne garde que lieux et
-contributions, à ne faire que si le serveur tourne avec
-`VECTOR_TILES=tiles/sunmap.pmtiles`. Le serveur lit l'archive
-(`vtiles.rs`) en priorité, sinon `BUILDINGS_TILES` (HBT, déprécié), sinon
-PostGIS — parité mesurée : `/sunlit` identique, `/canopy` à ~0,1 % de pixels
-d'écart (quantification ~0,6 m), arbres à ±0,2 m.
+`docs/tuiles-pmtiles.md`. À savoir : **les tables géométriques n'existent
+plus** (migration `drop_geometry_tables`) — PostgreSQL ne porte que lieux,
+comptes et contributions, et `VECTOR_TILES=tiles/sunmap.pmtiles` est
+obligatoire au démarrage du serveur. L'archive ne couvre que l'extrait
+donné (plus de base cumulative) : pour plusieurs zones, prendre un extrait
+englobant (ex. `france-latest`). L'import des lieux reste un upsert.
+`--upload` pousse sur Cloudflare R2 (`scripts/r2-upload.py`, variables
+`R2_*` dans `helios-server/.env`). Parité mesurée à la bascule : `/sunlit`
+identique, `/canopy` à ~0,1 % de pixels d'écart (quantification ~0,6 m),
+arbres à ±0,2 m.
 
 ## Prochaines étapes (dans l'ordre)
 

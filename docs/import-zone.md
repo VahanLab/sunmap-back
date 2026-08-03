@@ -1,41 +1,39 @@
 # Importer une nouvelle zone (extrait PBF)
 
-Procédure pour ajouter une zone géographique à SunMap : remplir PostGIS
-(bâtiments, végétation, établissements, mobilier urbain) depuis un extrait
-OSM, puis régénérer `tiles/sunmap.pmtiles` — l'archive vectorielle unique qui
-sert le calcul serveur comme le client (cf. `docs/tuiles-pmtiles.md`).
-Relançable sans risque — l'import est un upsert, réimporter une zone la
-rafraîchit.
+Procédure pour couvrir une zone géographique : générer l'archive vectorielle
+`tiles/sunmap.pmtiles` (bâtiments, végétation — cf. `docs/tuiles-pmtiles.md`)
+et charger les lieux (établissements, mobilier urbain) en base. **La
+géométrie ne passe plus par PostgreSQL** : elle va de l'extrait OSM à
+l'archive, directement.
 
 ## Prérequis
 
 - `osmium` (`brew install osmium-tool`) ;
-- Rust (le binaire `import` du workspace) ;
-- PostgreSQL + PostGIS joignable via `DATABASE_URL`
-  (défaut : `postgres://localhost/sunmap`, comme le serveur — les migrations
-  s'appliquent au premier démarrage du serveur, pas à l'import) ;
-- `python3` (le venv `.venv-tiles` se crée tout seul au premier lancement).
+- Rust (binaires `tilegen` et `import` du workspace) ;
+- PostgreSQL + PostGIS joignable via `DATABASE_URL` (défaut :
+  `postgres://localhost/sunmap`) — **pour les lieux uniquement** :
+  établissements, mobilier urbain, comptes, contributions. Les migrations
+  s'appliquent au démarrage du serveur.
 
 ## La commande
 
 Tout le pipeline tient en une commande, URL Geofabrik ou PBF déjà téléchargé :
 
 ```
-scripts/import-zone.sh https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf
-scripts/import-zone.sh pbf/ile-de-france-latest.osm.pbf --upload
+scripts/import-zone.sh https://download.geofabrik.de/europe/france-latest.osm.pbf --upload
+scripts/import-zone.sh pbf/ile-de-france-latest.osm.pbf
 ```
 
 Extraits Geofabrik : <https://download.geofabrik.de/europe/france.html>
-(Île-de-France ~336 Mo, France entière ~5 Go).
+(Île-de-France ~330 Mo, France entière ~5 Go).
 
-Options :
+`--upload` : pousse l'archive sur Cloudflare R2 après génération
+(`scripts/r2-upload.py`, variables `R2_*`, cf. plus bas).
 
-- `--upload` : pousse `sunmap.pmtiles` sur Cloudflare R2 après génération
-  (variables `R2_*`, cf. plus bas) ;
-- `--purge` : vide `buildings`/`trees`/`woods` après génération — PostGIS ne
-  garde que les lieux et les contributions. **Seulement si le serveur tourne
-  avec `VECTOR_TILES=tiles/sunmap.pmtiles`** ; sans archive, plus de
-  géométrie du tout. La régénération suivante repasse par un import.
+⚠ **L'archive ne couvre que l'extrait donné.** Il n'y a plus de base
+cumulative : pour couvrir plusieurs zones, partir d'un extrait qui les
+contient toutes (ex. `france-latest`). L'import des lieux, lui, reste un
+upsert cumulatif — relançable sans risque.
 
 ## Ce que fait chaque étape
 
@@ -46,43 +44,37 @@ Options :
    `wood`, `tree_row`, `scrub`, `landuse=forest`), établissements
    (`amenity=bar|pub|restaurant|cafe|fast_food|biergarten`), mobilier urbain
    (`amenity=bench`, `leisure=picnic_table`).
-3. **`cargo run --release --bin import`** — remplit les tables `buildings`,
-   `trees`, `woods`, `places`. C'est ICI que vivent les règles tags → hauteur
-   (`osm::building_from`, `osm::height_from_tags`) : médiane locale pour les
-   bâtiments sans tag, replis par type pour la végétation, déduction
-   `leaf_type` depuis le genre. Ne jamais les dupliquer ailleurs.
-4. **`scripts/build-pmtiles.py`** — génère `tiles/sunmap.pmtiles` (MVT z14,
-   couches `buildings`/`woods`/`trees`, sans simplification — format détaillé
-   dans `docs/tuiles-pmtiles.md`). ⚠ L'archive couvre l'emprise **totale** de
-   la base (`ST_Extent`), pas seulement la zone importée : chaque import
-   re-tuile tout, et le remplacement sur R2 est atomique. Un `--selftest`
-   (aller-retour d'encodage MVT) est joué avant chaque génération.
+3. **`cargo run --release --bin tilegen`** — extrait → `tiles/sunmap.pmtiles`
+   (MVT z14, couches `buildings`/`woods`/`trees`, sans simplification). Les
+   règles tags → hauteur (`osm::building_from`, `osm::height_from_tags`,
+   médiane locale des bâtiments non taggés) s'appliquent ICI, dans le Rust —
+   ne jamais les dupliquer ailleurs. Aucune base de données. Tout tient en
+   mémoire : l'Île-de-France passe large, la France entière demande ~20 Go
+   de RAM.
+4. **`cargo run --release --bin import`** — lieux vers PostgreSQL (upsert).
 
 Le serveur consomme l'archive via `VECTOR_TILES=tiles/sunmap.pmtiles`
-(`helios-server/.env`) ; sans la variable il lit PostGIS comme avant —
-c'est le rollback.
+(`helios-server/.env`) — variable **obligatoire** : sans elle il refuse de
+démarrer, un serveur sans géométrie classerait tout au soleil.
 
 ## Vérifier
 
 ```
-psql sunmap -c "SELECT (SELECT count(*) FROM buildings) AS buildings,
-                       (SELECT count(*) FROM trees)     AS trees,
-                       (SELECT count(*) FROM woods)     AS woods,
-                       (SELECT count(*) FROM places)    AS places;"
+psql sunmap -c "SELECT count(*) FROM places;"
 ```
 
-Ordres de grandeur Île-de-France : ~2,4 M de bâtiments, ~49 500 bancs et
-~2 900 tables de pique-nique dans `places`. Côté archive : lancer le serveur
-avec `VECTOR_TILES=` et comparer `/canopy/{z}/{x}/{y}`, `/trees` et quelques
-`/sunlit` à l'instance PostGIS — attendu : mêmes classifications, ~0,1 % de
-pixels d'écart en bord de polygone (quantification ~0,6 m), positions
-d'arbres à ±0,2 m.
+Ordres de grandeur Île-de-France : ~84 500 lieux (dont ~49 500 bancs et
+~2 900 tables de pique-nique). Côté archive : `tilegen` affiche les comptes
+(~2,4 M de bâtiments IdF) ; lancer le serveur et comparer `/canopy/{z}/{x}/{y}`
+et `/trees` à la version précédente — les tests `vtiles` (`cargo test`)
+couvrent l'aller-retour encodeur/lecteur.
 
 ## Cloudflare R2
 
 L'archive est servie statiquement depuis un bucket R2 (requêtes HTTP Range,
-pas de serveur de tuiles). Le script d'upload lit quatre variables, depuis
-l'environnement ou `helios-server/.env` (gitignoré, jamais dans le dépôt) :
+pas de serveur de tuiles). `scripts/r2-upload.py` lit quatre variables,
+depuis l'environnement ou `helios-server/.env` (gitignoré, jamais dans le
+dépôt) :
 
 ```
 R2_ACCOUNT_ID=…          # Account ID Cloudflare (page d'aperçu R2)
@@ -99,12 +91,11 @@ production — le `r2.dev` est bridé en débit et sans cache paramétrable).
 
 ## Limites connues
 
-- `build-pmtiles.py` interroge PostGIS tuile par tuile ; l'archive z14 de
-  l'Île-de-France se génère en quelques minutes (~7 000 tuiles candidates).
-- Après `--purge`, les endpoints et le calcul tournent sur l'archive ; toute
-  régénération demande de réimporter la ou les zones voulues.
-- `bin/ingest` (rafraîchissement Overpass d'une petite zone) écrit en base :
-  relancer `build-pmtiles.py` ensuite pour voir le changement dans l'archive.
-- Les tuiles internes HBT (`tilebuild`, `BUILDINGS_TILES`) restent
-  disponibles mais sont dépréciées : `VECTOR_TILES` les remplace, bâtiments
-  ET végétation.
+- `tilegen` tient l'extrait et l'archive en mémoire : pour un territoire
+  plus grand que la France, générer par sous-extraits et fusionner (à
+  outiller le jour venu).
+- L'ingestion Overpass (`bin/ingest`) a disparu avec les tables
+  géométriques : rafraîchir une zone = retélécharger son extrait PBF (les
+  extraits Geofabrik sont quotidiens).
+- Le client lit les tuiles via `GET /vtiles/{z}/{x}/{y}` du serveur tant
+  qu'il n'est pas branché directement sur R2.

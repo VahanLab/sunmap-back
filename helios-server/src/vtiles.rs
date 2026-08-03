@@ -599,6 +599,439 @@ fn skip_field(bytes: &[u8], p: &mut usize, wire: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------ écriture
+//
+// Le pendant du lecteur : `bin/tilegen` encode l'archive directement depuis un
+// extrait GeoJSONSeq (`pbf::read_geojsonseq`), sans passer par PostGIS — les
+// tables géométriques n'existent plus, l'archive EST la géométrie. Encodeur et
+// décodeur vivent dans le même fichier pour qu'une évolution de schéma ne
+// puisse pas en oublier un.
+
+/// Zoom unique de l'archive : tuile ~2,4 km, extent 4096 → pas ~0,6 m, petit
+/// devant le pixel DSM (~1,57 m).
+pub const ZOOM: u32 = 14;
+const EXTENT: u64 = 4096;
+
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn put_tag(out: &mut Vec<u8>, field: u64, wire: u64) {
+    put_varint(out, field << 3 | wire);
+}
+
+fn put_bytes(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    put_tag(out, field, 2);
+    put_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn zigzag_enc(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+/// Valeur d'attribut encodée en message `Value` MVT.
+enum EncValue<'a> {
+    Str(&'a str),
+    Double(f64),
+    Bool(bool),
+}
+
+fn encode_value(v: &EncValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    match v {
+        EncValue::Str(s) => put_bytes(&mut out, 1, s.as_bytes()),
+        EncValue::Double(d) => {
+            put_tag(&mut out, 3, 1);
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        EncValue::Bool(b) => {
+            put_tag(&mut out, 7, 0);
+            put_varint(&mut out, u64::from(*b));
+        }
+    }
+    out
+}
+
+/// Une couche en cours d'encodage : tables de clés/valeurs dédupliquées.
+struct LayerEncoder {
+    name: &'static str,
+    keys: Vec<String>,
+    values: Vec<Vec<u8>>,
+    value_index: HashMap<Vec<u8>, u64>,
+    features: Vec<Vec<u8>>,
+}
+
+impl LayerEncoder {
+    fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            keys: Vec::new(),
+            values: Vec::new(),
+            value_index: HashMap::new(),
+            features: Vec::new(),
+        }
+    }
+
+    fn key_id(&mut self, key: &str) -> u64 {
+        if let Some(i) = self.keys.iter().position(|k| k == key) {
+            return i as u64;
+        }
+        self.keys.push(key.to_string());
+        (self.keys.len() - 1) as u64
+    }
+
+    fn value_id(&mut self, value: &EncValue) -> u64 {
+        let bytes = encode_value(value);
+        if let Some(&i) = self.value_index.get(&bytes) {
+            return i;
+        }
+        let i = self.values.len() as u64;
+        self.value_index.insert(bytes.clone(), i);
+        self.values.push(bytes);
+        i
+    }
+
+    /// `geom_type` : 1 = point, 3 = polygone (spec MVT).
+    fn push_feature(&mut self, props: &[(&str, EncValue)], geom_type: u64, geometry: &[u64]) {
+        let mut tags: Vec<u64> = Vec::with_capacity(props.len() * 2);
+        for (k, v) in props {
+            tags.push(self.key_id(k));
+            tags.push(self.value_id(v));
+        }
+        let mut f = Vec::new();
+        let mut packed = Vec::new();
+        for t in &tags {
+            put_varint(&mut packed, *t);
+        }
+        put_bytes(&mut f, 2, &packed);
+        put_tag(&mut f, 3, 0);
+        put_varint(&mut f, geom_type);
+        let mut geo = Vec::new();
+        for g in geometry {
+            put_varint(&mut geo, *g);
+        }
+        put_bytes(&mut f, 4, &geo);
+        self.features.push(f);
+    }
+
+    fn finish(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_tag(&mut out, 15, 0);
+        put_varint(&mut out, 2); // version
+        put_bytes(&mut out, 1, self.name.as_bytes());
+        for f in &self.features {
+            put_bytes(&mut out, 2, f);
+        }
+        for k in &self.keys {
+            put_bytes(&mut out, 3, k.as_bytes());
+        }
+        for v in &self.values {
+            put_bytes(&mut out, 4, v);
+        }
+        put_tag(&mut out, 5, 0);
+        put_varint(&mut out, EXTENT);
+        out
+    }
+}
+
+/// Coordonnée géographique → coordonnée de tuile (entière, y vers le bas).
+fn tile_coord(lat: f64, lon: f64, z: u32, tx: u32, ty: u32) -> (i64, i64) {
+    let n = f64::powi(2.0, z as i32);
+    let fx = (lon + 180.0) / 360.0 * n - tx as f64;
+    let fy = (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n - ty as f64;
+    (
+        (fx * EXTENT as f64).round() as i64,
+        (fy * EXTENT as f64).round() as i64,
+    )
+}
+
+/// Commandes de géométrie d'un polygone : chaque anneau = MoveTo + LineTo +
+/// ClosePath. Le point de fermeture dupliqué du GeoJSON est retiré, ClosePath
+/// le porte.
+fn polygon_geometry(rings: &[Vec<(f64, f64)>], z: u32, tx: u32, ty: u32) -> Vec<u64> {
+    let mut out = Vec::new();
+    let (mut cx, mut cy) = (0i64, 0i64);
+    for ring in rings {
+        let mut pts: Vec<(i64, i64)> = ring
+            .iter()
+            .map(|&(lat, lon)| tile_coord(lat, lon, z, tx, ty))
+            .collect();
+        if pts.len() >= 2 && pts.first() == pts.last() {
+            pts.pop();
+        }
+        if pts.len() < 3 {
+            continue;
+        }
+        out.push(1 << 3 | 1); // MoveTo, 1 point
+        out.push(zigzag_enc(pts[0].0 - cx));
+        out.push(zigzag_enc(pts[0].1 - cy));
+        (cx, cy) = pts[0];
+        out.push(((pts.len() as u64 - 1) << 3) | 2); // LineTo, n-1 points
+        for &(px, py) in &pts[1..] {
+            out.push(zigzag_enc(px - cx));
+            out.push(zigzag_enc(py - cy));
+            (cx, cy) = (px, py);
+        }
+        out.push(7); // ClosePath
+    }
+    out
+}
+
+/// Encode la tuile MVT (non compressée) pour ces objets. `None` si vide.
+pub fn encode_tile(
+    tx: u32,
+    ty: u32,
+    buildings: &[&Building],
+    woods: &[&Building],
+    trees: &[&Tree],
+) -> Option<Vec<u8>> {
+    if buildings.is_empty() && woods.is_empty() && trees.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+
+    // Hauteurs arrondies au décimètre : stable, et le centimètre de plus
+    // n'existe pas dans la donnée source.
+    let dm = |v: f64| (v * 10.0).round() / 10.0;
+
+    for (name, list, leaf) in [("buildings", buildings, false), ("woods", woods, true)] {
+        if list.is_empty() {
+            continue;
+        }
+        let mut layer = LayerEncoder::new(name);
+        for b in list {
+            let geometry = polygon_geometry(&b.rings, ZOOM, tx, ty);
+            if geometry.is_empty() {
+                continue;
+            }
+            let mut props: Vec<(&str, EncValue)> = vec![
+                ("id", EncValue::Str(&b.osm_id)),
+                ("height_m", EncValue::Double(dm(b.height_m as f64))),
+                ("height_from_osm", EncValue::Bool(b.height_from_osm)),
+            ];
+            if let Some(name) = &b.name {
+                props.push(("name", EncValue::Str(name)));
+            }
+            if leaf {
+                props.push((
+                    "leaf_type",
+                    EncValue::Str(b.leaf_type.unwrap_or(LeafType::Broadleaved).as_str()),
+                ));
+            }
+            layer.push_feature(&props, 3, &geometry);
+        }
+        if !layer.features.is_empty() {
+            put_bytes(&mut out, 3, &layer.finish());
+        }
+    }
+
+    if !trees.is_empty() {
+        let mut layer = LayerEncoder::new("trees");
+        for t in trees {
+            let (px, py) = tile_coord(t.lat, t.lng, ZOOM, tx, ty);
+            let geometry = vec![1 << 3 | 1, zigzag_enc(px), zigzag_enc(py)];
+            layer.push_feature(
+                &[
+                    ("id", EncValue::Str(&t.osm_id)),
+                    ("height_m", EncValue::Double(dm(t.height_m))),
+                    ("crown_radius_m", EncValue::Double(dm(t.crown_radius_m))),
+                    ("leaf_type", EncValue::Str(t.leaf_type.as_str())),
+                ],
+                1,
+                &geometry,
+            );
+        }
+        put_bytes(&mut out, 3, &layer.finish());
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+// ----------------------------------------------------------- archive PMTiles
+
+/// Écrit une archive PMTiles v3 complète : tuiles gzip, annuaires gzip,
+/// en-tête de 127 octets — le miroir exact de `VectorStore::open`.
+pub struct ArchiveWriter {
+    entries: Vec<Entry>,
+    tile_data: Vec<u8>,
+}
+
+impl ArchiveWriter {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            tile_data: Vec::new(),
+        }
+    }
+
+    /// Les tuiles doivent arriver par `tile_id` croissant (archive
+    /// « clustered » : lectures Range voisines côté client).
+    pub fn add_tile(&mut self, tile_id: u64, mvt: &[u8]) -> std::io::Result<()> {
+        if let Some(last) = self.entries.last() {
+            if tile_id <= last.tile_id {
+                return Err(bad("tuiles hors ordre"));
+            }
+        }
+        let blob = gzip_bytes(mvt)?;
+        self.entries.push(Entry {
+            tile_id,
+            run_length: 1,
+            offset: self.tile_data.len() as u64,
+            length: blob.len() as u64,
+        });
+        self.tile_data.extend_from_slice(&blob);
+        Ok(())
+    }
+
+    pub fn tile_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn finish(
+        self,
+        mut out: impl std::io::Write,
+        bbox: (f64, f64, f64, f64), // (s, w, n, e)
+    ) -> std::io::Result<()> {
+        if self.entries.is_empty() {
+            return Err(bad("archive sans tuile"));
+        }
+        // Annuaire racine : toutes les entrées si ça tient sous la limite de
+        // 16 384 − 127 octets de la spec, sinon des feuilles de 4 096 entrées
+        // pointées par la racine (un seul niveau, comme le lecteur).
+        let root_all = gzip_bytes(&serialize_directory(&self.entries))?;
+        let (root_bytes, leaves_bytes) = if root_all.len() <= 16_384 - 127 {
+            (root_all, Vec::new())
+        } else {
+            let mut leaves = Vec::new();
+            let mut pointers = Vec::new();
+            for chunk in self.entries.chunks(4096) {
+                let leaf = gzip_bytes(&serialize_directory(chunk))?;
+                pointers.push(Entry {
+                    tile_id: chunk[0].tile_id,
+                    run_length: 0,
+                    offset: leaves.len() as u64,
+                    length: leaf.len() as u64,
+                });
+                leaves.extend_from_slice(&leaf);
+            }
+            (gzip_bytes(&serialize_directory(&pointers))?, leaves)
+        };
+
+        let metadata = gzip_bytes(
+            r#"{"name":"sunmap","attribution":"© OpenStreetMap contributors","description":"Géométrie SunMap : buildings, woods, trees — objets entiers dupliqués par tuile (dédoublonner par id)"}"#
+                .as_bytes(),
+        )?;
+
+        let root_offset = 127u64;
+        let metadata_offset = root_offset + root_bytes.len() as u64;
+        let leaf_offset = metadata_offset + metadata.len() as u64;
+        let tile_data_offset = leaf_offset + leaves_bytes.len() as u64;
+
+        let mut header = Vec::with_capacity(127);
+        header.extend_from_slice(b"PMTiles");
+        header.push(3);
+        for v in [
+            root_offset,
+            root_bytes.len() as u64,
+            metadata_offset,
+            metadata.len() as u64,
+            leaf_offset,
+            leaves_bytes.len() as u64,
+            tile_data_offset,
+            self.tile_data.len() as u64,
+            self.entries.len() as u64, // addressed
+            self.entries.len() as u64, // entries
+            self.entries.len() as u64, // contents (pas de dédup)
+        ] {
+            header.extend_from_slice(&v.to_le_bytes());
+        }
+        header.push(1); // clustered
+        header.push(2); // internal_compression gzip
+        header.push(2); // tile_compression gzip
+        header.push(1); // tile_type MVT
+        header.push(ZOOM as u8); // min_zoom
+        header.push(ZOOM as u8); // max_zoom
+        let (s, w, n, e) = bbox;
+        for v in [w, s, e, n] {
+            header.extend_from_slice(&((v * 1e7) as i32).to_le_bytes());
+        }
+        header.push(ZOOM as u8); // center_zoom
+        for v in [(w + e) / 2.0, (s + n) / 2.0] {
+            header.extend_from_slice(&((v * 1e7) as i32).to_le_bytes());
+        }
+        debug_assert_eq!(header.len(), 127);
+
+        out.write_all(&header)?;
+        out.write_all(&root_bytes)?;
+        out.write_all(&metadata)?;
+        out.write_all(&leaves_bytes)?;
+        out.write_all(&self.tile_data)?;
+        Ok(())
+    }
+}
+
+fn serialize_directory(entries: &[Entry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_varint(&mut out, entries.len() as u64);
+    let mut last = 0u64;
+    for e in entries {
+        put_varint(&mut out, e.tile_id - last);
+        last = e.tile_id;
+    }
+    for e in entries {
+        put_varint(&mut out, e.run_length);
+    }
+    for e in entries {
+        put_varint(&mut out, e.length);
+    }
+    for e in entries {
+        put_varint(&mut out, e.offset + 1);
+    }
+    out
+}
+
+fn gzip_bytes(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut enc, raw)?;
+    enc.finish()
+}
+
+/// Tuiles couvertes par la boîte englobante d'un lot d'anneaux, au zoom de
+/// l'archive — un objet à cheval est écrit entier dans chacune.
+pub fn covered_tiles(rings: &[Vec<(f64, f64)>]) -> Option<(u32, u32, u32, u32)> {
+    let mut s = f64::MAX;
+    let mut w = f64::MAX;
+    let mut n = f64::MIN;
+    let mut e = f64::MIN;
+    for ring in rings {
+        for &(lat, lon) in ring {
+            s = s.min(lat);
+            n = n.max(lat);
+            w = w.min(lon);
+            e = e.max(lon);
+        }
+    }
+    if s > n {
+        return None;
+    }
+    let (x0, y0) = tile_of(n, w, ZOOM);
+    let (x1, y1) = tile_of(s, e, ZOOM);
+    Some((x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)))
+}
+
 // -------------------------------------------------------------------- tests
 
 #[cfg(test)]
@@ -675,6 +1108,67 @@ mod tests {
         let s = store();
         assert!(s.buildings(45.0, 4.0, 45.01, 4.01).unwrap().is_empty());
         assert!(s.trees(45.0, 4.0, 45.01, 4.01).unwrap().is_empty());
+    }
+
+    /// L'encodeur Rust doit produire une archive que son propre lecteur relit
+    /// à l'identique — et le schéma des couches doit rester celui de la
+    /// fixture historique (mêmes attributs, mêmes types).
+    #[test]
+    fn encode_decode_roundtrip() {
+        let (s, w) = (48.8525, 2.3480);
+        let (n, e) = (48.8535, 2.3500);
+        let square = Building {
+            osm_id: "way/9".into(),
+            name: Some("Bloc".into()),
+            rings: vec![vec![(s, w), (s, e), (n, e), (n, w), (s, w)]],
+            height_m: 12.5,
+            height_from_osm: true,
+            leaf_type: None,
+        };
+        let wood = Building {
+            osm_id: "relation/8".into(),
+            name: None,
+            rings: vec![
+                vec![(48.8500, 2.3400), (48.8500, 2.3450), (48.8540, 2.3450), (48.8540, 2.3400)],
+                vec![(48.8510, 2.3410), (48.8510, 2.3440), (48.8530, 2.3440), (48.8530, 2.3410)],
+            ],
+            height_m: 18.0,
+            height_from_osm: false,
+            leaf_type: Some(LeafType::Needleleaved),
+        };
+        let tree = Tree {
+            osm_id: "node/7".into(),
+            lat: 48.8530,
+            lng: 2.3499,
+            height_m: 10.0,
+            crown_radius_m: 3.0,
+            leaf_type: LeafType::Palm,
+        };
+
+        let (tx, ty) = tile_of(48.853, 2.348, ZOOM);
+        let mvt = encode_tile(tx, ty, &[&square], &[&wood], &[&tree]).unwrap();
+        let mut writer = ArchiveWriter::new();
+        writer.add_tile(zxy_to_tileid(ZOOM, tx, ty), &mvt).unwrap();
+        let path = std::env::temp_dir().join("vtiles_roundtrip.pmtiles");
+        let file = std::fs::File::create(&path).unwrap();
+        writer.finish(file, (48.84, 2.33, 48.86, 2.36)).unwrap();
+
+        let store = VectorStore::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.zoom(), ZOOM);
+        let b = &store.buildings(48.85, 2.34, 48.86, 2.36).unwrap()[0];
+        assert_eq!(b.osm_id, "way/9");
+        assert_eq!(b.name.as_deref(), Some("Bloc"));
+        assert_eq!(b.height_m, 12.5);
+        assert!(b.height_from_osm);
+        let wd = &store.woods(48.85, 2.34, 48.86, 2.36).unwrap()[0];
+        assert_eq!(wd.rings.len(), 2, "extérieur + clairière");
+        assert_eq!(wd.leaf_type, Some(LeafType::Needleleaved));
+        let t = &store.trees(48.85, 2.34, 48.86, 2.36).unwrap()[0];
+        assert_eq!(t.osm_id, "node/7");
+        assert_eq!(t.crown_radius_m, 3.0);
+        assert_eq!(t.leaf_type, LeafType::Palm);
+        assert!((t.lat - 48.8530).abs() < 2e-5, "lat {}", t.lat);
+        assert!((t.lng - 2.3499).abs() < 2e-5, "lng {}", t.lng);
     }
 
     #[test]

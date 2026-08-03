@@ -1,12 +1,11 @@
-//! Code partagé entre le serveur (`main.rs`) et le binaire d'ingestion
-//! (`bin/ingest.rs`).
+//! Code partagé entre le serveur (`main.rs`) et les binaires du pipeline
+//! d'import (`bin/tilegen`, `bin/import`).
 //!
-//! La séparation matérialise le choix d'architecture : Overpass n'est plus sur
-//! le chemin d'une requête client (`osm`), il ne sert qu'à remplir PostGIS, et
-//! le serveur ne lit plus que la base (`db`).
+//! La séparation matérialise le choix d'architecture : la géométrie va de
+//! l'extrait OSM (`pbf`, règles `osm`) à l'archive vectorielle (`vtiles`),
+//! le serveur la lit là — PostgreSQL (`db`) ne porte que le métier.
 
 pub mod auth;
-pub mod btiles;
 pub mod canopy_tiles;
 pub mod db;
 pub mod dem;

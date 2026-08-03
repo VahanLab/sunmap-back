@@ -60,29 +60,18 @@ async fn main() {
         }
     };
 
-    // Upsert sur l'identifiant OSM : réimporter un extrait plus récent met à
-    // jour en place, et cohabite avec ce qu'a écrit l'ingestion Overpass.
-    for (label, result) in [
-        ("bâtiments", db::upsert_buildings(&pool, &extract.buildings).await),
-        ("arbres", db::upsert_trees(&pool, &extract.trees).await),
-        ("bois", db::upsert_woods(&pool, &extract.woods).await),
-        ("établissements", db::upsert_places(&pool, &extract.places).await),
-    ] {
-        match result {
-            Ok(n) => println!("{label:12} {n} lignes écrites"),
-            Err(e) => eprintln!("{label:12} ÉCHEC : {e}"),
-        }
+    // Seuls les lieux (établissements + mobilier urbain) vont en base : la
+    // géométrie (bâtiments, arbres, bois) part dans l'archive vectorielle via
+    // `bin/tilegen`, sans passer par PostgreSQL. Upsert sur l'identifiant
+    // OSM : réimporter un extrait plus récent met à jour en place.
+    match db::upsert_places(&pool, &extract.places).await {
+        Ok(n) => println!("établissements : {n} lignes écrites"),
+        Err(e) => eprintln!("établissements : ÉCHEC : {e}"),
     }
 
-    for (table, label) in [
-        ("buildings", "bâtiments"),
-        ("trees", "arbres"),
-        ("places", "établissements"),
-    ] {
-        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(-1);
-        println!("base : {n} {label}");
-    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM places")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(-1);
+    println!("base : {n} établissements");
 }

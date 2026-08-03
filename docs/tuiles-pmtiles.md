@@ -9,10 +9,11 @@ toute la géométrie qui fait de l'ombre. Trois consommateurs, mêmes octets :
    géométrie ;
 3. **l'affichage Mapbox** (à venir) — arbres 3D (`ModelLayer`), extrusions.
 
-Ce qu'on voit est ce qui fait l'ombre, par construction. C'est cette archive
-qui remplace les tables PostGIS `buildings`/`trees`/`woods` au runtime —
-PostGIS n'est plus que la zone de transit de l'import
-(cf. `docs/import-zone.md`, option `--purge`).
+Ce qu'on voit est ce qui fait l'ombre, par construction. Les tables PostGIS
+`buildings`/`trees`/`woods` **n'existent plus** (migration
+`drop_geometry_tables`) : l'archive est générée par `bin/tilegen` directement
+depuis l'extrait OSM, PostgreSQL ne garde que le métier — lieux, comptes,
+contributions (cf. `docs/import-zone.md`).
 
 ## Format
 
@@ -36,14 +37,18 @@ PostGIS n'est plus que la zone de transit de l'import
 
 ## Génération et lecture
 
-- Écriture : `scripts/build-pmtiles.py` (encodage via `mapbox-vector-tile`,
-  container via `pmtiles`). `--selftest` fait l'aller-retour d'encodage sans
-  base ; `--fixture` régénère `helios-server/testdata/mini.pmtiles`.
+- Écriture : `bin/tilegen` (Rust) — extrait GeoJSONSeq → archive, encodeur
+  MVT et writer PMTiles maison dans `vtiles.rs`, à côté du lecteur : une
+  évolution de schéma ne peut pas en oublier un. Testé en aller-retour
+  (`cargo test vtiles`).
 - Lecture serveur : `vtiles.rs` — décodeurs PMTiles v3 et MVT maison
-  (~200 lignes, pas de dépendance protobuf), testés contre la fixture écrite
-  par le générateur Python : deux implémentations indépendantes doivent se
-  lire, c'est le test de non-dérive du format.
-- Toute évolution du schéma des couches = les deux côtés + la fixture.
+  (pas de dépendance protobuf). `helios-server/testdata/mini.pmtiles`
+  (écrite par l'ancien générateur Python) reste la fixture de non-dérive :
+  une implémentation indépendante doit rester lisible.
+- Lecture client : `MVTDecoder.swift` (repo iOS) — troisième implémentation
+  du même format.
+- Toute évolution du schéma des couches = `vtiles.rs` (encode + decode),
+  `MVTDecoder`/`VegetationTileRepository` côté iOS, et la fixture.
 
 ## Servir depuis R2
 
@@ -53,7 +58,7 @@ Cloudflare cache les plages lues. Pas de Worker nécessaire pour un client
 natif ; le Worker protomaps n'est utile que pour exposer des URLs `/z/x/y`
 classiques (ce que Mapbox iOS peut préférer pour ses sources vectorielles).
 
-Upload : `scripts/build-pmtiles.py --upload` (variables `R2_*`, cf.
+Upload : `scripts/r2-upload.py` (variables `R2_*`, cf.
 `docs/import-zone.md`) ou rclone :
 
 ```
@@ -66,10 +71,11 @@ remplacement d'archive est atomique du point de vue du client (nouvel etag).
 ## Côté serveur
 
 ```
-VECTOR_TILES=tiles/sunmap.pmtiles   # helios-server/.env
+VECTOR_TILES=tiles/sunmap.pmtiles   # helios-server/.env — OBLIGATOIRE
 ```
 
-Priorité des chemins de données : `VECTOR_TILES` > `BUILDINGS_TILES` (HBT,
-legacy — bâtiments seuls) > PostGIS. Ne pas définir la variable = rollback
-immédiat vers l'ancien chemin. Une archive illisible fait mourir le serveur
-au démarrage plutôt que de retomber en silence sur un autre chemin.
+L'archive est l'unique chemin de données géométrique : sans la variable (ou
+avec une archive illisible), le serveur refuse de démarrer — un serveur sans
+géométrie classerait tout au soleil sans le dire. L'endpoint
+`GET /vtiles/{z}/{x}/{y}` sert les tuiles brutes au client tant que R2 n'est
+pas branché.

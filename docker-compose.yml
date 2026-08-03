@@ -22,7 +22,7 @@ services:
     restart: unless-stopped
     # Configuration de l'application, prise là où elle vit : à côté du serveur.
     # `env_file` passe le fichier au conteneur tel quel — DATABASE_URL,
-    # BUILDINGS_TILES, OSM_CLIENT_ID/SECRET, OSM_API_BASE/WEB_BASE — sans avoir
+    # VECTOR_TILES, OSM_CLIENT_ID/SECRET, OSM_API_BASE/WEB_BASE — sans avoir
     # à énumérer chaque variable ici, donc sans risque d'en oublier une à la
     # prochaine.
     #
@@ -32,8 +32,8 @@ services:
     env_file:
       - ./helios-server/.env
     volumes:
-      # Fichiers de tuiles générés par `tilebuild`, sur le disque de la VM —
-      # gros (Go), statiques, rien à faire dans une image ou un volume nommé.
+      # Archive vectorielle générée par `tilegen`, sur le disque de la VM —
+      # grosse (Go), statique, rien à faire dans une image ou un volume nommé.
       - ./tiles:/tiles
     # Pas de port publié sur l'hôte : seul le proxy parle à l'API, via le
     # réseau compose interne (`http://api:8080`). Exposer 8080 en direct

@@ -10,36 +10,35 @@ Procédure de référence : `docs/import-zone.md` (la lire avant d'agir).
 ## Commande unique
 
 ```bash
-scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--purge]
+scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload]
 ```
 
-- URL des extraits : https://download.geofabrik.de/ (prendre le
-  `-latest.osm.pbf` de la plus petite région couvrant la zone demandée).
+- URL des extraits : https://download.geofabrik.de/ — ATTENTION : l'archive
+  générée ne couvre QUE cet extrait (plus de base cumulative). Pour couvrir
+  plusieurs zones, prendre un extrait englobant (ex. france-latest).
 - `--upload` : pousse `tiles/sunmap.pmtiles` sur Cloudflare R2 — demander
   confirmation à l'utilisateur avant, c'est un envoi vers un service externe.
-- `--purge` : vide les tables `buildings`/`trees`/`woods` après génération —
-  UNIQUEMENT si le serveur tourne avec `VECTOR_TILES=tiles/sunmap.pmtiles`,
-  et demander confirmation à l'utilisateur (destructif).
 
 ## Points de vigilance
 
-- L'import PostGIS est un upsert : relançable, réimporter rafraîchit.
-- Les règles tags → hauteur vivent dans `helios-server/src/osm.rs` — ne
-  jamais les dupliquer dans un script.
-- L'archive `sunmap.pmtiles` (MVT z14, couches buildings/woods/trees) couvre
-  l'emprise TOTALE de la base (`ST_Extent`), pas seulement la zone importée.
-- Toute évolution du schéma des couches MVT = `scripts/build-pmtiles.py` ET
-  `helios-server/src/vtiles.rs` ET la fixture
-  (`build-pmtiles.py --fixture helios-server/testdata/mini.pmtiles`).
+- La géométrie ne passe PAS par PostgreSQL : `bin/tilegen` va de l'extrait à
+  l'archive. Seuls les lieux (établissements, mobilier) vont en base, en
+  upsert (relançable).
+- Les règles tags → hauteur vivent dans `helios-server/src/osm.rs` et
+  `pbf.rs` — ne jamais les dupliquer dans un script.
+- Le serveur exige `VECTOR_TILES=tiles/sunmap.pmtiles` (il refuse de
+  démarrer sans).
+- Toute évolution du schéma des couches MVT = `vtiles.rs` (encode + decode),
+  `MVTDecoder.swift` côté iOS, et la fixture
+  `helios-server/testdata/mini.pmtiles`.
 - `DATABASE_URL` : défaut `postgres://localhost/sunmap` ; vérifier quelle
   base est visée avant d'importer (locale vs OVH).
 
 ## Vérification après import
 
 ```bash
-psql sunmap -c "SELECT (SELECT count(*) FROM buildings) AS buildings, (SELECT count(*) FROM trees) AS trees, (SELECT count(*) FROM woods) AS woods, (SELECT count(*) FROM places) AS places;"
+psql sunmap -c "SELECT count(*) FROM places;"
 ```
 
-Les compteurs doivent croître ; tuile canopée de l'archive = celle de
-`GET /canopy/{z}/{x}/{y}` au pixel près (cf. `build-pmtiles.py --selftest`
-pour la partie sans base).
+Le compteur de lieux doit croître ; `tilegen` affiche ses comptes (bâtiments,
+bois, arbres) ; `cargo test vtiles` couvre l'aller-retour encodeur/lecteur.

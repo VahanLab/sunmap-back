@@ -57,15 +57,11 @@ struct AppState {
     tiles: TileCache,
     buildings: BuildingCache,
     places_results: PlacesResultCache,
-    /// Tuiles bâtiments (`BUILDINGS_TILES=chemin.hbt`). `None` = lecture
-    /// PostGIS classique — c'est aussi le rollback : ne pas définir la
-    /// variable suffit à revenir à l'ancien chemin.
-    btiles: Option<helios_server::btiles::TileStore>,
     /// Archive vectorielle `sunmap.pmtiles` (`VECTOR_TILES=chemin.pmtiles`) :
-    /// bâtiments ET végétation, prioritaire sur `btiles` comme sur PostGIS.
-    /// `None` = replis dans cet ordre. C'est elle qui permet de purger les
-    /// tables `buildings`/`trees`/`woods` (cf. docs/import-zone.md).
-    vstore: Option<helios_server::vtiles::VectorStore>,
+    /// LA géométrie — bâtiments ET végétation. Obligatoire : les tables
+    /// PostGIS correspondantes n'existent plus (cf. docs/tuiles-pmtiles.md),
+    /// un serveur sans archive classerait tout au soleil.
+    vstore: helios_server::vtiles::VectorStore,
 }
 
 /// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
@@ -117,17 +113,13 @@ async fn main() {
         std::process::exit(1);
     }
 
-    for (table, label) in [
-        ("buildings", "bâtiments"),
-        ("trees", "arbres"),
-        ("places", "établissements"),
-    ] {
-        let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(-1);
-        println!("base : {n} {label}");
-    }
+    // La base ne porte plus que le métier — la géométrie vit dans l'archive
+    // vectorielle (VECTOR_TILES).
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM places")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(-1);
+    println!("base : {n} établissements");
 
     // Projet Firebase attendu comme destinataire des jetons. Surchargeable par
     // l'environnement pour pointer un projet de test sans recompiler.
@@ -149,37 +141,28 @@ async fn main() {
         buildings: RwLock::new(HashMap::new()),
         places_results: RwLock::new(HashMap::new()),
         // `filter` : docker-compose passe la variable vide quand elle n'est
-        // pas définie dans `.env` — vide vaut absente.
-        btiles: match std::env::var("BUILDINGS_TILES").ok().filter(|p| !p.is_empty()) {
-            Some(path) => match helios_server::btiles::TileStore::open(&path) {
-                Ok(store) => {
-                    println!("bâtiments : tuiles {path}");
-                    Some(store)
-                }
-                Err(e) => {
-                    // Échouer franchement plutôt que retomber en silence sur
-                    // PostGIS : la variable exprime une intention, un serveur
-                    // qui la contredit sans le dire fausserait tout benchmark.
-                    eprintln!("BUILDINGS_TILES={path} : {e}");
-                    std::process::exit(1);
-                }
-            },
-            None => None,
-        },
-        vstore: match std::env::var("VECTOR_TILES").ok().filter(|p| !p.is_empty()) {
-            Some(path) => match helios_server::vtiles::VectorStore::open(&path) {
+        // pas définie dans `.env` — vide vaut absente. Mourir plutôt que
+        // démarrer sans géométrie : un serveur sans archive classerait tout
+        // au soleil sans le dire.
+        vstore: {
+            let Some(path) = std::env::var("VECTOR_TILES").ok().filter(|p| !p.is_empty())
+            else {
+                eprintln!(
+                    "VECTOR_TILES manquant : l'archive vectorielle est LA géométrie \
+                     (générer avec `scripts/import-zone.sh`, cf. docs/import-zone.md)."
+                );
+                std::process::exit(1);
+            };
+            match helios_server::vtiles::VectorStore::open(&path) {
                 Ok(store) => {
                     println!("géométrie : archive vectorielle {path} (z{})", store.zoom());
-                    Some(store)
+                    store
                 }
                 Err(e) => {
-                    // Même politique que BUILDINGS_TILES : mourir plutôt que
-                    // de retomber en silence sur un autre chemin de données.
                     eprintln!("VECTOR_TILES={path} : {e}");
                     std::process::exit(1);
                 }
-            },
-            None => None,
+            }
         },
     });
 
@@ -474,9 +457,7 @@ async fn add_buildings(
     // sans ombre de feuillage qu'une erreur, la végétation étant un raffinement
     // par-dessus le relief et le bâti.
     let phase = std::time::Instant::now();
-    let (woods, trees) = load_canopy(state, south, west, north, east)
-        .await
-        .unwrap_or_default();
+    let (woods, trees) = load_canopy(state, south, west, north, east).unwrap_or_default();
     let t_canopy_query_ms = phase.elapsed().as_secs_f64() * 1000.0;
     let phase = std::time::Instant::now();
     if !woods.is_empty() || !trees.is_empty() {
@@ -505,35 +486,10 @@ async fn load_buildings(
         return Ok(hit.clone());
     }
 
-    let buildings = if let Some(store) = &state.vstore {
-        // Archive vectorielle : le chemin cible (les tables PostGIS peuvent
-        // être purgées quand elle est en place).
-        store
-            .buildings(s, w, n, e)
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?
-    } else {
-        match &state.btiles {
-        // Tuiles : mêmes bâtiments, découpés sur la grille DEM. L'intervalle
-        // de tuiles couvrant la bbox est le même calcul que pour les tuiles
-        // de terrain (`assemble_grid`).
-        Some(store) => {
-            let (wx0, wy0) = world_px(n, w);
-            let (wx1, wy1) = world_px(s, e);
-            let ts = TILE_SIZE as f64;
-            store
-                .buildings(
-                    (wx0 / ts) as u32,
-                    (wy0 / ts) as u32,
-                    (wx1 / ts) as u32,
-                    (wy1 / ts) as u32,
-                )
-                .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("tuiles : {err}")))?
-        }
-        None => db::buildings_in_bbox(&state.pool, s, w, n, e)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?,
-        }
-    };
+    let buildings = state
+        .vstore
+        .buildings(s, w, n, e)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?;
     println!("[buildings] {key} → {} emprises", buildings.len());
 
     let arc = Arc::new(buildings);
@@ -541,26 +497,17 @@ async fn load_buildings(
     Ok(arc)
 }
 
-/// Végétation de la zone : archive vectorielle si elle est en place, PostGIS
-/// sinon — même bascule que `load_buildings`, mêmes données que le rendu.
-async fn load_canopy(
+/// Végétation de la zone, depuis l'archive vectorielle — les mêmes données
+/// que le rendu client.
+fn load_canopy(
     state: &AppState,
     s: f64,
     w: f64,
     n: f64,
     e: f64,
 ) -> Result<(Vec<Building>, Vec<helios_server::osm::Tree>), String> {
-    if let Some(store) = &state.vstore {
-        let woods = store.woods(s, w, n, e).map_err(|err| format!("vtiles : {err}"))?;
-        let trees = store.trees(s, w, n, e).map_err(|err| format!("vtiles : {err}"))?;
-        return Ok((woods, trees));
-    }
-    let woods = db::woods_in_bbox(&state.pool, s, w, n, e)
-        .await
-        .map_err(|err| format!("PostGIS : {err}"))?;
-    let trees = db::trees_in_bbox(&state.pool, s, w, n, e)
-        .await
-        .map_err(|err| format!("PostGIS : {err}"))?;
+    let woods = state.vstore.woods(s, w, n, e).map_err(|err| format!("vtiles : {err}"))?;
+    let trees = state.vstore.trees(s, w, n, e).map_err(|err| format!("vtiles : {err}"))?;
     Ok((woods, trees))
 }
 
@@ -2144,10 +2091,8 @@ async fn canopy_tile(
     let (s, w, n, e) = canopy_tiles::tile_bounds(z, x, y);
     let pad_lat = 30.0 / 111_320.0;
     let pad_lon = pad_lat / ((s + n) / 2.0).to_radians().cos();
-    let (woods, trees) =
-        load_canopy(&state, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
+    let (woods, trees) = load_canopy(&state, s - pad_lat, w - pad_lon, n + pad_lat, e + pad_lon)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err))?;
 
     let tile = canopy_tiles::rasterize(z, x, y, &woods, &trees);
     let png = canopy_tiles::encode_png(&tile)
@@ -2168,15 +2113,12 @@ async fn canopy_tile(
 /// `/z/x/y` pour épargner au client un lecteur PMTiles. Le client y lit les
 /// couches `trees` et `woods` pour poser sa végétation 3D.
 ///
-/// 404 sans `VECTOR_TILES` : l'endpoint n'existe que si l'archive est là,
-/// et une tuile vide est un 404 aussi (comme une clé absente sur R2).
+/// Une tuile vide est un 404 (comme une clé absente sur R2).
 async fn vector_tile(
     State(state): State<Arc<AppState>>,
     Path((z, x, y)): Path<(u32, u32, u32)>,
 ) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
-    let Some(store) = &state.vstore else {
-        return Err((StatusCode::NOT_FOUND, "VECTOR_TILES non configuré".into()));
-    };
+    let store = &state.vstore;
     if z != store.zoom() {
         return Err((StatusCode::NOT_FOUND, format!("zoom {z} ≠ z{}", store.zoom())));
     }
@@ -2222,14 +2164,10 @@ async fn trees(
         return Err((StatusCode::BAD_REQUEST, "bbox invalide".into()));
     }
 
-    let raw = match &state.vstore {
-        Some(store) => store
-            .trees(s, w, n, e)
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?,
-        None => db::trees_in_bbox(&state.pool, s, w, n, e)
-            .await
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {err}")))?,
-    };
+    let raw = state
+        .vstore
+        .trees(s, w, n, e)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?;
     let trees: Vec<Tree> = raw
         .into_iter()
         .map(|t| Tree {

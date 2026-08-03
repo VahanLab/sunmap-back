@@ -1,40 +1,38 @@
 #!/usr/bin/env bash
-# Importe une nouvelle zone OSM (extrait PBF) et régénère l'archive de tuiles.
+# Importe une nouvelle zone OSM (extrait PBF) : lieux en base, géométrie dans
+# l'archive vectorielle. PostgreSQL ne voit plus passer aucune géométrie.
 #
-#   scripts/import-zone.sh <zone.osm.pbf | URL Geofabrik> [--upload] [--purge]
+#   scripts/import-zone.sh <zone.osm.pbf | URL Geofabrik> [--upload]
 #
-#   scripts/import-zone.sh https://download.geofabrik.de/europe/france/ile-de-france-latest.osm.pbf
+#   scripts/import-zone.sh https://download.geofabrik.de/europe/france-latest.osm.pbf --upload
 #
 # Enchaîne tout le pipeline documenté dans docs/import-zone.md :
 #   1. téléchargement du PBF si on donne une URL (sinon fichier local) ;
 #   2. osm-extract.sh — filtrage osmium (bâtiments, végétation, établissements,
 #      mobilier urbain) et export GeoJSONSeq ;
-#   3. bin/import — remplissage PostGIS (règles tags → hauteur canoniques) ;
-#   4. build-pmtiles.py — tiles/sunmap.pmtiles, l'archive vectorielle unique
-#      (couches buildings/woods/trees), sur l'emprise TOTALE de la base : les
-#      zones déjà importées sont re-tuilées avec, l'archive est globale.
+#   3. bin/tilegen — extrait → tiles/sunmap.pmtiles, l'archive vectorielle
+#      unique (règles tags → hauteur canoniques de osm.rs, médiane locale
+#      comprise), SANS base de données ;
+#   4. bin/import — lieux (établissements + mobilier urbain) vers PostgreSQL,
+#      la seule chose qui y reste (DATABASE_URL, défaut
+#      postgres://localhost/sunmap).
 #
-# --upload : pousse ensuite l'archive sur Cloudflare R2 (variables R2_* de
-#            l'environnement ou de helios-server/.env).
-# --purge  : vide les tables buildings/trees/woods après génération — PostGIS
-#            ne garde alors que les lieux et contributions. À ne faire QUE si
-#            le serveur tourne avec VECTOR_TILES=tiles/sunmap.pmtiles : sans
-#            archive, plus de géométrie du tout. (La régénération suivante
-#            repassera par un import.)
+# --upload : pousse ensuite l'archive sur Cloudflare R2 (scripts/r2-upload.py,
+#            variables R2_* de l'environnement ou de helios-server/.env).
 #
-# DATABASE_URL cible la base (défaut : postgres://localhost/sunmap, comme le
-# serveur). Relançable sans risque : l'import est un upsert.
+# ⚠ L'archive générée ne couvre que CET extrait : contrairement à l'époque
+# PostGIS, il n'y a plus de base cumulative — pour couvrir plusieurs zones,
+# partir d'un extrait qui les contient toutes (ex. france-latest).
+# Relançable sans risque : l'import des lieux est un upsert.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-SRC=${1:?Usage: import-zone.sh <zone.osm.pbf | URL Geofabrik> [--upload] [--purge]}
+SRC=${1:?Usage: import-zone.sh <zone.osm.pbf | URL Geofabrik> [--upload]}
 shift
 UPLOAD=0
-PURGE=0
 for arg in "$@"; do
   case "$arg" in
     --upload) UPLOAD=1 ;;
-    --purge) PURGE=1 ;;
     *) echo "option inconnue : $arg" >&2; exit 1 ;;
   esac
 done
@@ -59,24 +57,20 @@ GEOJSONL="pbf/${BASE%.osm.pbf}.geojsonl"
 echo "=== 2/4 extraction osmium → $GEOJSONL"
 scripts/osm-extract.sh "$PBF" "$GEOJSONL"
 
-echo "=== 3/4 import PostGIS (buildings, trees, woods, places)"
+echo "=== 3/4 archive vectorielle → tiles/sunmap.pmtiles"
+cargo run --release --bin tilegen -- "$GEOJSONL" tiles/sunmap.pmtiles
+
+echo "=== 4/4 lieux (établissements + mobilier) → PostgreSQL"
 cargo run --release --bin import -- "$GEOJSONL"
 
-echo "=== 4/4 archive vectorielle → tiles/sunmap.pmtiles"
-VENV=.venv-tiles
-if [[ ! -x "$VENV/bin/python" ]]; then
-  echo "création du venv $VENV…"
-  python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q "psycopg[binary]" pmtiles mapbox-vector-tile boto3
-fi
-"$VENV/bin/python" scripts/build-pmtiles.py --selftest
-ARGS=(--out-dir tiles)
-[[ $UPLOAD == 1 ]] && ARGS+=(--upload)
-"$VENV/bin/python" scripts/build-pmtiles.py "${ARGS[@]}"
-
-if [[ $PURGE == 1 ]]; then
-  echo "=== purge des tables géométriques (PostGIS ne garde que les lieux)"
-  psql "${DATABASE_URL:-sunmap}" -c "TRUNCATE buildings, trees, woods"
+if [[ $UPLOAD == 1 ]]; then
+  echo "=== upload R2"
+  VENV=.venv-tiles
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install -q boto3
+  fi
+  "$VENV/bin/python" scripts/r2-upload.py tiles/sunmap.pmtiles
 fi
 
 echo "=== terminé"
