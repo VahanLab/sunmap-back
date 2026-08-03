@@ -153,8 +153,9 @@ est réservé aux offres Enterprise. Sans conséquence ici, `sunmap.tech` et
 - L'ingestion Overpass (`bin/ingest`) a disparu avec les tables
   géométriques : rafraîchir une zone = retélécharger son extrait PBF (les
   extraits Geofabrik sont quotidiens).
-- Le client lit les tuiles via `GET /vtiles/{z}/{x}/{y}` du serveur, qui
-  redirige vers le CDN quand `TILES_URL` est défini.
+- Le client lit les tuiles directement sur le CDN
+  (`https://tiles.sunmap.tech/sunmap/{z}/{x}/{y}.mvt`) : le serveur n'en
+  sert aucune, il lit sa propre copie locale de l'archive.
 - La fusion relit l'archive de base tuile par tuile : le temps de
   génération croît avec la couverture déjà en place, pas seulement avec le
   nouvel extrait.

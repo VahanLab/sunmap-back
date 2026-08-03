@@ -78,9 +78,10 @@ ainsi que le relief est chargé — alors que le SDK iOS ne sait pas ouvrir une
 archive PMTiles sans gestionnaire de protocole custom. Le bucket reste
 **privé**, le Worker y accédant par binding interne.
 
-Le serveur redirige `/vtiles/{z}/{x}/{y}` vers ce CDN quand `TILES_URL` est
-défini : l'app suit la redirection sans mise à jour. Détails et procédure de
-déploiement : `cloudflare/README.md`.
+**Le client tape ce CDN en direct** (`TilesConfig`, repo iOS) : les tuiles ne
+transitent plus par `helios-server`, qui n'a plus d'endpoint de tuiles du
+tout. Le serveur lit la même archive de son côté, en local. Détails et
+procédure de déploiement : `cloudflare/README.md`.
 
 Upload : `scripts/r2-upload.py` (variables `R2_*`, cf.
 `docs/import-zone.md`) ou rclone :
@@ -100,6 +101,5 @@ VECTOR_TILES=tiles/sunmap.pmtiles   # helios-server/.env — OBLIGATOIRE
 
 L'archive est l'unique chemin de données géométrique : sans la variable (ou
 avec une archive illisible), le serveur refuse de démarrer — un serveur sans
-géométrie classerait tout au soleil sans le dire. L'endpoint
-`GET /vtiles/{z}/{x}/{y}` sert les tuiles brutes au client tant que R2 n'est
-pas branché.
+géométrie classerait tout au soleil sans le dire. Le serveur ne sert
+**aucune** tuile : le client passe par le CDN.

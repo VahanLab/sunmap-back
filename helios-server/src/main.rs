@@ -62,10 +62,6 @@ struct AppState {
     /// PostGIS correspondantes n'existent plus (cf. docs/tuiles-pmtiles.md),
     /// un serveur sans archive classerait tout au soleil.
     vstore: helios_server::vtiles::VectorStore,
-    /// Base du CDN de tuiles (`TILES_URL`, sans barre oblique finale), vers
-    /// laquelle `/vtiles/{z}/{x}/{y}` redirige. `None` = tuiles servies
-    /// depuis l'archive locale.
-    tiles_url: Option<String>,
 }
 
 /// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
@@ -168,18 +164,6 @@ async fn main() {
                 }
             }
         },
-        tiles_url: {
-            let url = std::env::var("TILES_URL")
-                .ok()
-                .filter(|u| !u.is_empty())
-                // Barre oblique finale retirée : la redirection la remet.
-                .map(|u| u.trim_end_matches('/').to_string());
-            match &url {
-                Some(u) => println!("tuiles client : redirigées vers {u}"),
-                None => println!("tuiles client : servies depuis l'archive locale"),
-            }
-            url
-        },
     });
 
     // Reprise des envois OSM qui ont échoué — au démarrage, puis toutes les
@@ -220,7 +204,6 @@ async fn main() {
         .route("/users/{username}/contributions", get(user_contributions))
         .route("/trees", get(trees))
         .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
-        .route("/vtiles/{z}/{x}/{y}", get(vector_tile))
         .route("/sun-hours", get(sun_hours))
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
@@ -2122,63 +2105,6 @@ async fn canopy_tile(
         ],
         png,
     ))
-}
-
-/// Tuile MVT de l'archive vectorielle, pour la végétation 3D du client
-/// (couches `trees` et `woods`).
-///
-/// **Redirige vers le CDN** dès que `TILES_URL` est défini : les tuiles sont
-/// les mêmes octets, mais servies par le Worker Cloudflare depuis R2
-/// (cf. `cloudflare/README.md`) — la VM cesse d'en payer la bande passante,
-/// et le cache au bord absorbe les déplacements de carte. La redirection
-/// évite d'avoir à publier une version de l'app pour changer de source.
-///
-/// Sans `TILES_URL`, l'archive locale est servie directement — c'est le
-/// chemin de développement, et le rollback si le CDN pose problème.
-///
-/// Une tuile vide est un 404 (comme une clé absente sur R2).
-async fn vector_tile(
-    State(state): State<Arc<AppState>>,
-    Path((z, x, y)): Path<(u32, u32, u32)>,
-) -> Result<axum::response::Response, (StatusCode, String)> {
-    use axum::response::IntoResponse;
-
-    if let Some(base) = &state.tiles_url {
-        // Redirection permanente (308) : la cible ne changera pas d'une
-        // requête à l'autre, et un client qui la mémorise nous épargne le
-        // rebond suivant.
-        return Ok(axum::response::Redirect::permanent(&format!(
-            "{base}/sunmap/{z}/{x}/{y}.mvt"
-        ))
-        .into_response());
-    }
-
-    let store = &state.vstore;
-    if z != store.zoom() {
-        return Err((StatusCode::NOT_FOUND, format!("zoom {z} ≠ z{}", store.zoom())));
-    }
-    let Some(bytes) = store
-        .tile_stored(x, y)
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("vtiles : {err}")))?
-    else {
-        return Err((StatusCode::NOT_FOUND, "tuile vide".into()));
-    };
-    let mut headers = vec![
-        (axum::http::header::CONTENT_TYPE, "application/vnd.mapbox-vector-tile".to_string()),
-        // La géométrie ne bouge qu'au réimport : cacheable longtemps.
-        (axum::http::header::CACHE_CONTROL, "public, max-age=86400".to_string()),
-    ];
-    if store.tiles_gzipped() {
-        // Tuiles stockées gzip : servies telles quelles, le client dégzippe.
-        headers.push((axum::http::header::CONTENT_ENCODING, "gzip".to_string()));
-    }
-    Ok((
-        axum::http::HeaderMap::from_iter(
-            headers.into_iter().map(|(k, v)| (k, v.parse().unwrap())),
-        ),
-        bytes,
-    )
-        .into_response())
 }
 
 /// Arbres OSM (`natural=tree`) de la zone — aucun calcul soleil/ombre ici

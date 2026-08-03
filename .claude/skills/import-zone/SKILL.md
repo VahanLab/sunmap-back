@@ -42,7 +42,8 @@ scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--replace]
 - Les règles tags → hauteur vivent dans `helios-server/src/osm.rs` et
   `pbf.rs` — ne jamais les dupliquer dans un script.
 - Le serveur exige `VECTOR_TILES=tiles/sunmap.pmtiles` (il refuse de
-  démarrer sans) ; `TILES_URL` fait rediriger `/vtiles` vers le CDN.
+  démarrer sans). Il ne sert aucune tuile : le client tape le CDN en direct,
+  d'où l'importance de la purge après upload.
 
 ## Si l'encodeur MVT est modifié
 

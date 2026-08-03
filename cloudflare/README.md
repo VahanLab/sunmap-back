@@ -90,29 +90,34 @@ sa version précédente jusqu'à expiration du `CACHE_CONTROL` (1 jour par
 défaut). Après un `scripts/import-zone.sh … --upload`, il faut donc purger :
 dashboard → **Caching → Configuration → Purge Everything**.
 
-(Le jeton OAuth de wrangler ne porte que `zone (read)` : la purge ne peut pas
-être scriptée avec lui. Il faudrait un jeton API dédié avec la permission
-*Cache Purge*.)
+C'est ce que fait `scripts/cf-purge.py`, enchaîné automatiquement par
+`import-zone.sh --upload`. Il lui faut un jeton API **dédié**
+(`CLOUDFLARE_PURGE_TOKEN`, permission *Zone → Cache Purge*) : le jeton OAuth
+de wrangler ne porte que `zone (read)`, et celui de R2 aucun droit sur le
+cache. Voir `docs/import-zone.md` § Cloudflare R2.
 
-**La parade durable serait de versionner le nom de l'archive** — téléverser
-`sunmap-20260803.pmtiles` plutôt que d'écraser `sunmap.pmtiles`, puis pointer
-`TILES_URL` dessus. Les URLs changent, donc aucune tuile périmée, la bascule
-est atomique et le retour arrière consiste à remettre l'ancienne valeur. Pas
-encore fait : à décider quand les réimports deviendront réguliers.
+Depuis que le client tape le CDN en direct, versionner le nom de l'archive
+(`sunmap-20260803.pmtiles`) ne dispenserait plus de la purge : il faudrait
+aussi publier une version de l'app pour changer l'URL. La purge scriptée est
+donc la bonne réponse ; le versionnage ne redeviendrait intéressant que si
+l'URL du tileset était servie au client par configuration.
 
-## Côté client — rien à changer dans l'app
+## Côté client
 
-`VegetationTileRepository` (repo iOS) tape toujours
-`GET /vtiles/{z}/{x}/{y}` sur le serveur helios, qui **redirige (308)** vers
-`$TILES_URL/sunmap/{z}/{x}/{y}.mvt` dès que `TILES_URL` est défini dans
-`helios-server/.env`. URLSession suit la redirection sans rien demander : le
-trafic passe par le CDN sans publier de version de l'app, et changer de
-source (ou revenir en arrière) est un réglage serveur.
+`VegetationTileRepository` (repo iOS) tape **ce Worker en direct**, via
+`TilesConfig.baseURL` — `helios-server` n'a plus d'endpoint de tuiles, il
+lit sa propre copie locale de l'archive pour ses calculs. Changer d'URL
+demande donc une version de l'app : c'est le prix du chemin direct, assumé
+puisque le domaine est stable.
 
-Le Worker renvoie du MVT **déjà décompressé** (`application/x-protobuf`,
-sans `Content-Encoding`), là où l'archive locale du serveur sert les octets
-gzip tels quels — dans les deux cas `MVTDecoder` reçoit du MVT en clair.
+Deux détails de protocole qui comptent :
+
+- le Worker renvoie du MVT **déjà décompressé** (`application/x-protobuf`,
+  sans `Content-Encoding`) — `MVTDecoder` reçoit du MVT en clair ;
+- une tuile absente de l'archive donne **204**, pas 404 (le 404 est réservé
+  à un zoom hors plage ou une archive introuvable). Le client traite les
+  deux comme « tuile vide » et les met en cache, sans quoi chaque
+  déplacement de carte redemanderait les mêmes tuiles vides.
 
 Le jour où l'app consommera les tuiles avec Mapbox (`VectorSource`,
-extrusions et `ModelLayer`), c'est l'URL du Worker qu'il faudra donner
-directement au SDK — pas la redirection.
+extrusions et `ModelLayer`), c'est cette même URL qu'on donnera au SDK.

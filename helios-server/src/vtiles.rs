@@ -2,9 +2,10 @@
 //!
 //! LA géométrie du serveur (variable `VECTOR_TILES=chemin.pmtiles`,
 //! obligatoire) : l'archive est générée par `bin/tilegen` à l'import d'une
-//! zone, et les mêmes octets servent le calcul serveur, le masque Metal
-//! client et l'affichage Mapbox — ce qu'on voit est ce qui fait l'ombre,
-//! par construction.
+//! zone. Le serveur la lit pour classer soleil/ombre ; le client lit la
+//! MÊME archive, servie par le Worker Cloudflare depuis R2
+//! (`cloudflare/README.md`) — ce qu'on voit est ce qui fait l'ombre, par
+//! construction.
 //!
 //! Deux décodeurs maison, volontairement minimaux :
 //!
@@ -133,9 +134,8 @@ impl VectorStore {
     }
 
     /// Octets de la tuile **tels que stockés** (gzip chez notre générateur),
-    /// `None` si elle est vide. C'est ce que sert `GET /vtiles/{z}/{x}/{y}` :
-    /// le client HTTP dégzippe lui-même via `Content-Encoding`.
-    pub fn tile_stored(&self, x: u32, y: u32) -> std::io::Result<Option<Vec<u8>>> {
+    /// `None` si elle est vide.
+    fn tile_stored(&self, x: u32, y: u32) -> std::io::Result<Option<Vec<u8>>> {
         let id = zxy_to_tileid(self.zoom, x, y);
         let pos = match self.index.binary_search_by_key(&id, |e| e.tile_id) {
             Ok(i) => i,
@@ -153,12 +153,6 @@ impl VectorStore {
             file.read_exact(&mut buf)?;
         }
         Ok(Some(buf))
-    }
-
-    /// La compression déclarée pour les tuiles est-elle gzip ? (Décide de
-    /// l'en-tête `Content-Encoding` côté endpoint.)
-    pub fn tiles_gzipped(&self) -> bool {
-        self.tile_compression == 2
     }
 
     /// Octets MVT (décompressés) de la tuile, `None` si elle est vide.
