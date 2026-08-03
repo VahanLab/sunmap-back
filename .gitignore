@@ -27,3 +27,8 @@ pbf/
 
 # Python
 __pycache__/
+
+# Dépendances et artefacts du Worker Cloudflare (régénérables par npm install).
+cloudflare/node_modules/
+cloudflare/dist/
+cloudflare/.wrangler/

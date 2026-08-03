@@ -3,11 +3,18 @@
 Architecture cible :
 
 ```
-Internet ──▶ Nginx Proxy Manager (443, Let's Encrypt) ──▶ api:8080 (helios-server)
-                                                              │
-                                                              ▼
-                                       PostgreSQL managé OVH (PostGIS, TLS)
+Internet ──▶ Cloudflare (proxy, Full strict) ──▶ Nginx Proxy Manager (443) ──▶ api:8080 (helios-server)
+                                                                                   │
+                                                                                   ▼
+                                                            PostgreSQL managé OVH (PostGIS, TLS)
 ```
+
+Le domaine `sunmap.tech` est déjà sur Cloudflare (nameservers délégués,
+2026-08-03) : `sunmap.tech`/`www` restent en **DNS only** (ils pointent vers
+Vercel, qui gère son propre SSL — les passer en proxy casse leur certificat,
+cf. incident du 2026-08-03). `tiles.sunmap.tech` (archive R2) est déjà
+branché. **`api.sunmap.tech` reste à faire, une fois la VM commandée** —
+cf. § 3 ci-dessous, tout est en TODO.
 
 Trois briques : la VM (Docker Compose : API + proxy), la base managée OVH,
 le domaine. Le fichier `docker-compose.yml` de la racine porte le tout.
@@ -66,19 +73,40 @@ Pare-feu OVH (ou `ufw`) : ouvrir 80 et 443 au monde, **restreindre 81**
 (admin du proxy) à son IP, fermer tout le reste — 8080 n'est pas publié sur
 l'hôte, l'API n'est joignable que via le proxy.
 
-## 3. Domaine et proxy
+## 3. Domaine et proxy — ⚠ TODO une fois la VM commandée
 
-1. DNS : un enregistrement `A` `api.<domaine>` → IP de la VM.
+Le domaine (`sunmap.tech`, déjà sur Cloudflare) est prêt ; ce qui suit
+demande l'IP de la VM, pas encore commandée au 2026-08-03. Le SSL est géré
+par Cloudflare (Origin CA) plutôt que Let's Encrypt — Nginx Proxy Manager
+sert toujours de reverse proxy interne, mais ne parle plus au monde
+directement.
+
+1. [ ] **DNS Cloudflare** (pas OVH — le domaine y est déjà délégué,
+   nameservers changés) : dashboard Cloudflare → `sunmap.tech` → DNS →
+   Records → Add record : type `A`, name `api`, IPv4 = IP publique de la
+   VM, Proxy status = **Proxied** (orange). Laisser `sunmap.tech`/`www` en
+   DNS only (Vercel).
 2. `http://<ip-vm>:81` → Nginx Proxy Manager (premier login
    `admin@example.com` / `changeme`, à changer immédiatement).
-3. **Proxy Hosts → Add** : domaine `api.<domaine>`, forward
+3. **Proxy Hosts → Add** : domaine `api.sunmap.tech`, forward
    `http://api:8080` (le nom de service compose résout dans le réseau
    interne). Activer « Block Common Exploits » et « Websockets » (inutile
    mais inoffensif).
-4. Onglet **SSL** : « Request a new SSL Certificate » (Let's Encrypt),
-   « Force SSL ». Le renouvellement est automatique.
+4. [ ] **Certificat d'origine** : Cloudflare → SSL/TLS → Origin Server →
+   Create Certificate (RSA, 15 ans, hostname `api.sunmap.tech`) → coller le
+   certificat + la clé privée dans l'onglet **SSL** du Proxy Host NPM
+   (« Custom » plutôt que « Request a new SSL Certificate » Let's Encrypt —
+   Cloudflare valide ce certificat, pas une CA publique).
+5. [ ] Cloudflare → SSL/TLS → Overview → mode **Full (strict)** : sans ça,
+   Cloudflare accepterait un certificat non vérifié à l'origine.
+6. [ ] **Allowlist Cloudflare** sur la VM (`iptables`, plages IP
+   <https://www.cloudflare.com/ips/>) pour n'accepter 80/443 que depuis
+   Cloudflare — sinon l'IP de la VM, si elle fuite, permet de contourner le
+   proxy. Activer aussi `real_ip` dans NPM pour restaurer l'IP visiteur
+   réelle depuis `CF-Connecting-IP` (sinon tous les logs affichent les IP
+   Cloudflare).
 
-Côté iOS : `HeliosServerConfig.baseURL` passe à `https://api.<domaine>` et
+Côté iOS : `HeliosServerConfig.baseURL` passe à `https://api.sunmap.tech` et
 l'exception ATS HTTP de l'Info.plist peut disparaître (le trafic devient TLS).
 
 ## 4. Import des données OSM et archive vectorielle
@@ -109,7 +137,9 @@ Notes :
   cumulative) — prendre un extrait englobant toutes les zones voulues.
 - **R2** : la même archive se pousse sur Cloudflare R2
   (`scripts/r2-upload.py`) pour le client ; le serveur garde sa copie
-  locale.
+  locale. Domaine custom déjà branché : `tiles.sunmap.tech` (R2 → bucket
+  `sunmap-tiles` → Settings → Custom Domains), proxy Cloudflare géré
+  automatiquement, rien à faire côté VM.
 
 ## 5. Déploiement continu (GitHub Actions)
 

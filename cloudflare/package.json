@@ -1,0 +1,19 @@
+{
+  "name": "sunmap-tiles-worker",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Worker Cloudflare servant sunmap.pmtiles en /{name}/{z}/{x}/{y}.mvt (source : protomaps/PMTiles, BSD-3)",
+  "scripts": {
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "wrangler deploy --outdir dist --dry-run"
+  },
+  "dependencies": {
+    "pmtiles": "^4.3.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.59.1"
+  }
+}
