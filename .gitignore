@@ -17,3 +17,13 @@ web/
 # identifiants OAuth OpenStreetMap) et le `.env` de racine que compose lit pour
 # le tag de l'image. Le motif sans barre oblique couvre les deux.
 .env
+
+# Archives PMTiles générées par scripts/build-pmtiles.py — lourdes, régénérables.
+tiles/
+
+# PBF téléchargés et extraits intermédiaires du pipeline import-zone.sh.
+pbf/
+.venv-tiles/
+
+# Python
+__pycache__/

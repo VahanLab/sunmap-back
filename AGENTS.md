@@ -253,6 +253,22 @@ d'autrui.
 une erreur en production salit une base que des milliers de gens relisent à la
 main. Protocole complet : `helios-server/README.md`.
 
+## Importer une nouvelle zone (procédure réutilisable)
+
+Ajouter une zone = **une commande**, qui enchaîne téléchargement PBF →
+extraction osmium → import PostGIS (bâtiments, végétation, établissements,
+mobilier urbain) → génération des tuiles PMTiles (bâtiments + canopée) :
+
+    scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload] [--hbt]
+
+Procédure détaillée, vérifications et configuration R2 :
+**`docs/import-zone.md`**. Formats et service des tuiles :
+`docs/tuiles-pmtiles.md`. À savoir : l'import est un upsert (relançable) ;
+les archives PMTiles couvrent toute la base, pas la seule zone importée ;
+`--upload` pousse sur Cloudflare R2 (variables `R2_*` dans
+`helios-server/.env`) ; `--hbt` régénère les tuiles internes serveur
+(`BUILDINGS_TILES`, requis pour un déploiement).
+
 ## Prochaines étapes (dans l'ordre)
 
 1. Échantillonner la terrasse en surface plutôt qu'au point : 3–5 points dans
@@ -264,6 +280,10 @@ main. Protocole complet : `helios-server/README.md`.
    source, en superposition ou en remplacement des arbres Mapbox.
 3. Cache CDN des réponses `/places` (clé zone + jour, le bitfield rend la
    clé stable une journée entière).
+4. Tuiles statiques sur Cloudflare R2 : `buildings.pmtiles` et
+   `canopy.pmtiles` générés par le pipeline d'import (cf. § « Importer une
+   nouvelle zone », vérifiés à parité pixel avec `/canopy/{z}/{x}/{y}`) ;
+   reste à brancher le client dessus.
 
 ## Backlog (décidé mais volontairement différé)
 
