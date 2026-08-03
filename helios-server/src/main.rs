@@ -868,6 +868,11 @@ struct SunInterval {
 /// une précision largement suffisante — une ombre qui balaie une terrasse ne
 /// se joue pas à 5 min près.
 const SUN_DAY_STEP_S: f64 = 600.0;
+/// Distance au-delà de laquelle un dégagement n'apporte plus rien : le retrait
+/// de caméra le plus grand qu'on pratique est de ~220 m, chercher plus loin ne
+/// changerait aucun cadrage et allongerait le lancer de rayons pour rien.
+const VIEW_MAX_DISTANCE_M: f64 = 250.0;
+
 const SUN_DAY_SLOTS: usize = (86_400.0 / SUN_DAY_STEP_S) as usize;
 
 fn day_bounds_local(t_unix: f64, utc_offset_minutes: i32) -> (f64, f64) {
@@ -975,6 +980,122 @@ async fn sun_hours(
 /// Recherche en anneaux croissants sur la grille de propriétaires, plus une
 /// cellule de marge pour ne pas rester collé à la façade. Renvoie le point
 /// d'origine si rien de libre dans le rayon (POI au cœur d'un grand bâtiment).
+/// Cap de caméra le plus dégagé pour regarder un point, et la distance libre
+/// qu'il offre derrière l'objectif.
+///
+/// ## Le problème que ça résout
+///
+/// Mapbox place la caméra **en retrait** du point visé, d'une distance au sol
+/// de `altitude × tan(pitch)` — à z19.5 et 51° d'inclinaison, environ 220 m.
+/// Viser une terrasse « de face », depuis la rue, met donc l'objectif 220 m
+/// dans le pâté de maisons d'en face : dans une rue étroite, l'immeuble d'en
+/// face masque la terrasse. Baisser l'inclinaison ou zoomer ne suffit pas, le
+/// retrait reste toujours grand devant la largeur d'une rue.
+///
+/// La sortie est de regarder **le long** de la rue plutôt qu'à travers : dans
+/// son axe il y a 50 à 200 m de vide, exactement ce que le retrait réclame.
+///
+/// ## Ce que la fonction rend
+///
+/// Le **cap Mapbox** (direction que regarde la caméra), pas la direction
+/// dégagée : la caméra se tient à l'opposé de son cap, donc le vide doit être
+/// derrière elle. Les deux sont à 180° l'un de l'autre, et les confondre
+/// pointerait l'objectif pile sur le mur qu'on cherchait à éviter.
+///
+/// - Parameter preferred_bearing_deg: cap idéal — celui qui met la façade de
+///   l'établissement en toile de fond. Départage les directions à peu près
+///   aussi dégagées, pour ne pas perdre ce cadrage quand la place le permet.
+fn open_view_bearing(
+    dsm: &Dsm,
+    owner: &[u32],
+    px: f64,
+    py: f64,
+    preferred_bearing_deg: f64,
+    max_distance_m: f64,
+) -> (f64, f64) {
+    /// Un tour complet par pas de 10° : plus fin ne changerait rien, une rue
+    /// se voit largement à cette résolution.
+    const STEPS: usize = 36;
+
+    let occupied = |x: f64, y: f64| -> bool {
+        let (ix, iy) = (x.round() as i32, y.round() as i32);
+        if ix < 0 || iy < 0 || ix >= dsm.width as i32 || iy >= dsm.height as i32 {
+            // Hors grille : on ne sait pas, donc on arrête de compter — mieux
+            // vaut sous-estimer le dégagement que promettre du vide inconnu.
+            return true;
+        }
+        let o = owner[iy as usize * dsm.width + ix as usize];
+        o != OWNER_TERRAIN && o != OWNER_CANOPY
+    };
+
+    let max_steps = (max_distance_m / dsm.meters_per_pixel).max(1.0) as i32;
+    let mut measured: Vec<(f64, f64)> = Vec::with_capacity(STEPS);
+
+    for i in 0..STEPS {
+        let bearing = i as f64 * (360.0 / STEPS as f64);
+        // Repère raster : x vers l'est, y vers le sud, azimut horaire depuis
+        // le nord — d'où le `-cos` sur y, comme dans le ray marching.
+        let (dx, dy) = (
+            (bearing.to_radians()).sin(),
+            -(bearing.to_radians()).cos(),
+        );
+        let mut free_px = 0.0;
+        for step in 1..=max_steps {
+            let (x, y) = (px + dx * step as f64, py + dy * step as f64);
+            if occupied(x, y) {
+                break;
+            }
+            free_px = step as f64;
+        }
+        measured.push((bearing, free_px * dsm.meters_per_pixel));
+    }
+
+    let best_free = measured.iter().fold(0.0_f64, |acc, (_, d)| acc.max(*d));
+    if best_free <= 0.0 {
+        // Enfermé de toutes parts : rien de mieux à proposer que le cap voulu,
+        // et l'appelant bornera l'inclinaison avec une distance nulle.
+        return (preferred_bearing_deg, 0.0);
+    }
+
+    // Parmi les directions à peu près aussi dégagées, celle dont le cap est le
+    // plus proche du cadrage voulu. Sans ce départage, deux côtés d'une rue
+    // droite s'échangeraient au moindre pixel de différence, et le cadrage
+    // sauterait d'un tap à l'autre sur le même établissement.
+    let threshold = best_free * 0.8;
+    let mut best: Option<(f64, f64, f64)> = None;
+    for (open_bearing, free_m) in measured {
+        if free_m < threshold {
+            continue;
+        }
+        // La caméra se tient dans la direction dégagée, donc elle regarde à
+        // l'opposé.
+        let camera_bearing = (open_bearing + 180.0).rem_euclid(360.0);
+        let delta = angular_distance_deg(camera_bearing, preferred_bearing_deg);
+        if best.as_ref().is_none_or(|(_, _, d)| delta < *d) {
+            best = Some((camera_bearing, free_m, delta));
+        }
+    }
+
+    best.map(|(bearing, free_m, _)| (bearing, free_m))
+        .unwrap_or((preferred_bearing_deg, best_free))
+}
+
+/// Azimut de `(lat1, lng1)` vers `(lat2, lng2)` : degrés depuis le nord, sens
+/// horaire — la convention de tout le projet, celle d'OSM et celle de Mapbox.
+fn bearing_deg(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dl = (lng2 - lng1).to_radians();
+    let y = dl.sin() * p2.cos();
+    let x = p1.cos() * p2.sin() - p1.sin() * p2.cos() * dl.cos();
+    y.atan2(x).to_degrees().rem_euclid(360.0)
+}
+
+/// Écart entre deux caps, dans [0, 180].
+fn angular_distance_deg(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(360.0);
+    if d > 180.0 { 360.0 - d } else { d }
+}
+
 fn nudge_out_of_building(
     dsm: &Dsm,
     owner: &[u32],
@@ -1212,6 +1333,23 @@ struct Place {
     snapped_lng: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapped_distance_m: Option<f64>,
+    /// Cap conseillé pour poser la caméra sur ce lieu, en degrés depuis le
+    /// nord — et la distance libre, en mètres, disponible **derrière**
+    /// l'objectif à ce cap.
+    ///
+    /// Mapbox place la caméra en retrait du point visé (`altitude × tan(pitch)`,
+    /// ~220 m à z19.5/51°). Sans ce cap, viser une terrasse « de face » depuis
+    /// la rue met l'objectif dans le pâté de maisons d'en face, et l'immeuble
+    /// masque la terrasse dès que la rue est étroite. Ce cap regarde **le long**
+    /// de la rue, où le vide existe.
+    ///
+    /// La distance sert au client à borner l'inclinaison :
+    /// `pitch ≤ atan(distance / altitude)`. Dans une cour fermée elle vaut 0,
+    /// et le cadrage se dégrade proprement vers une vue verticale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view_bearing_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    view_free_distance_m: Option<f64>,
     elevation_m: f32,
     /// Champs OSM optionnels — couverture très inégale selon les POI.
     website: Option<String>,
@@ -1813,6 +1951,17 @@ async fn places(
 
             let (snapped_lat, snapped_lng) =
                 latlon_of_world_px(origin_x + px, origin_y + py);
+
+            // Cap de caméra conseillé — seulement pour ce qui se regarde de
+            // près. Un banc n'a pas de façade à mettre en toile de fond, et le
+            // client ne vole que vers les terrasses.
+            let view = (!is_furniture).then(|| {
+                // Cadrage idéal : la façade de l'établissement derrière la
+                // terrasse, donc le cap du point analysé vers le nœud OSM.
+                let preferred = bearing_deg(snapped_lat, snapped_lng, p.lat, p.lng);
+                open_view_bearing(&dsm, &owner, px, py, preferred, VIEW_MAX_DISTANCE_M)
+            });
+
             Place {
                 id: p.osm_id.clone(),
                 name: p.name.clone(),
@@ -1838,6 +1987,8 @@ async fn places(
                 snapped_lat: (moved_m > 0.0).then_some(snapped_lat),
                 snapped_lng: (moved_m > 0.0).then_some(snapped_lng),
                 snapped_distance_m: (moved_m > 0.0).then_some(moved_m),
+                view_bearing_deg: view.map(|(bearing, _)| bearing),
+                view_free_distance_m: view.map(|(_, free)| free),
                 elevation_m: ground,
                 website: p.website.clone(),
                 phone: p.phone.clone(),
@@ -2011,6 +2162,83 @@ fn parse_time(raw: Option<&str>) -> Result<f64, (StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Grille jouet : une rue nord-sud dégagée, du bâti de part et d'autre.
+    ///
+    /// ```
+    ///   x → 0 1 2 3 4
+    ///        # . # # #      y = 0
+    ///        # . # # #      …
+    ///        # . # # #
+    /// ```
+    /// La colonne 1 est libre, tout le reste est bâti.
+    fn street_grid(width: usize, height: usize, free_column: usize) -> (Dsm, Vec<u32>) {
+        let dsm = Dsm::flat(width, height, 1.0, 0.0);
+        let mut owner = vec![1u32; width * height]; // 1 = un bâtiment
+        for y in 0..height {
+            owner[y * width + free_column] = OWNER_TERRAIN;
+        }
+        (dsm, owner)
+    }
+
+    #[test]
+    fn vise_le_long_de_la_rue_et_non_a_travers() {
+        let (dsm, owner) = street_grid(5, 41, 1);
+        // Au milieu de la rue, avec un cadrage voulu vers l'est (90°) —
+        // c'est-à-dire pile vers le mur d'en face.
+        let (bearing, free_m) = open_view_bearing(&dsm, &owner, 1.0, 20.0, 90.0, 100.0);
+
+        // La rue court nord-sud : la caméra doit regarder le long, donc au nord
+        // (0°) ou au sud (180°), jamais vers le mur qu'on lui proposait.
+        assert!(bearing == 0.0 || bearing == 180.0, "cap retenu : {bearing}");
+        assert!(free_m > 15.0, "distance libre : {free_m}");
+    }
+
+    #[test]
+    fn le_cap_rendu_est_celui_de_la_camera_pas_du_vide() {
+        // Rue nord-sud, point collé au bord SUD : le vide est au nord, donc la
+        // caméra s'y place et regarde vers le sud (180°).
+        let (dsm, owner) = street_grid(5, 41, 1);
+        let (bearing, _) = open_view_bearing(&dsm, &owner, 1.0, 39.0, 180.0, 100.0);
+        assert_eq!(bearing, 180.0, "la caméra doit regarder à l'opposé du vide");
+    }
+
+    #[test]
+    fn departage_par_le_cadrage_voulu() {
+        // Rue symétrique : les deux sens sont aussi dégagés. Le cap voulu doit
+        // trancher, sinon le cadrage sauterait d'un tap à l'autre.
+        let (dsm, owner) = street_grid(5, 41, 1);
+        let (vers_nord, _) = open_view_bearing(&dsm, &owner, 1.0, 20.0, 10.0, 100.0);
+        let (vers_sud, _) = open_view_bearing(&dsm, &owner, 1.0, 20.0, 170.0, 100.0);
+        assert_eq!(vers_nord, 0.0);
+        assert_eq!(vers_sud, 180.0);
+    }
+
+    #[test]
+    fn enferme_de_toutes_parts_rend_le_cap_voulu_et_zero() {
+        let dsm = Dsm::flat(5, 5, 1.0, 0.0);
+        let owner = vec![1u32; 25]; // que du bâti
+        let (bearing, free_m) = open_view_bearing(&dsm, &owner, 2.0, 2.0, 42.0, 50.0);
+        assert_eq!(bearing, 42.0);
+        assert_eq!(free_m, 0.0, "sans dégagement, l'appelant doit borner le pitch");
+    }
+
+    #[test]
+    fn azimut_degres_depuis_le_nord_sens_horaire() {
+        // Depuis Paris : plein nord, plein est, plein sud, plein ouest.
+        let (lat, lng) = (48.86, 2.35);
+        assert!((bearing_deg(lat, lng, lat + 0.01, lng) - 0.0).abs() < 0.5);
+        assert!((bearing_deg(lat, lng, lat, lng + 0.01) - 90.0).abs() < 0.5);
+        assert!((bearing_deg(lat, lng, lat - 0.01, lng) - 180.0).abs() < 0.5);
+        assert!((bearing_deg(lat, lng, lat, lng - 0.01) - 270.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn ecart_angulaire_prend_le_plus_court_chemin() {
+        assert_eq!(angular_distance_deg(10.0, 350.0), 20.0);
+        assert_eq!(angular_distance_deg(350.0, 10.0), 20.0);
+        assert_eq!(angular_distance_deg(0.0, 180.0), 180.0);
+    }
 
     /// Une journée doit commencer à minuit LOCAL. Le bug d'origine découpait
     /// sur UTC : à Paris en été, un instant à 00h30 locale (22:30Z la veille)

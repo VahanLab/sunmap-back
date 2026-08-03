@@ -207,6 +207,31 @@ libre. Sinon ils donnent le point **réellement classé** : c'est ce qui permet
 au client d'afficher le déport et de distinguer « le calcul est faux » de « le
 calcul porte sur un autre endroit ».
 
+#### Cap de caméra conseillé
+
+Mapbox ne place pas la caméra *sur* le point visé mais **en retrait**, d'une
+distance au sol de `altitude × tan(pitch)` — environ **220 m** à z19,5 et 51°
+d'inclinaison. Viser une terrasse « de face » depuis la rue met donc l'objectif
+220 m dans le pâté de maisons d'en face : dans une rue étroite, l'immeuble d'en
+face masque la terrasse. Baisser l'inclinaison ou zoomer n'y suffit pas, le
+retrait reste toujours grand devant la largeur d'une rue.
+
+`view_bearing_deg` regarde **le long** de la rue plutôt qu'à travers : 36 rayons
+sont lancés depuis le point analysé sur la grille de bâtiments déjà assemblée,
+et le plus dégagé l'emporte. Les directions à moins de 20 % du meilleur sont
+départagées par le cadrage idéal (façade de l'établissement en toile de fond),
+faute de quoi les deux sens d'une rue droite s'échangeraient au moindre pixel de
+différence et le cadrage sauterait d'un tap à l'autre.
+
+C'est le cap **de la caméra**, pas la direction dégagée : la caméra se tient à
+l'opposé de son cap, les deux sont à 180° l'un de l'autre, et les confondre
+pointerait l'objectif pile sur le mur qu'on cherchait à éviter.
+
+`view_free_distance_m` sert au client à faire tenir le retrait dans la place
+disponible — en zoomant d'abord, en redressant l'inclinaison seulement ensuite
+(cf. `CameraFraming` côté iOS). Mesuré sur une bbox du centre de Paris : de
+15,7 m dans une cour à 210,6 m dans l'axe d'une rue, sur 504 lieux qualifiés.
+
 ### `POST /places/terrace`
 
 Terrasse signalée par un utilisateur : sa présence, et sa position si elle a été
