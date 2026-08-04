@@ -1,0 +1,19 @@
+{
+  "name": "sunmap-asc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pousse les fiches App Store (textes + captures, toutes langues) via l'API App Store Connect",
+  "type": "module",
+  "bin": {
+    "asc": "./src/cli.js"
+  },
+  "scripts": {
+    "status": "node src/cli.js status",
+    "pull": "node src/cli.js pull",
+    "push": "node src/cli.js push",
+    "check": "node src/cli.js check"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

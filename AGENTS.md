@@ -318,3 +318,8 @@ arbres à ±0,2 m.
 
 - **App iOS SunMap** : voir `ios/SunMap/AGENTS.md` pour l'architecture SwiftUI,
   les features, l'auth Firebase et les spécificités Xcode.
+- **Fiche App Store** : `tools/asc/` — outil Node sans dépendance qui pousse
+  textes et captures dans les 5 langues via l'API App Store Connect. Les textes
+  sont versionnés en `tools/asc/metadata/<locale>/*.txt`, les captures en
+  `tools/asc/screenshots/<locale>/<type d'écran>/`. Mode d'emploi :
+  `tools/asc/README.md`.
