@@ -339,6 +339,26 @@ async fn assemble_grid(
 /// immeuble fait cette ombre » après le ray marching.
 /// `terrain` est le relief nu (la DSM AVANT tout stamping) : c'est lui qui
 /// donne l'altitude du sol sous chaque bâtiment, cf. commentaire plus bas.
+/// D'où vient le sol sur lequel on pose la hauteur d'un objet.
+#[derive(Clone, Copy, PartialEq)]
+enum GroundRef {
+    /// Une seule altitude — celle du centre de l'emprise — pour tout le
+    /// polygone. C'est ce qu'il faut aux **bâtiments** : les `building:part`
+    /// et les membres d'une relation se recouvrent par construction, et
+    /// relire le sol sous chaque cellule ferait empiler les hauteurs (on a
+    /// observé un toit à 102 m pour un bâtiment de 25 m sur un sol à 35 m).
+    /// Un immeuble n'a de toute façon pas de dénivelé notable sous lui.
+    BboxCenter,
+    /// Le relief sous **chaque cellule**. Indispensable aux emprises
+    /// boisées : une forêt épouse la pente, là où un bâtiment est posé à
+    /// plat. Avec une altitude unique, le haut d'une emprise de montagne se
+    /// retrouve au-dessus de sa propre canopée — la condition d'écriture ne
+    /// passe plus, aucune canopée n'est posée, et le point est classé au
+    /// soleil en pleine forêt (cas réel : Forêt Domaniale de Vallorcine,
+    /// sol à 1 694 m contre une canopée calée à 1 651 m).
+    PerPixel,
+}
+
 fn stamp_buildings(
     dsm: &mut Dsm,
     terrain: &Dsm,
@@ -346,6 +366,7 @@ fn stamp_buildings(
     origin_x: f64,
     origin_y: f64,
     buildings: &[Building],
+    ground: GroundRef,
 ) {
     for (bi, b) in buildings.iter().enumerate() {
         // Tous les anneaux ensemble : extérieur + cours. La règle pair-impair
@@ -377,21 +398,14 @@ fn stamp_buildings(
             continue; // entièrement hors grille
         }
 
-        // Sol de référence : centre du polygone (bbox center, approximation
-        // suffisante pour l'altitude de départ — un bâtiment n'a
-        // généralement pas de dénivelé notable sous son emprise).
-        //
-        // Échantillonné sur le RELIEF SEUL, jamais sur la DSM en cours de
-        // construction : sinon un bâtiment posé sur une emprise déjà stampée
-        // prend le toit du précédent pour sol et les hauteurs s'additionnent.
-        // Sans conséquence tant qu'on ne chargeait que `way[building]` (les
-        // empreintes se recouvrent peu), mais `building:part` recouvre par
-        // construction son bâtiment parent, et les membres d'une relation se
-        // recouvrent entre eux — on a observé un toit à 102 m pour un
-        // bâtiment de 25 m sur un sol à 35 m, soit trois empilements.
+        // Sol de référence, échantillonné sur le RELIEF SEUL et jamais sur la
+        // DSM en cours de construction : sinon un objet posé sur une emprise
+        // déjà stampée prendrait le toit du précédent pour sol et les hauteurs
+        // s'additionneraient. Le choix entre altitude unique et sol par
+        // cellule appartient à l'appelant (cf. `GroundRef`).
         let cx = ((min_x + max_x) / 2.0).clamp(0.0, dsm.width as f64 - 1.0);
         let cy = ((min_y + max_y) / 2.0).clamp(0.0, dsm.height as f64 - 1.0);
-        let target = terrain.sample(cx, cy).unwrap_or(0.0) + b.height_m;
+        let target_bbox = terrain.sample(cx, cy).unwrap_or(0.0) + b.height_m;
 
         let y0 = min_y.max(0.0).floor() as usize;
         let y1 = max_y.min(dsm.height as f64 - 1.0).ceil() as usize;
@@ -417,6 +431,10 @@ fn stamp_buildings(
                 if x_end >= 0.0 && x_end as usize >= x_start {
                     for x in x_start..=(x_end as usize).min(dsm.width - 1) {
                         let idx = y * dsm.width + x;
+                        let target = match ground {
+                            GroundRef::BboxCenter => target_bbox,
+                            GroundRef::PerPixel => terrain.data[idx] + b.height_m,
+                        };
                         if dsm.data[idx] < target {
                             dsm.data[idx] = target;
                             owner[idx] = bi as u32;
@@ -446,7 +464,7 @@ async fn add_buildings(
     let mut owner = vec![OWNER_TERRAIN; dsm.width * dsm.height];
     let terrain = dsm.clone();
     let phase = std::time::Instant::now();
-    stamp_buildings(dsm, &terrain, &mut owner, origin_x, origin_y, &buildings);
+    stamp_buildings(dsm, &terrain, &mut owner, origin_x, origin_y, &buildings, GroundRef::BboxCenter);
     let t_stamp_buildings_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
     // Végétation ensuite, jamais avant : là où arbre et bâtiment se recouvrent,
@@ -559,7 +577,7 @@ fn stamp_canopy(
     // sait écrire que dans une grille opaque.
     let mut wood_owner = vec![OWNER_TERRAIN; owner.len()];
     let mut scratch = terrain.clone();
-    stamp_buildings(&mut scratch, terrain, &mut wood_owner, origin_x, origin_y, woods);
+    stamp_buildings(&mut scratch, terrain, &mut wood_owner, origin_x, origin_y, woods, GroundRef::PerPixel);
 
     let width = dsm.width;
     let (canopy_top, canopy_base) = dsm.canopy_layers_mut();
@@ -2170,6 +2188,71 @@ fn parse_time(raw: Option<&str>) -> Result<f64, (StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Une emprise boisée en PENTE doit recevoir sa canopée sur toute sa
+    /// hauteur, pas seulement autour de l'altitude de son centre.
+    ///
+    /// Régression réelle : la Forêt Domaniale de Vallorcine était calée sur le
+    /// sol de son centre de bbox (1 633 m), si bien que ses parties hautes
+    /// (1 694 m) se retrouvaient 43 m au-dessus de leur propre canopée. La
+    /// condition d'écriture (`dsm.data[idx] < target`) ne passait plus, aucune
+    /// canopée n'y était posée, et un point en pleine forêt ressortait « au
+    /// soleil » toute la journée.
+    #[test]
+    fn sloped_wood_gets_canopy_everywhere() {
+        // Relief qui monte de 100 m d'ouest en est sur la largeur de la grille.
+        let (w, h) = (64usize, 8usize);
+        let mut terrain = Dsm::flat(w, h, 1.6, 0.0);
+        for y in 0..h {
+            for x in 0..w {
+                terrain.data[y * w + x] = x as f32 * 100.0 / w as f32;
+            }
+        }
+
+        // Emprise couvrant toute la grille, en (lat, lon) autour d'un point
+        // arbitraire — les anneaux sont reprojetés en pixels par `world_px`.
+        let (origin_x, origin_y) = world_px(46.03, 6.89);
+        let corner = |dx: f64, dy: f64| {
+            latlon_of_world_px(origin_x + dx, origin_y + dy)
+        };
+        let rings = vec![vec![
+            corner(0.0, 0.0),
+            corner(w as f64 - 1.0, 0.0),
+            corner(w as f64 - 1.0, h as f64 - 1.0),
+            corner(0.0, h as f64 - 1.0),
+        ]];
+        let wood = Building {
+            osm_id: "relation/1".into(),
+            name: Some("Forêt en pente".into()),
+            rings,
+            height_m: 18.0,
+            height_from_osm: false,
+            leaf_type: Some(helios_server::osm::LeafType::Broadleaved),
+        };
+
+        let mut dsm = terrain.clone();
+        let mut owner = vec![OWNER_TERRAIN; w * h];
+        stamp_canopy(&mut dsm, &terrain, &mut owner, origin_x, origin_y, &[wood], &[]);
+
+        // Au bas comme au sommet de la pente, la couronne doit couvrir
+        // exactement les 18 m au-dessus du sol LOCAL.
+        for x in [2usize, w / 2, w - 3] {
+            let i = (h / 2) * w + x;
+            let ground = terrain.data[i];
+            let (base, top) = dsm
+                .canopy_at(x as f64, (h / 2) as f64)
+                .unwrap_or_else(|| panic!("aucune canopée en x={x} (sol {ground} m)"));
+            assert!(
+                (base - ground).abs() < 0.5,
+                "base de couronne calée sur le sol local en x={x} : {base} vs {ground}"
+            );
+            assert!(
+                (top - (ground + 18.0)).abs() < 0.5,
+                "sommet à sol+18 m en x={x} : {top} vs {}",
+                ground + 18.0
+            );
+        }
+    }
 
     /// Grille jouet : une rue nord-sud dégagée, du bâti de part et d'autre.
     ///
