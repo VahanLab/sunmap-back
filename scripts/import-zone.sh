@@ -77,6 +77,14 @@ cargo run --release --bin tilegen -- "${MERGE[@]}" "$GEOJSONL" "$ARCHIVE.tmp"
 mv -f "$ARCHIVE.tmp" "$ARCHIVE"
 
 echo "=== 4/4 lieux (établissements + mobilier) → PostgreSQL"
+# `db::connect()` ne lit QUE la variable d'environnement (le `.env` n'est
+# consommé que par docker compose, via `env_file`) : sans cet export, le
+# binaire retombe silencieusement sur la base locale de dev — l'import
+# France du 2026-08-05 est parti là au lieu de la base managée.
+if [[ -z "${DATABASE_URL:-}" ]]; then
+  DATABASE_URL=$(grep '^DATABASE_URL=' helios-server/.env | tail -1 | cut -d= -f2-)
+  export DATABASE_URL
+fi
 cargo run --release --bin import -- "$GEOJSONL"
 
 if [[ $UPLOAD == 1 ]]; then
