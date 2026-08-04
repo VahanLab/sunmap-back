@@ -74,10 +74,36 @@ const NEEDLE_GENERA: &[&str] = &[
     "cryptomeria", "metasequoia", "calocedrus",
 ];
 
-/// Palmiers d'ornement du pourtour méditerranéen.
+/// Genres à silhouette de palmier : un stipe nu couronné de frondes.
+///
+/// Deux familles s'y mêlent volontairement, parce que c'est la **silhouette**
+/// qui choisit le modèle et non la botanique (cf. `LeafType`) :
+///
+/// 1. les vrais palmiers (Arecaceae) ;
+/// 2. leurs sosies d'autres familles — cycas, dragonnier, yucca, cordyline,
+///    bananier. Aucun n'est un palmier, tous portent un bouquet de longues
+///    feuilles au sommet d'un tronc nu, et le modèle de feuillu — une boule
+///    posée sur un fût — leur va bien plus mal que celui de palmier.
+///
+/// La liste vient du **relevé taginfo des valeurs de `genus` réellement
+/// présentes dans OSM** (août 2026), pas d'une flore : la famille compte ~180
+/// genres, la traîne ne se couvrirait jamais, et un genre absent d'OSM ne
+/// coûte que du bruit ici. Les quatre derniers vrais palmiers sont sous le
+/// seuil du relevé mais courants en plantation d'ornement — ils ne coûtent
+/// rien à prévoir.
+///
+/// L'ordre n'a pas d'importance, la comparaison est exacte et en minuscules.
 const PALM_GENERA: &[&str] = &[
-    "phoenix", "washingtonia", "trachycarpus", "chamaerops", "butia", "livistona",
-    "syagrus", "howea", "cocos", "sabal",
+    // Arecaceae, par fréquence OSM décroissante (elaeis ≈ 17 000 objets,
+    // howea ≈ 25).
+    "elaeis", "phoenix", "cocos", "jubaea", "washingtonia", "trachycarpus",
+    "livistona", "sabal", "roystonea", "areca", "syagrus", "dypsis",
+    "chamaerops", "archontophoenix", "butia", "brahea", "adonidia", "thrinax",
+    "howea",
+    // Attendus mais sous le seuil du relevé.
+    "bismarckia", "wodyetia", "caryota", "ravenea",
+    // Sosies : silhouette de palmier, autre famille.
+    "musa", "cordyline", "cycas", "dracaena", "yucca", "zamia",
 ];
 
 impl LeafType {
@@ -91,11 +117,14 @@ impl LeafType {
             Some("broadleaved") => return Self::Broadleaved,
             _ => {}
         }
-        // `species` commence par le genre ("Pinus nigra") : le premier mot
-        // suffit dans les deux cas.
+        // `species` et `taxon` commencent par le genre ("Pinus nigra") : le
+        // premier mot suffit dans les trois cas. `taxon` est le tag que le wiki
+        // OSM recommande pour l'identification — trois fois moins répandu que
+        // `species`, mais gratuit à lire ici.
         let genus = tags
             .get("genus")
             .or_else(|| tags.get("species"))
+            .or_else(|| tags.get("taxon"))
             .map(|g| g.split_whitespace().next().unwrap_or("").to_lowercase());
         match genus.as_deref() {
             Some(g) if NEEDLE_GENERA.contains(&g) => Self::Needleleaved,
@@ -664,5 +693,63 @@ mod tests {
         assert_eq!(b.amenity.as_deref(), Some("bench"));
         assert_eq!(b.backrest, Some(false));
         assert_eq!(b.direction_deg, None);
+    }
+
+    fn leaf_of(pairs: &[(&str, &str)]) -> LeafType {
+        let tags = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        LeafType::from_tags(&tags)
+    }
+
+    /// `leaf_type` fait foi quand il est là — c'est le tag prévu pour ça, et il
+    /// doit gagner même contre un genre qui dirait autre chose.
+    #[test]
+    fn leaf_type_prime_sur_le_genre() {
+        assert_eq!(leaf_of(&[("leaf_type", "palm")]), LeafType::Palm);
+        assert_eq!(
+            leaf_of(&[("leaf_type", "broadleaved"), ("genus", "Phoenix")]),
+            LeafType::Broadleaved
+        );
+    }
+
+    /// Le repli par genre, sur les trois tags qui le portent. La casse et le
+    /// nom d'espèce complet ne doivent rien changer.
+    #[test]
+    fn genre_rattrape_un_leaf_type_absent() {
+        assert_eq!(leaf_of(&[("genus", "Areca")]), LeafType::Palm);
+        assert_eq!(leaf_of(&[("genus", "areca")]), LeafType::Palm);
+        assert_eq!(leaf_of(&[("species", "Phoenix canariensis")]), LeafType::Palm);
+        assert_eq!(leaf_of(&[("taxon", "Washingtonia robusta")]), LeafType::Palm);
+        assert_eq!(leaf_of(&[("species", "Pinus nigra")]), LeafType::Needleleaved);
+        assert_eq!(leaf_of(&[("genus", "Platanus")]), LeafType::Broadleaved);
+    }
+
+    /// Les sosies : pas des palmiers, mais la même silhouette — un tronc nu
+    /// couronné de longues feuilles. Le modèle de feuillu leur irait plus mal.
+    #[test]
+    fn les_sosies_prennent_la_silhouette_palmier() {
+        for genus in ["Cycas", "Yucca", "Cordyline", "Dracaena", "Musa"] {
+            assert_eq!(leaf_of(&[("genus", genus)]), LeafType::Palm, "{genus}");
+        }
+    }
+
+    /// Sans rien pour trancher, feuillu : c'est ~80 % des arbres urbains
+    /// d'Europe, donc le pari le moins souvent faux.
+    #[test]
+    fn repli_feuillu_sans_indice() {
+        assert_eq!(leaf_of(&[]), LeafType::Broadleaved);
+        assert_eq!(leaf_of(&[("genus", "")]), LeafType::Broadleaved);
+        assert_eq!(leaf_of(&[("leaf_type", "n_importe_quoi")]), LeafType::Broadleaved);
+    }
+
+    /// Un genre ne peut pas être dans deux tables à la fois — la première qui
+    /// répond gagnerait en silence.
+    #[test]
+    fn aucun_genre_dans_deux_tables() {
+        for g in PALM_GENERA {
+            assert!(!NEEDLE_GENERA.contains(g), "{g} est dans les deux tables");
+        }
     }
 }
