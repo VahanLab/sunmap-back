@@ -425,47 +425,90 @@ pub async fn furniture_contributions(
 // (`bin/tilegen`), sans passer par la base.
 
 pub async fn upsert_places(pool: &PgPool, pois: &[Place]) -> Result<u64, sqlx::Error> {
+    // Un statement par LOT (UNNEST de tableaux), pas par ligne : chaque
+    // statement paie un aller-retour réseau complet, et la base est distante
+    // (managée OVH). En ligne à ligne, la France entière (523 k lieux) prenait
+    // ~3 h depuis un poste (~20 ms de RTT par INSERT) ; en lots de 1 000,
+    // ~500 aller-retours suffisent — quelques minutes.
     let mut written = 0u64;
     for chunk in pois.chunks(1000) {
-        let mut tx = pool.begin().await?;
+        let mut osm_ids = Vec::with_capacity(chunk.len());
+        let mut names = Vec::with_capacity(chunk.len());
+        let mut amenities = Vec::with_capacity(chunk.len());
+        let mut outdoor = Vec::with_capacity(chunk.len());
+        let mut websites = Vec::with_capacity(chunk.len());
+        let mut phones = Vec::with_capacity(chunk.len());
+        let mut hours = Vec::with_capacity(chunk.len());
+        let mut cuisines = Vec::with_capacity(chunk.len());
+        let mut wikidatas = Vec::with_capacity(chunk.len());
+        let mut lngs = Vec::with_capacity(chunk.len());
+        let mut lats = Vec::with_capacity(chunk.len());
+        let mut directions = Vec::with_capacity(chunk.len());
+        let mut covereds = Vec::with_capacity(chunk.len());
+        let mut backrests = Vec::with_capacity(chunk.len());
+        let mut seats = Vec::with_capacity(chunk.len());
+        let mut materials = Vec::with_capacity(chunk.len());
         for p in chunk {
-            written += sqlx::query(
-                "INSERT INTO places (osm_id, name, amenity, outdoor_seating, website, phone, \
-                                       opening_hours, cuisine, wikidata, geom, \
-                                       direction_deg, covered, backrest, seats, material) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
-                         ST_SetSRID(ST_MakePoint($10, $11), 4326), \
-                         $12, $13, $14, $15, $16) \
-                 ON CONFLICT (osm_id) DO UPDATE SET \
-                   name = EXCLUDED.name, amenity = EXCLUDED.amenity, \
-                   outdoor_seating = EXCLUDED.outdoor_seating, website = EXCLUDED.website, \
-                   phone = EXCLUDED.phone, opening_hours = EXCLUDED.opening_hours, \
-                   cuisine = EXCLUDED.cuisine, wikidata = EXCLUDED.wikidata, geom = EXCLUDED.geom, \
-                   direction_deg = EXCLUDED.direction_deg, covered = EXCLUDED.covered, \
-                   backrest = EXCLUDED.backrest, seats = EXCLUDED.seats, \
-                   material = EXCLUDED.material",
-            )
-            .bind(&p.osm_id)
-            .bind(&p.name)
-            .bind(&p.amenity)
-            .bind(p.outdoor_seating)
-            .bind(&p.website)
-            .bind(&p.phone)
-            .bind(&p.opening_hours)
-            .bind(&p.cuisine)
-            .bind(&p.wikidata)
-            .bind(p.lng)
-            .bind(p.lat)
-            .bind(p.direction_deg.map(|d| d as f32))
-            .bind(p.covered)
-            .bind(p.backrest)
-            .bind(p.seats)
-            .bind(&p.material)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+            osm_ids.push(p.osm_id.clone());
+            names.push(p.name.clone());
+            amenities.push(p.amenity.clone());
+            outdoor.push(p.outdoor_seating);
+            websites.push(p.website.clone());
+            phones.push(p.phone.clone());
+            hours.push(p.opening_hours.clone());
+            cuisines.push(p.cuisine.clone());
+            wikidatas.push(p.wikidata.clone());
+            lngs.push(p.lng);
+            lats.push(p.lat);
+            directions.push(p.direction_deg.map(|d| d as f32));
+            covereds.push(p.covered);
+            backrests.push(p.backrest);
+            seats.push(p.seats);
+            materials.push(p.material.clone());
         }
-        tx.commit().await?;
+        written += sqlx::query(
+            "INSERT INTO places (osm_id, name, amenity, outdoor_seating, website, phone, \
+                                   opening_hours, cuisine, wikidata, geom, \
+                                   direction_deg, covered, backrest, seats, material) \
+             SELECT osm_id, name, amenity, outdoor_seating, website, phone, \
+                    opening_hours, cuisine, wikidata, \
+                    ST_SetSRID(ST_MakePoint(lng, lat), 4326), \
+                    direction_deg, covered, backrest, seats, material \
+             FROM UNNEST($1::text[], $2::text[], $3::text[], $4::bool[], $5::text[], \
+                         $6::text[], $7::text[], $8::text[], $9::text[], $10::float8[], \
+                         $11::float8[], $12::real[], $13::bool[], $14::bool[], \
+                         $15::int[], $16::text[]) \
+                  AS t(osm_id, name, amenity, outdoor_seating, website, phone, \
+                       opening_hours, cuisine, wikidata, lng, lat, \
+                       direction_deg, covered, backrest, seats, material) \
+             ON CONFLICT (osm_id) DO UPDATE SET \
+               name = EXCLUDED.name, amenity = EXCLUDED.amenity, \
+               outdoor_seating = EXCLUDED.outdoor_seating, website = EXCLUDED.website, \
+               phone = EXCLUDED.phone, opening_hours = EXCLUDED.opening_hours, \
+               cuisine = EXCLUDED.cuisine, wikidata = EXCLUDED.wikidata, geom = EXCLUDED.geom, \
+               direction_deg = EXCLUDED.direction_deg, covered = EXCLUDED.covered, \
+               backrest = EXCLUDED.backrest, seats = EXCLUDED.seats, \
+               material = EXCLUDED.material",
+        )
+        .bind(&osm_ids)
+        .bind(&names)
+        .bind(&amenities)
+        .bind(&outdoor)
+        .bind(&websites)
+        .bind(&phones)
+        .bind(&hours)
+        .bind(&cuisines)
+        .bind(&wikidatas)
+        .bind(&lngs)
+        .bind(&lats)
+        .bind(&directions)
+        .bind(&covereds)
+        .bind(&backrests)
+        .bind(&seats)
+        .bind(&materials)
+        .execute(pool)
+        .await?
+        .rows_affected();
     }
     Ok(written)
 }
