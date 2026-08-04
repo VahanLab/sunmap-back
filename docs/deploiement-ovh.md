@@ -305,9 +305,30 @@ dernières lignes de log partent dans la sortie du job en cas d'échec.
 Un vrai `GET /health` (sans base) serait plus franc que cette inspection de
 conteneur : à ajouter quand l'endpoint existera.
 
+## Rate limiting — en place (2026-08-05)
+
+Token bucket nginx par IP visiteur, dans le volume NPM (survit aux
+redémarrages, PAS versionné — le recréer si le volume saute) :
+
+- `/data/nginx/custom/http_top.conf` : `limit_req_zone` `api_perip`,
+  10 Mo (~160 k IP), **20 r/s** par IP, `limit_req_status 429`.
+- `/data/nginx/custom/server_proxy.conf` : `limit_req zone=api_perip
+  burst=40 nodelay` (+ le `real_ip_header CF-Connecting-IP` du § 3 —
+  la limite compte bien l'IP du visiteur, pas celle de Cloudflare).
+
+20 r/s est volontairement généreux : app mobile = opérateurs en CGNAT,
+plusieurs utilisateurs légitimes derrière une même IP. Le burst absorbe
+l'ouverture de carte (plusieurs fetch simultanés). Vérifié : ~60 requêtes
+passent en rafale depuis une IP, le reste tombe en 429.
+
+Étages complémentaires :
+- **Cloudflare edge (recommandé, à faire au dashboard)** : Security → WAF →
+  Rate limiting rules (1 règle incluse au plan gratuit) — ex. seuil
+  300 requêtes / 10 s par IP → Block. Absorbe un flood volumétrique avant
+  même la VM.
+- **Quotas par uid sur les contributions** (middleware axum) : backlog.
+
 ## Rappels avant mise en production
 
 - Retirer `/debug/ray` (tâche Notion `[MEP]`).
-- Rate limiting (cf. discussion : token bucket par IP via le proxy ou en
-  middleware axum, quotas par uid sur les contributions).
 - L'admin NPM (port 81) ne doit jamais rester ouvert au monde.
