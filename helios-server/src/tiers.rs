@@ -93,6 +93,21 @@ impl Tier {
             (Tier::Established, Lang::En) => "Established contributor",
             (Tier::Innovator, Lang::En) => "Innovator",
             (Tier::Influential, Lang::En) => "Influential",
+            (Tier::Novice, Lang::Es) => "Novato",
+            (Tier::Budding, Lang::Es) => "Contribuidor en ciernes",
+            (Tier::Established, Lang::Es) => "Contribuidor consolidado",
+            (Tier::Innovator, Lang::Es) => "Innovador",
+            (Tier::Influential, Lang::Es) => "Influyente",
+            (Tier::Novice, Lang::It) => "Novizio",
+            (Tier::Budding, Lang::It) => "Contributore in erba",
+            (Tier::Established, Lang::It) => "Contributore affermato",
+            (Tier::Innovator, Lang::It) => "Innovatore",
+            (Tier::Influential, Lang::It) => "Influente",
+            (Tier::Novice, Lang::De) => "Neuling",
+            (Tier::Budding, Lang::De) => "Angehender Beitragender",
+            (Tier::Established, Lang::De) => "Etablierter Beitragender",
+            (Tier::Innovator, Lang::De) => "Innovator",
+            (Tier::Influential, Lang::De) => "Einflussreich",
         }
     }
 }
@@ -208,7 +223,7 @@ mod tests {
 
     #[test]
     fn every_tier_has_distinct_labels() {
-        for lang in [Lang::Fr, Lang::En] {
+        for lang in [Lang::Fr, Lang::En, Lang::Es, Lang::It, Lang::De] {
             let labels: Vec<&str> = Tier::ALL.iter().map(|t| t.label(lang)).collect();
             let mut unique = labels.clone();
             unique.sort_unstable();
