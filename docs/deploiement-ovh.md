@@ -13,8 +13,8 @@ Le domaine `sunmap.tech` est déjà sur Cloudflare (nameservers délégués,
 2026-08-03) : `sunmap.tech`/`www` restent en **DNS only** (ils pointent vers
 Vercel, qui gère son propre SSL — les passer en proxy casse leur certificat,
 cf. incident du 2026-08-03). `tiles.sunmap.tech` (archive R2) est déjà
-branché. **`api.sunmap.tech` reste à faire, une fois la VM commandée** —
-cf. § 3 ci-dessous, tout est en TODO.
+branché. **`api.sunmap.tech` est en place** (2026-08-04, VM
+`57.130.73.102`) — cf. § 3 ci-dessous.
 
 Trois briques : la VM (Docker Compose : API + proxy), la base managée OVH,
 le domaine. Le fichier `docker-compose.yml` de la racine porte le tout.
@@ -69,77 +69,99 @@ OSM_WEB_BASE=https://master.apis.dev.openstreetmap.org
 Une application OAuth appartient à son instance : celle du bac à sable et celle
 de production sont deux déclarations distinctes, avec deux `client_id`.
 
-Pare-feu OVH (ou `ufw`) : ouvrir 80 et 443 au monde, **restreindre 81**
-(admin du proxy) à son IP, fermer tout le reste — 8080 n'est pas publié sur
-l'hôte, l'API n'est joignable que via le proxy.
+Pare-feu OVH (ou `ufw`) : ouvrir 22, 80 et 443, fermer tout le reste —
+8080 n'est pas publié sur l'hôte, l'API n'est joignable que via le proxy.
+**Attention : un port publié par Docker contourne `ufw`** (iptables, chaîne
+DOCKER, traversée avant les règles hôte) — c'est pourquoi l'admin du proxy
+(81) n'est pas publiée au monde mais liée à `127.0.0.1` dans le compose,
+et s'atteint par tunnel SSH :
 
-## 3. Domaine et proxy — ⚠ TODO une fois la VM commandée
+```bash
+ssh -L 8181:localhost:81 <user>@<ip-vm>
+# puis http://localhost:8181
+```
 
-Le domaine (`sunmap.tech`, déjà sur Cloudflare) est prêt ; ce qui suit
-demande l'IP de la VM, pas encore commandée au 2026-08-03. Le SSL est géré
-par Cloudflare (Origin CA) plutôt que Let's Encrypt — Nginx Proxy Manager
-sert toujours de reverse proxy interne, mais ne parle plus au monde
-directement.
+## 3. Domaine et proxy — ✅ en place (2026-08-04)
 
-1. [ ] **DNS Cloudflare** (pas OVH — le domaine y est déjà délégué,
+Le SSL est géré par Cloudflare (Origin CA) plutôt que Let's Encrypt —
+Nginx Proxy Manager sert toujours de reverse proxy interne, mais ne parle
+plus au monde directement. Derrière le proxy orange, le client ne voit
+jamais le certificat d'origine : Let's Encrypt n'apporterait qu'une
+machinerie de renouvellement à 90 jours pour un certificat que seul
+Cloudflare consulte, quand l'Origin CA se colle une fois pour 15 ans.
+
+1. [x] **DNS Cloudflare** (pas OVH — le domaine y est déjà délégué,
    nameservers changés) : dashboard Cloudflare → `sunmap.tech` → DNS →
    Records → Add record : type `A`, name `api`, IPv4 = IP publique de la
    VM, Proxy status = **Proxied** (orange). Laisser `sunmap.tech`/`www` en
    DNS only (Vercel).
-2. `http://<ip-vm>:81` → Nginx Proxy Manager (premier login
-   `admin@example.com` / `changeme`, à changer immédiatement).
+2. Admin Nginx Proxy Manager par tunnel SSH (cf. § 2) :
+   `ssh -L 8181:localhost:81 <vm>` puis `http://localhost:8181` (premier
+   login `admin@example.com` / `changeme`, à changer immédiatement).
 3. **Proxy Hosts → Add** : domaine `api.sunmap.tech`, forward
    `http://api:8080` (le nom de service compose résout dans le réseau
    interne). Activer « Block Common Exploits » et « Websockets » (inutile
    mais inoffensif).
-4. [ ] **Certificat d'origine** : Cloudflare → SSL/TLS → Origin Server →
+4. [x] **Certificat d'origine** : Cloudflare → SSL/TLS → Origin Server →
    Create Certificate (RSA, 15 ans, hostname `api.sunmap.tech`) → coller le
    certificat + la clé privée dans l'onglet **SSL** du Proxy Host NPM
    (« Custom » plutôt que « Request a new SSL Certificate » Let's Encrypt —
    Cloudflare valide ce certificat, pas une CA publique).
-5. [ ] Cloudflare → SSL/TLS → Overview → mode **Full (strict)** : sans ça,
+5. [x] Cloudflare → SSL/TLS → Overview → mode **Full (strict)** : sans ça,
    Cloudflare accepterait un certificat non vérifié à l'origine.
-6. [ ] **Allowlist Cloudflare** sur la VM (`iptables`, plages IP
-   <https://www.cloudflare.com/ips/>) pour n'accepter 80/443 que depuis
-   Cloudflare — sinon l'IP de la VM, si elle fuite, permet de contourner le
-   proxy. Activer aussi `real_ip` dans NPM pour restaurer l'IP visiteur
-   réelle depuis `CF-Connecting-IP` (sinon tous les logs affichent les IP
-   Cloudflare).
+6. [x] **Allowlist Cloudflare** sur la VM : `scripts/cf-allowlist.sh`
+   (installé en `/usr/local/sbin/`, service systemd `cf-allowlist` au boot
+   + timer hebdomadaire de rafraîchissement des plages). N'accepte 80/443
+   que depuis les plages Cloudflare — sinon l'IP de la VM, si elle fuite,
+   permet de contourner le proxy. Les règles vivent dans la chaîne iptables
+   `DOCKER-USER` : comme pour le port 81, `ufw` ne voit pas le trafic vers
+   les ports publiés par Docker.
+7. [x] **IP visiteur réelle** (`CF-Connecting-IP`) : fichier
+   `/data/nginx/custom/server_proxy.conf` dans le volume NPM, contenant
+   `real_ip_header CF-Connecting-IP;` seul. Pas au niveau http
+   (`http_top.conf`) : le `nginx.conf` de NPM y définit déjà
+   `real_ip_header X-Real-IP` (doublon = crash-loop) — au niveau server,
+   la directive surcharge proprement, et les plages `set_real_ip_from`
+   Cloudflare sont déjà dans l'`ip_ranges.conf` embarqué de NPM.
 
 Côté iOS : `HeliosServerConfig.baseURL` passe à `https://api.sunmap.tech` et
 l'exception ATS HTTP de l'Info.plist peut disparaître (le trafic devient TLS).
 
-## 4. Import des données OSM et archive vectorielle
+## 4. Import des données OSM et archive vectorielle — VM d'import dédiée
 
-La géométrie (bâtiments, végétation) ne passe plus du tout par la base
-managée : `bin/tilegen` génère `sunmap.pmtiles` directement depuis l'extrait
-PBF, sur le disque de la VM, et le serveur la lit là (`VECTOR_TILES`,
-obligatoire). La base managée ne garde que lieux, comptes et contributions
-(quelques Go au plus).
+**Le pipeline d'import ne tourne PAS sur la VM applicative.** Une VM
+dédiée (à commander au besoin, éphémère si l'on veut) porte osmium,
+`bin/tilegen` et les jetons d'écriture : c'est elle qui télécharge le PBF
+Geofabrik, génère `sunmap.pmtiles` et le pousse sur R2 + purge le cache
+(`scripts/import-zone.sh <url> --upload`). Ses variables (`R2_*` en
+« Object Read & Write », `CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_PURGE_TOKEN`)
+ne vivent que là — cf. `docs/import-zone.md`.
 
-Le pipeline, une fois sur la VM (osmium requis hors Docker) :
+La VM applicative, elle, ne fait que **lire** : le serveur exige un fichier
+local (`VECTOR_TILES`, obligatoire — la géométrie ne passe plus du tout par
+la base managée, qui ne garde que lieux, comptes et contributions). Après
+chaque import, rapatrier l'archive depuis R2 et redémarrer :
 
 ```bash
-# Tout-en-un : téléchargement Geofabrik → extraction → archive → lieux.
-scripts/import-zone.sh https://download.geofabrik.de/europe/france-latest.osm.pbf
-
-# Puis pointer le serveur sur l'archive et redémarrer :
-#   VECTOR_TILES=/tiles/sunmap.pmtiles dans .env (./tiles est monté).
-docker compose up -d api
+# Sur la VM applicative — R2_* (jeton « Object Read only ») dans
+# helios-server/.env. Téléchargement atomique (.part puis rename).
+python3 scripts/r2-download.py sunmap.pmtiles tiles/
+docker compose restart api
 ```
 
 Notes :
-- **Ordre RAM** : `tilegen` est borné en mémoire (flux + buckets disque,
-  pic = le plus gros bucket, ~1 Go sur la France). C'est `osmium`
-  (assemblage des aires à l'extraction) qui demande le plus — si la VM
-  sature, extraire en local et copier le `.geojsonl` (`scp`).
+- **Séparation des jetons** : la VM applicative n'a qu'un jeton R2
+  « Object Read only » limité au bucket. Écriture et purge restent sur la
+  VM d'import — une VM applicative compromise ne peut pas corrompre les
+  tuiles servies aux clients.
+- **RAM (VM d'import)** : `tilegen` est borné en mémoire (flux + buckets
+  disque, pic ~1 Go sur la France) ; c'est `osmium` (assemblage des aires)
+  qui demande le plus — dimensionner la VM d'import pour lui.
 - **Couverture** : l'archive ne couvre que l'extrait donné (plus de base
   cumulative) — prendre un extrait englobant toutes les zones voulues.
-- **R2** : la même archive se pousse sur Cloudflare R2
-  (`scripts/r2-upload.py`) pour le client ; le serveur garde sa copie
-  locale. Domaine custom déjà branché : `tiles.sunmap.tech` (R2 → bucket
-  `sunmap-tiles` → Settings → Custom Domains), proxy Cloudflare géré
-  automatiquement, rien à faire côté VM.
+- **Client** : le Worker `tiles.sunmap.tech` sert les tuiles depuis le même
+  bucket R2 (binding interne, bucket privé) — l'upload de la VM d'import
+  alimente donc serveur ET client d'un coup.
 
 ## 5. Déploiement continu (GitHub Actions)
 

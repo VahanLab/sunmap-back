@@ -50,7 +50,11 @@ services:
     ports:
       - "80:80"    # HTTP (challenges Let's Encrypt + redirection HTTPS)
       - "443:443"  # HTTPS public
-      - "81:81"    # Interface d'admin — à restreindre par pare-feu OVH
+      # Interface d'admin : liée à localhost UNIQUEMENT — un port publié par
+      # Docker contourne ufw (chaîne iptables DOCKER, avant les règles hôte),
+      # une restriction pare-feu sur 81 serait décorative. Accès par tunnel :
+      #   ssh -L 8181:localhost:81 <vm>   puis   http://localhost:8181
+      - "127.0.0.1:81:81"
     volumes:
       - npm_data:/data
       - npm_letsencrypt:/etc/letsencrypt
