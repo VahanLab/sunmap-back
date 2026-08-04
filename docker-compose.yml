@@ -31,6 +31,13 @@ services:
     # qui ne parle pas de l'application.
     env_file:
       - ./helios-server/.env
+    environment:
+      # La base managée est distante par nature : le serveur refuse une base
+      # non locale sans ce drapeau. C'est un garde-fou de développement — un
+      # `cargo run` sur un poste ne doit pas appliquer ses migrations (dont un
+      # DROP TABLE) sur la production parce qu'un `.env` traînait. Ici le geste
+      # est délibéré et visible.
+      ALLOW_REMOTE_DB: "1"
     volumes:
       # Archive vectorielle générée par `tilegen`, sur le disque de la VM —
       # grosse (Go), statique, rien à faire dans une image ou un volume nommé.

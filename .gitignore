@@ -32,3 +32,6 @@ __pycache__/
 cloudflare/node_modules/
 cloudflare/dist/
 cloudflare/.wrangler/
+
+# Aide-mémoire du DSN de production — jamais commité, jamais chargé.
+.env.production

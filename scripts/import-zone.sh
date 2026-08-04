@@ -16,8 +16,8 @@
 #      existante si elle est là : ajouter une région n'efface pas les
 #      précédentes (--replace pour repartir de zéro) ;
 #   4. bin/import — lieux (établissements + mobilier urbain) vers PostgreSQL,
-#      la seule chose qui y reste (DATABASE_URL, défaut
-#      postgres://localhost/sunmap).
+#      la seule chose qui y reste. DATABASE_URL est OBLIGATOIRE et sans
+#      défaut ; la base visée est annoncée avant écriture.
 #
 # --upload  : pousse ensuite l'archive sur Cloudflare R2 (scripts/r2-upload.py)
 #             PUIS purge le cache Cloudflare (scripts/cf-purge.py) — sans
@@ -77,14 +77,15 @@ cargo run --release --bin tilegen -- "${MERGE[@]}" "$GEOJSONL" "$ARCHIVE.tmp"
 mv -f "$ARCHIVE.tmp" "$ARCHIVE"
 
 echo "=== 4/4 lieux (établissements + mobilier) → PostgreSQL"
-# `db::connect()` ne lit QUE la variable d'environnement (le `.env` n'est
-# consommé que par docker compose, via `env_file`) : sans cet export, le
-# binaire retombe silencieusement sur la base locale de dev — l'import
-# France du 2026-08-05 est parti là au lieu de la base managée.
-if [[ -z "${DATABASE_URL:-}" ]]; then
-  DATABASE_URL=$(grep '^DATABASE_URL=' helios-server/.env | tail -1 | cut -d= -f2-)
-  export DATABASE_URL
-fi
+# `bin/import` charge lui-même `helios-server/.env` et annonce la base visée
+# avant d'écrire. Il n'y a plus de repli silencieux : sans DATABASE_URL il
+# s'arrête. Pour viser une autre base que celle du `.env` — la production
+# depuis un poste de dev, typiquement — la passer explicitement :
+#
+#   DATABASE_URL='postgres://…' scripts/import-zone.sh …
+#
+# Une variable déjà présente dans l'environnement l'emporte sur le `.env`
+# (dotenvy n'écrase pas), le geste reste donc ponctuel et visible.
 cargo run --release --bin import -- "$GEOJSONL"
 
 if [[ $UPLOAD == 1 ]]; then

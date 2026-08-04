@@ -1,12 +1,15 @@
-//! Charge dans PostGIS un extrait OSM préparé par `osmium` (GeoJSONSeq).
-//!
-//! Remplace l'ingestion Overpass par tuiles (`bin/ingest.rs`) dès qu'on veut
-//! plus qu'une ville : 192 requêtes réseau et ~45 min pour Paris, contre un
-//! téléchargement et quelques minutes ici. `ingest` reste utile pour rafraîchir
-//! une zone restreinte sans re-télécharger un extrait.
+//! Charge dans PostgreSQL les **lieux** d'un extrait OSM préparé par `osmium`
+//! (GeoJSONSeq) : établissements et mobilier urbain. La géométrie
+//! (bâtiments, arbres, bois) ne passe pas par ici — elle va directement dans
+//! l'archive vectorielle, cf. `bin/tilegen`.
 //!
 //!   ./scripts/osm-extract.sh idf.osm.pbf extrait.geojsonl
-//!   cargo run --release --bin import -- extrait.geojsonl
+//!   DATABASE_URL=postgres://localhost/sunmap \
+//!     cargo run --release --bin import -- extrait.geojsonl
+//!
+//! La base visée est **annoncée avant toute écriture**, et il n'y a pas de
+//! valeur par défaut : un import de la France entière est déjà parti dans la
+//! base de dev en silence faute d'avoir exporté `DATABASE_URL`.
 //!
 //! Lit aussi sur l'entrée standard si aucun fichier n'est donné, ce qui permet
 //! d'enchaîner sans fichier intermédiaire :
@@ -18,9 +21,37 @@ use std::io::{BufReader, IsTerminal};
 
 use helios_server::{db, pbf};
 
+/// Même chargement que le serveur : sans lui, les binaires ne voyaient pas
+/// `helios-server/.env` et chacun contournait à sa façon — c'est cette
+/// asymétrie qui avait fini par mettre des identifiants de production dans un
+/// fichier lu par le serveur de développement.
+fn load_dotenv() {
+    for candidate in ["helios-server/.env", ".env"] {
+        if dotenvy::from_filename(candidate).is_ok() {
+            return;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    load_dotenv();
     let path = std::env::args().nth(1);
+
+    // Lue avant de parser l'extrait : inutile de passer plusieurs minutes sur
+    // un fichier de plusieurs Go pour échouer sur la configuration.
+    let url = match db::database_url() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "cible : {} ({})",
+        db::host_of(&url).unwrap_or_else(|| "?".into()),
+        if db::is_local_url(&url) { "locale" } else { "DISTANTE" }
+    );
 
     let extract = match &path {
         Some(p) => {

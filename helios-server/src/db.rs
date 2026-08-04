@@ -13,12 +13,73 @@ use sqlx::Row;
 
 use crate::osm::Place;
 
-/// URL par défaut en dev local. Surchargeable par `DATABASE_URL`.
-pub const DEFAULT_URL: &str = "postgres://localhost/sunmap";
+/// Erreur de configuration de la base, distincte d'une erreur sqlx : il n'y a
+/// rien à retenter, il manque un réglage.
+#[derive(Debug)]
+pub struct DatabaseConfigError(pub String);
 
-pub async fn connect() -> Result<PgPool, sqlx::Error> {
-    let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    PgPoolOptions::new().max_connections(8).connect(&url).await
+impl std::fmt::Display for DatabaseConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for DatabaseConfigError {}
+
+/// URL de la base, **sans valeur par défaut**.
+///
+/// Un repli silencieux sur `postgres://localhost/sunmap` a déjà coûté cher :
+/// un import de la France entière est parti dans la base de dev sans que rien
+/// ne le signale, parce que `DATABASE_URL` n'était pas exporté. Se tromper de
+/// base doit être une erreur bruyante, jamais un défaut.
+pub fn database_url() -> Result<String, DatabaseConfigError> {
+    match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => Ok(url),
+        _ => Err(DatabaseConfigError(
+            "DATABASE_URL manquant. Aucune base par défaut : viser la mauvaise \
+             est trop facile et trop silencieux. Exemple en dev :\n  \
+             export DATABASE_URL=postgres://localhost/sunmap"
+                .into(),
+        )),
+    }
+}
+
+/// L'URL désigne-t-elle une base sur cette machine ?
+///
+/// Sert de garde-fou : un binaire de développement ne doit pas écrire dans une
+/// base distante — a fortiori celle de production — par le seul fait qu'un
+/// fichier de configuration traînait.
+pub fn is_local_url(url: &str) -> bool {
+    match host_of(url) {
+        // Hôte vide = socket Unix (`postgres:///sunmap`), donc cette machine.
+        Some(h) => matches!(h.as_str(), "localhost" | "127.0.0.1" | "::1" | ""),
+        // URL illisible : traitée comme DISTANTE. Un garde-fou qui laisse
+        // passer ce qu'il ne comprend pas ne garde rien.
+        None => false,
+    }
+}
+
+/// Hôte d'une URL PostgreSQL, sans dépendance : ce qui suit le dernier `@`
+/// (ou `//` s'il n'y a pas d'identifiants) jusqu'au `:`, `/` ou `?` suivant.
+///
+/// `None` quand l'URL n'a même pas de `://` — `is_local_url` la tient alors
+/// pour distante.
+pub fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split("://").nth(1)?;
+    let authority = after_scheme.split(['/', '?']).next()?;
+    // Dernier `@` : un mot de passe peut en contenir, et peut aussi contenir
+    // « localhost » — l'hôte est ce qui vient après le dernier.
+    let host_port = authority.rsplit('@').next()?;
+    // IPv6 littérale entre crochets (`[::1]:5432`) : découper sur `:` la
+    // couperait en deux.
+    if let Some(rest) = host_port.strip_prefix('[') {
+        return rest.split(']').next().map(str::to_string);
+    }
+    Some(host_port.split(':').next()?.to_string())
+}
+
+pub async fn connect() -> Result<PgPool, Box<dyn std::error::Error + Send + Sync>> {
+    let url = database_url()?;
+    Ok(PgPoolOptions::new().max_connections(8).connect(&url).await?)
 }
 
 /// Enveloppe PostGIS d'une bbox géographique.
@@ -929,4 +990,52 @@ pub async fn mark_osm_push_failed(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_local_url` porte un garde-fou de sécurité : c'est lui qui empêche un
+    /// binaire de développement d'écrire dans la base de production. Il doit
+    /// pencher du côté prudent — dans le doute, distant.
+    #[test]
+    fn local_urls_are_recognised() {
+        for url in [
+            "postgres://localhost/sunmap",
+            "postgres://user@localhost/sunmap",
+            "postgres://user:pass@localhost:5432/sunmap",
+            "postgres://127.0.0.1:5432/sunmap",
+            "postgres://user@[::1]:5432/sunmap",
+            // Socket Unix : pas d'hôte du tout.
+            "postgres:///sunmap",
+        ] {
+            assert!(is_local_url(url), "devrait être local : {url}");
+        }
+    }
+
+    #[test]
+    fn remote_urls_are_recognised() {
+        for url in [
+            "postgres://u:p@postgresql-abc.database.cloud.ovh.net:20184/defaultdb?sslmode=require",
+            "postgres://u:p@10.0.0.5/sunmap",
+            "postgres://db.example.com/sunmap",
+            // Un mot de passe contenant « localhost » ne doit pas faire passer
+            // pour local : l'hôte se lit APRÈS le dernier `@`.
+            "postgres://user:localhost@db.example.com/sunmap",
+            // Illisible : traité comme distant, jamais l'inverse.
+            "pas-une-url",
+        ] {
+            assert!(!is_local_url(url), "devrait être distant : {url}");
+        }
+    }
+
+    #[test]
+    fn host_is_extracted_without_credentials() {
+        assert_eq!(
+            host_of("postgres://user:pass@db.example.com:20184/defaultdb?sslmode=require").as_deref(),
+            Some("db.example.com")
+        );
+        assert_eq!(host_of("postgres://localhost/sunmap").as_deref(), Some("localhost"));
+    }
 }

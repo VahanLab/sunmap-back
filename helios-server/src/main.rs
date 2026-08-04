@@ -98,15 +98,41 @@ fn load_dotenv() {
 async fn main() {
     load_dotenv();
 
+    // Garde-fou : un binaire lancé à la main ne doit pas parler à une base
+    // distante — a fortiori celle de production — parce qu'un `.env` traînait.
+    // C'est arrivé : un `cargo run` local a tenté d'appliquer ses migrations
+    // sur la base managée, et seul un refus de droits l'a arrêté. Or ces
+    // migrations contiennent un `DROP TABLE`.
+    //
+    // En production, le conteneur pose `ALLOW_REMOTE_DB=1` — le geste est
+    // délibéré et visible dans la configuration de déploiement.
+    let url = match db::database_url() {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let remote_allowed = std::env::var("ALLOW_REMOTE_DB").is_ok_and(|v| v == "1");
+    if !db::is_local_url(&url) && !remote_allowed {
+        eprintln!(
+            "DATABASE_URL vise une base DISTANTE ({}), et ALLOW_REMOTE_DB n'est pas à 1.\n\
+             Refus de démarrer : les migrations embarquées s'appliquent au démarrage,\n\
+             et l'une d'elles supprime des tables. Pour du développement, viser une\n\
+             base locale ; pour la production, poser ALLOW_REMOTE_DB=1.",
+            db::host_of(&url).unwrap_or_else(|| "hôte illisible".into())
+        );
+        std::process::exit(1);
+    }
+
     let pool = match db::connect().await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Connexion PostgreSQL impossible : {e}");
             eprintln!(
-                "Attendu : {}. Créer avec `createdb sunmap`, puis remplir avec \
-                 `cargo run --bin import` (le schéma s'applique tout seul au \
-                 démarrage, cf. migrations/).",
-                db::DEFAULT_URL
+                "Base visée : {}. En dev : `createdb sunmap`, puis \
+                 `DATABASE_URL=postgres://localhost/sunmap cargo run`.",
+                db::host_of(&url).unwrap_or_else(|| "?".into())
             );
             std::process::exit(1);
         }

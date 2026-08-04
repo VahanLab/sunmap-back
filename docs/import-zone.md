@@ -10,10 +10,32 @@ l'archive, directement.
 
 - `osmium` (`brew install osmium-tool`) ;
 - Rust (binaires `tilegen` et `import` du workspace) ;
-- PostgreSQL + PostGIS joignable via `DATABASE_URL` (défaut :
-  `postgres://localhost/sunmap`) — **pour les lieux uniquement** :
-  établissements, mobilier urbain, comptes, contributions. Les migrations
-  s'appliquent au démarrage du serveur.
+- PostgreSQL + PostGIS joignable via `DATABASE_URL`, **sans valeur par
+  défaut** — pour les lieux uniquement (établissements, mobilier urbain,
+  comptes, contributions). Les migrations s'appliquent au démarrage du
+  serveur.
+
+### Quelle base ? Le geste doit être explicite
+
+Il n'y a plus de repli silencieux : sans `DATABASE_URL`, l'import s'arrête.
+`helios-server/.env` vise la base de **développement** ; `bin/import`
+annonce l'hôte visé avant d'écrire quoi que ce soit.
+
+Pour importer vers la **production** depuis un poste, passer le DSN le temps
+d'une commande — une variable déjà présente dans l'environnement l'emporte
+sur le `.env` :
+
+```
+DATABASE_URL="$(grep -h '^DATABASE_URL=' helios-server/.env.production | cut -d= -f2-)" \
+  scripts/import-zone.sh <zone.osm.pbf>
+```
+
+`helios-server/.env.production` n'est chargé par **aucun** binaire : c'est un
+aide-mémoire, gitignoré. Le DSN de production n'a rien à faire dans le `.env`
+que lit le serveur de dev — un `cargo run` a déjà tenté d'y appliquer ses
+migrations, dont un `DROP TABLE`, et seul un refus de droits l'a arrêté. Le
+serveur refuse d'ailleurs désormais toute base non locale sans
+`ALLOW_REMOTE_DB=1`, que docker-compose pose en production.
 
 ## La commande
 
