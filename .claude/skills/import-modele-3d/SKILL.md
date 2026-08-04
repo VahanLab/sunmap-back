@@ -53,15 +53,24 @@ sur les réglages.
 |---|---|---|
 | Triangles | ~4 000 | 500–1 000 |
 | Textures | 1024 px | 512 px |
-| Ombre portée | oui | **non** |
+| Ombre portée | oui | **selon ce qu'elle signifie** |
 
-Deux raisons, et elles se cumulent :
+La raison principale est le nombre : à z15–17 un bosquet fait quelques pixels
+de haut, et c'est **précisément là qu'on en pose le plus** — une grande forêt
+remplit l'écran.
 
-- à z15–17 un bosquet fait quelques pixels de haut, et c'est **précisément là
-  qu'on en pose le plus** — une grande forêt remplit l'écran ;
-- `modelCastShadows` fait re-rendre toute la géométrie dans la passe de shadow
-  map : c'est un **doublement pur** du coût. À cette distance, l'ombre d'un
-  bosquet parmi mille est invisible, tout le sous-bois est déjà sombre.
+**Sur l'ombre, se méfier du réflexe.** `modelCastShadows` fait re-rendre toute
+la géométrie dans la passe de shadow map : c'est un doublement pur du coût, et
+la couper est tentant. Ça a été fait sur les bosquets lointains, et ça revenait
+à **supprimer l'ombre de la végétation dans tout l'usage normal** — on ne voit
+le maillage détaillé que de très près. Or l'ombre d'un arbre est une
+information du produit, pas un ornement. La bonne question n'est pas « est-ce
+loin ? » mais « est-ce que cette ombre dit quelque chose ? » : oui pour un
+arbre, non pour un banc à z18, dont l'ombre fait un pixel.
+
+Quand l'ombre reste, **la compter dans le budget** (×2 sur le coût de
+l'instance) plutôt que la retirer : l'arbitrage vit alors dans le budget, où on
+peut le revoir, au lieu d'être figé dans l'asset.
 
 Générer la variante lointaine **depuis le `.glb` proche déjà livré** quand c'est
 possible : la bbox reste presque identique, donc les constantes d'échelle se
@@ -86,7 +95,8 @@ C'est le point qui décide de tout le câblage :
 couche lointaine sans y poser le même `onLayerTap` rend l'objet visible mais
 sourd au doigt sous le seuil de détail — ce qui se lit comme une panne.
 
-Seuils en place : `VegetationModel.detailedZoom` = 17,
+Seuils en place : `VegetationModel.detailedZoom` = 17 (arbres isolés),
+`VegetationModel.detailedClusterZoom` = 18 (bosquets),
 `FurnitureModelLayer.detailedZoom` = `TerraceModelLayer.detailedZoom` = 19,5
 (le zoom d'arrivée du survol vers un lieu, `CameraFraming.baseZoom`).
 
@@ -125,12 +135,17 @@ metersPerUnit_loin = metersPerUnit_proche × (emprise_proche / emprise_loin)
 
 ## 5. Le budget, à ne pas contourner
 
-`VegetationPlacement.triangleBudget` (1,5 M) plafonne toute la végétation d'une
-image. Un plafond exprimé en **nombre d'instances** est aveugle au coût
-unitaire — il autorise autant de bosquets à 50 000 triangles qu'à 4 000, et
-c'est exactement ce qui a laissé passer 300 M de triangles par image en forêt
-de conifères. Si un nouveau modèle sature le budget, c'est le modèle qu'il faut
-alléger, pas le budget qu'il faut lever.
+`VegetationPlacement.clusterTriangleBudget` (3 M) plafonne les bosquets d'une
+image, passe d'ombre comprise. Un plafond exprimé en **nombre d'instances** est
+aveugle au coût unitaire — il autorise autant de bosquets à 50 000 triangles
+qu'à 4 000, et c'est exactement ce qui a laissé passer 300 M de triangles par
+image en forêt de conifères. Si un nouveau modèle sature le budget, c'est le
+modèle qu'il faut alléger, pas le budget qu'il faut lever.
+
+La dilution qui en découle se fait par **crans de puissance de deux**, jamais
+par un facteur continu : les nœuds d'un cran doivent rester un sous-ensemble
+strict de ceux du cran précédent, sinon changer de niveau déplace toute la
+forêt. Cf. `VegetationPlacement.thinningLevel`.
 
 ## Vérifier
 
