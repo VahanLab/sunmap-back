@@ -216,6 +216,44 @@ async fn main() {
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
 
+    // Clé d'API globale (header `X-API-Key`) : filtre le scraping opportuniste
+    // et les curl anonymes — pas une authentification (la clé embarquée dans
+    // l'app se lit dans le binaire ; l'identité, c'est Firebase). En header et
+    // pas en query : une query part dans les logs du proxy, de Cloudflare et
+    // les caches d'URL. Absente de l'environnement = filtre éteint (dev local).
+    let app = match std::env::var("API_TOKEN").ok().filter(|t| !t.is_empty()) {
+        Some(token) => {
+            println!("clé d'API : exigée (X-API-Key)");
+            let token: Arc<str> = token.into();
+            app.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let token = token.clone();
+                async move {
+                    let presented = req
+                        .headers()
+                        .get("x-api-key")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    // Comparaison en temps constant : ne pas offrir un oracle
+                    // de préfixe à qui mesure les temps de réponse.
+                    let expected = token.as_bytes();
+                    let given = presented.as_bytes();
+                    let mut diff = expected.len() ^ given.len();
+                    for i in 0..expected.len() {
+                        diff |= (expected[i] ^ *given.get(i).unwrap_or(&0)) as usize;
+                    }
+                    if diff != 0 {
+                        return Err(axum::http::StatusCode::UNAUTHORIZED);
+                    }
+                    Ok(next.run(req).await)
+                }
+            }))
+        }
+        None => {
+            println!("clé d'API : absente (API_TOKEN vide) — endpoints ouverts");
+            app
+        }
+    };
+
     // Surchargeable pour faire tourner deux instances côte à côte (comparer
     // un chemin de données à l'autre) sans toucher au serveur de dev.
     let addr = format!(
