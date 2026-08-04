@@ -413,8 +413,15 @@ vues.
     {
       "osm_id": "node/2267752285", "name": "Epifani",
       "amenity": "restaurant", "category_label": "Restaurant",
-      "has_terrace": true, "lat": 48.8426051, "lng": 2.2779253,
+      "kind": "terrace", "has_terrace": true,
+      "lat": 48.8426051, "lng": 2.2779253,
       "updated_at": "2026-07-29T10:19:17.507222+00:00"
+    },
+    {
+      "osm_id": "user/6f0c…", "amenity": "bench", "category_label": "Banc public",
+      "kind": "furniture", "has_terrace": false,
+      "lat": 48.8431, "lng": 2.2784,
+      "updated_at": "2026-08-03T16:02:11.882+00:00"
     }
   ],
   "listable_count": 5
@@ -427,6 +434,19 @@ l'ancien. Le client n'accroche son décor qu'à `key`, jamais au libellé tradui
 
 `next_tier` est absent au sommet du barème, `remaining_to_next` vaut alors `0` et
 `progress` vaut `1`.
+
+**Deux gestes, une seule liste.** `kind` vaut `terrace` (présence ou absence de
+terrasse signalée sur un établissement) ou `furniture` (banc ou table de
+pique-nique posé, déplacé, corrigé). `has_terrace` ne veut rien dire pour le
+mobilier : il y vaut `false` faute de pouvoir être omis sans casser le décodage
+des clients d'avant `kind`, qui l'attendent obligatoire. C'est `kind` qui décide
+de le lire.
+
+**Une ligne par lieu, pas par geste.** `place_furniture_contributions` est un
+journal — corriger trois fois l'orientation d'un banc y écrit trois lignes —
+alors que `place_terraces` ne garde déjà que le dernier état. Le profil
+dédoublonne donc le mobilier par lieu, en gardant l'envoi le plus récent :
+corriger dix fois le même banc reste une contribution, palier compris.
 
 **Trois nombres, et ils ne disent pas la même chose.** `contribution_count` est
 le total réel, celui qui décide du palier. `contributions` n'est qu'un **aperçu
@@ -457,7 +477,8 @@ partage que les profils : le premier lit le jeton, le second est public.
     {
       "osm_id": "node/2267752285", "name": "Epifani",
       "amenity": "restaurant", "category_label": "Restaurant",
-      "has_terrace": true, "lat": 48.8426051, "lng": 2.2779253,
+      "kind": "terrace", "has_terrace": true,
+      "lat": 48.8426051, "lng": 2.2779253,
       "updated_at": "2026-07-29T10:19:17.507222+00:00"
     }
   ],

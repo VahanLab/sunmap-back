@@ -44,6 +44,26 @@ done
 
 mkdir -p pbf tiles
 
+# Les binaires viennent de `cargo` en développement, de l'image Docker sur la
+# VM — qui n'a pas de toolchain Rust, et où ces imports ont vocation à tourner
+# (les identifiants de la base managée n'ont pas à en sortir).
+if command -v cargo >/dev/null 2>&1; then
+  RUN_TILEGEN=(cargo run --release --quiet --bin tilegen --)
+  RUN_IMPORT=(cargo run --release --quiet --bin import --)
+else
+  IMAGE=${SUNMAP_TOOLS_IMAGE:-sunmap-tools:local}
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "=== construction de $IMAGE (une fois)"
+    docker build -q -t "$IMAGE" . >/dev/null
+  fi
+  # Image dédiée à l'outillage, jamais celle que sert `docker compose` : la
+  # construire ici ne doit pas remplacer l'image de production, qui vient du
+  # registre avec son tag.
+  DOCKER_RUN=(docker run --rm -v "$PWD:/work" -w /work -u "$(id -u):$(id -g)")
+  RUN_TILEGEN=("${DOCKER_RUN[@]}" "$IMAGE" tilegen)
+  RUN_IMPORT=("${DOCKER_RUN[@]}" -e DATABASE_URL "$IMAGE" import)
+fi
+
 case "$SRC" in
   http://*|https://*)
     PBF="pbf/$(basename "$SRC")"
@@ -73,7 +93,7 @@ if [[ $REPLACE == 0 && -f "$ARCHIVE" ]]; then
   echo "    (fusion dans l'archive existante)"
   MERGE=(--merge "$ARCHIVE")
 fi
-cargo run --release --bin tilegen -- "${MERGE[@]}" "$GEOJSONL" "$ARCHIVE.tmp"
+"${RUN_TILEGEN[@]}" "${MERGE[@]}" "$GEOJSONL" "$ARCHIVE.tmp"
 mv -f "$ARCHIVE.tmp" "$ARCHIVE"
 
 echo "=== 4/4 lieux (établissements + mobilier) → PostgreSQL"
@@ -86,7 +106,7 @@ echo "=== 4/4 lieux (établissements + mobilier) → PostgreSQL"
 #
 # Une variable déjà présente dans l'environnement l'emporte sur le `.env`
 # (dotenvy n'écrase pas), le geste reste donc ponctuel et visible.
-cargo run --release --bin import -- "$GEOJSONL"
+"${RUN_IMPORT[@]}" "$GEOJSONL"
 
 if [[ $UPLOAD == 1 ]]; then
   echo "=== upload R2"

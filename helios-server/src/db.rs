@@ -158,6 +158,37 @@ pub struct UserRecord {
 #[derive(Debug)]
 pub struct UsernameTaken;
 
+/// Ce qui a été contribué sur un lieu.
+///
+/// Les deux gestes vivent dans des tables différentes (`place_terraces` et
+/// `place_furniture_contributions`) mais valent la même chose pour qui regarde
+/// un profil : une correction apportée à la carte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContributionKind {
+    /// Présence ou absence de terrasse signalée sur un établissement.
+    Terrace,
+    /// Banc ou table de pique-nique posé, déplacé ou corrigé.
+    Furniture,
+}
+
+impl ContributionKind {
+    /// Clé stable, servie telle quelle au client : c'est elle qui décide de
+    /// l'icône et du libellé d'une ligne.
+    pub fn key(self) -> &'static str {
+        match self {
+            ContributionKind::Terrace => "terrace",
+            ContributionKind::Furniture => "furniture",
+        }
+    }
+
+    fn from_sql(raw: &str) -> Self {
+        match raw {
+            "furniture" => ContributionKind::Furniture,
+            _ => ContributionKind::Terrace,
+        }
+    }
+}
+
 /// Une contribution, vue depuis le profil de son auteur.
 ///
 /// Porte l'établissement (nom, catégorie, position) et non la seule référence :
@@ -169,7 +200,11 @@ pub struct ContributionRecord {
     pub osm_id: String,
     pub name: Option<String>,
     pub amenity: Option<String>,
-    pub has_terrace: bool,
+    pub kind: ContributionKind,
+    /// Renseigné pour une terrasse seulement : un banc ne dit rien de la
+    /// présence d'une terrasse, et lui prêter `false` le ferait passer pour un
+    /// « pas de terrasse » signalé.
+    pub has_terrace: Option<bool>,
     pub lat: f64,
     pub lng: f64,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -645,16 +680,56 @@ pub async fn user_by_username(
     )
 }
 
+/// Contributions d'un compte, terrasses **et** mobilier, à raison d'une ligne
+/// par lieu — CTE `contributions`, partagée par le décompte, le total
+/// affichable et la liste paginée.
+///
+/// Une seule définition pour les trois : le total qui décide du palier, celui
+/// qui dimensionne la pagination et les lignes rendues doivent parler des mêmes
+/// contributions, faute de quoi la liste s'arrête avant le total promis ou
+/// tourne dans le vide.
+///
+/// **Une ligne par lieu, pas par geste.** Corriger trois fois l'orientation
+/// d'un banc reste une contribution : `place_furniture_contributions` est un
+/// journal (une ligne par envoi), là où `place_terraces` ne garde déjà que le
+/// dernier état. Le `DISTINCT ON` aligne le premier sur le second, en gardant
+/// l'envoi le plus récent — c'est sa date qui situe la contribution.
+///
+/// Le second `DISTINCT ON`, sur l'union, ne sert qu'à un cas qui ne se produit
+/// pas aujourd'hui : les identifiants de mobilier et d'établissement sont
+/// disjoints. Il coûte une ligne et rend la requête indifférente au jour où un
+/// même lieu porterait les deux.
+///
+/// `$1` = uid.
+const CONTRIBUTIONS_CTE: &str = "WITH furniture AS ( \
+         SELECT DISTINCT ON (place_id) \
+                place_id AS osm_id, created_at AS updated_at, \
+                NULL::boolean AS has_terrace, 'furniture'::text AS kind \
+         FROM place_furniture_contributions \
+         WHERE user_uid = $1 \
+         ORDER BY place_id, created_at DESC \
+     ), gestures AS ( \
+         SELECT osm_id, updated_at, has_terrace, 'terrace'::text AS kind \
+         FROM place_terraces WHERE user_uid = $1 \
+         UNION ALL \
+         SELECT osm_id, updated_at, has_terrace, kind FROM furniture \
+     ), contributions AS ( \
+         SELECT DISTINCT ON (osm_id) osm_id, updated_at, has_terrace, kind \
+         FROM gestures ORDER BY osm_id, updated_at DESC \
+     ) ";
+
 /// Nombre de contributions d'un compte.
 ///
 /// Compté à part de la liste plutôt que déduit de sa longueur : la liste est
 /// tronquée pour l'affichage, et le total est justement ce qui décide du palier
 /// — le déduire d'une liste plafonnée figerait tout le monde au plafond.
 pub async fn contribution_count(pool: &PgPool, uid: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM place_terraces WHERE user_uid = $1")
-        .bind(uid)
-        .fetch_one(pool)
-        .await
+    sqlx::query_scalar::<_, i64>(&format!(
+        "{CONTRIBUTIONS_CTE} SELECT count(*) FROM contributions"
+    ))
+    .bind(uid)
+    .fetch_one(pool)
+    .await
 }
 
 /// Nombre de contributions **affichables**, c'est-à-dire dont l'établissement
@@ -666,11 +741,10 @@ pub async fn contribution_count(pool: &PgPool, uid: &str) -> Result<i64, sqlx::E
 /// total brut comme total de pagination promettrait des pages qu'on n'atteint
 /// jamais — le défilement s'arrêterait sur un chargement perpétuel.
 pub async fn listable_contribution_count(pool: &PgPool, uid: &str) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM place_terraces t \
-         JOIN places p USING (osm_id) \
-         WHERE t.user_uid = $1",
-    )
+    sqlx::query_scalar::<_, i64>(&format!(
+        "{CONTRIBUTIONS_CTE} \
+         SELECT count(*) FROM contributions c JOIN places p USING (osm_id)"
+    ))
     .bind(uid)
     .fetch_one(pool)
     .await
@@ -696,12 +770,14 @@ pub async fn delete_user(pool: &PgPool, uid: &str) -> Result<bool, sqlx::Error> 
     Ok(result.rows_affected() > 0)
 }
 
-/// Établissements auxquels un compte a contribué, du plus récent au plus ancien.
+/// Lieux auxquels un compte a contribué, du plus récent au plus ancien —
+/// terrasses signalées et mobilier posé ou corrigé, mêlés dans une seule liste.
 ///
-/// `JOIN places` et non `LEFT JOIN` : une contribution dont l'établissement a
-/// disparu d'OSM depuis n'a plus rien à montrer — ni nom, ni catégorie, ni
-/// position. Elle reste comptée dans le total, mais n'a pas sa place dans une
-/// liste dont chaque ligne est censée être cliquable.
+/// `JOIN places` et non `LEFT JOIN` : une contribution dont le lieu a disparu
+/// d'OSM depuis n'a plus rien à montrer — ni nom, ni catégorie, ni position.
+/// Elle reste comptée dans le total, mais n'a pas sa place dans une liste dont
+/// chaque ligne est censée être cliquable. (Le mobilier ne peut pas y tomber :
+/// `place_furniture_contributions.place_id` est en `ON DELETE CASCADE`.)
 ///
 /// Tri sur `(updated_at, osm_id)` et non sur la seule date : deux contributions
 /// enregistrées dans la même transaction partagent la même horodate, et
@@ -714,15 +790,15 @@ pub async fn contributions_by_user(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<ContributionRecord>, sqlx::Error> {
-    Ok(sqlx::query(
-        "SELECT t.osm_id, t.has_terrace, t.updated_at, \
+    Ok(sqlx::query(&format!(
+        "{CONTRIBUTIONS_CTE} \
+         SELECT c.osm_id, c.has_terrace, c.updated_at, c.kind, \
                 p.name, p.amenity, ST_Y(p.geom) AS lat, ST_X(p.geom) AS lng \
-         FROM place_terraces t \
+         FROM contributions c \
          JOIN places p USING (osm_id) \
-         WHERE t.user_uid = $1 \
-         ORDER BY t.updated_at DESC, t.osm_id DESC \
-         LIMIT $2 OFFSET $3",
-    )
+         ORDER BY c.updated_at DESC, c.osm_id DESC \
+         LIMIT $2 OFFSET $3"
+    ))
     .bind(uid)
     .bind(limit)
     .bind(offset)
@@ -733,6 +809,7 @@ pub async fn contributions_by_user(
         osm_id: r.get("osm_id"),
         name: r.get("name"),
         amenity: r.get("amenity"),
+        kind: ContributionKind::from_sql(r.get::<String, _>("kind").as_str()),
         has_terrace: r.get("has_terrace"),
         lat: r.get("lat"),
         lng: r.get("lng"),

@@ -2968,9 +2968,18 @@ struct ContributionPayload {
     amenity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     category_label: Option<String>,
+    /// Ce qui a été contribué : `terrace` ou `furniture`. Clé stable, à laquelle
+    /// le client accroche son icône et son libellé.
+    kind: &'static str,
     /// L'utilisateur a-t-il signalé une terrasse, ou son absence ? Les deux sont
     /// des contributions : dire « pas de terrasse » corrige la carte autant que
     /// l'inverse.
+    ///
+    /// Toujours sérialisé, `false` pour du mobilier, alors que le domaine le
+    /// laisse absent dans ce cas : les clients d'avant `kind` le décodent en
+    /// booléen obligatoire, et l'omettre ferait échouer chez eux le décodage de
+    /// **tout** le profil. Ils liront « pas de terrasse » sur une ligne de
+    /// mobilier — inexact, mais lisible, là où l'écran serait sinon vide.
     has_terrace: bool,
     lat: f64,
     lng: f64,
@@ -3030,7 +3039,8 @@ fn contribution_payload(r: db::ContributionRecord, lang: Lang) -> ContributionPa
         osm_id: r.osm_id,
         name: r.name,
         amenity: r.amenity,
-        has_terrace: r.has_terrace,
+        kind: r.kind.key(),
+        has_terrace: r.has_terrace.unwrap_or(false),
         lat: r.lat,
         lng: r.lng,
         updated_at: r.updated_at.to_rfc3339(),

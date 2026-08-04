@@ -29,10 +29,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Le serveur, et l'outil d'import PBF — pour pouvoir remplir la base managée
-# depuis la VM (`docker compose run --rm api import extrait.geojsonl`).
+# Le serveur ET l'outillage d'import — la VM n'a pas de toolchain Rust, et
+# c'est là que les imports doivent tourner : les identifiants de la base
+# managée n'ont alors pas à quitter la production pour un poste de dev.
+# `tilegen` ne touche aucune base, `import` n'écrit que les lieux.
 COPY --from=builder /app/target/release/helios-server /usr/local/bin/helios-server
 COPY --from=builder /app/target/release/import /usr/local/bin/import
+COPY --from=builder /app/target/release/tilegen /usr/local/bin/tilegen
 
 # Processus non-root : l'app n'écrit rien sur disque, aucun privilège requis.
 RUN useradd --system --no-create-home sunmap
