@@ -199,6 +199,117 @@ pub fn shadow_hit_from_ground(
     None
 }
 
+/// Nature d'une cellule rencontrée par le rayon.
+///
+/// `helios-core` ne connaît que des altitudes : distinguer relief et bâtiment,
+/// ou arbre isolé et emprise boisée, demande la grille d'occupation que seul
+/// l'appelant possède.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cause {
+    /// Obstacle opaque.
+    Opaque,
+    /// Cellule de canopée traversée.
+    Canopy,
+}
+
+/// Ce que le rayon a rencontré sur toute sa longueur.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShadowCauses {
+    /// Un obstacle opaque coupe le rayon.
+    pub opaque_blocked: bool,
+    /// La canopée a éteint le soleil à elle seule : transmittance cumulée
+    /// passée sous le seuil.
+    pub canopy_extinguished: bool,
+}
+
+impl ShadowCauses {
+    pub fn shadowed(&self) -> bool {
+        self.opaque_blocked || self.canopy_extinguished
+    }
+}
+
+/// Parcourt le rayon **en entier** et signale chaque cellule qui l'ombre, au
+/// lieu de s'arrêter au premier obstacle comme [`shadow_hit_from_ground`].
+///
+/// L'arrêt anticipé suffit à répondre « suis-je à l'ombre », et c'est lui qui
+/// rend la classification en masse rapide. Il ne suffit pas à répondre « de
+/// QUOI suis-je à l'ombre » : l'arbre au-dessus de la tête n'efface pas la
+/// montagne qui, plus loin, ombre toute la vallée. On voit donc tout le
+/// rayon, et l'appelant arbitre.
+///
+/// À réserver aux requêtes ponctuelles — le parcours est complet par
+/// construction, là où `/places` doit garder son early-exit.
+pub fn shadow_causes_from_ground(
+    dsm: &Dsm,
+    sun: &SunPosition,
+    px: f64,
+    py: f64,
+    ground: f32,
+    params: &ShadowParams,
+    dsm_max_elevation: f32,
+    // Coordonnées FRACTIONNAIRES : `sample` interpole sur quatre cellules, et
+    // l'appelant doit pouvoir consulter les mêmes. Arrondir ici lui ferait
+    // attribuer au relief un obstacle dont seul le bord de bâtiment voisin
+    // dépasse le rayon.
+    mut on_cause: impl FnMut(Cause, f64, f64),
+) -> ShadowCauses {
+    let mut out = ShadowCauses::default();
+    if !sun.is_up() {
+        return out;
+    }
+    let z0 = ground as f64 + params.observer_height_m;
+
+    let rad = std::f64::consts::PI / 180.0;
+    let az = sun.azimuth_deg * rad;
+    let tan_elev = (sun.elevation_deg * rad).tan();
+    let dx = az.sin() * params.step_px;
+    let dy = -az.cos() * params.step_px;
+    let step_m = params.step_px * dsm.meters_per_pixel;
+
+    let max_useful_m = ((dsm_max_elevation as f64 - z0).max(0.0)) / tan_elev.max(1e-9);
+    let max_m = params.max_distance_m.min(max_useful_m);
+    let max_steps = (max_m / step_m).ceil() as usize;
+
+    let cos_elev = (sun.elevation_deg * rad).cos().max(1e-6);
+    let step_ray_m = step_m / cos_elev;
+    let has_canopy = dsm.canopy_top.is_some();
+    let ln_tau = params.canopy_transmittance_per_m.max(1e-9).ln();
+    let ln_threshold = params.sunlit_light_threshold.max(1e-9).ln();
+    let mut ln_light = 0.0f64;
+
+    let (mut x, mut y) = (px, py);
+    for i in 1..=max_steps {
+        x += dx;
+        y += dy;
+        let Some(h) = dsm.sample(x, y) else { break };
+        let ray_z = z0 + (i as f64) * step_m * tan_elev;
+
+        if (h as f64) > ray_z {
+            // Signalé puis dépassé : ce qui est derrière ombre tout autant, et
+            // c'est souvent ce qui ombre le PLUS (une crête derrière un mur).
+            out.opaque_blocked = true;
+            on_cause(Cause::Opaque, x, y);
+            continue;
+        }
+
+        if has_canopy {
+            if let Some((base, top)) = dsm.canopy_at(x, y) {
+                if ray_z >= base as f64 && ray_z <= top as f64 {
+                    // Toutes les cellules traversées sont signalées, y compris
+                    // avant l'extinction : ce sont elles qui la causent, et
+                    // l'appelant n'en tiendra compte que si elle survient.
+                    on_cause(Cause::Canopy, x, y);
+                    ln_light += step_ray_m * ln_tau;
+                    if ln_light < ln_threshold {
+                        out.canopy_extinguished = true;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Rend le masque d'ombre de toute la grille : `255` = ombre, `0` = soleil.
 ///
 /// Boucle naïvement sur les pixels — chaque ligne est indépendante, donc la

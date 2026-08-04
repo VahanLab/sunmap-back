@@ -45,10 +45,18 @@ type PlacesResultCache = RwLock<HashMap<String, Arc<PlacesResponse>>>;
 
 /// Valeur de la grille `owner` pour « aucun bâtiment ici » (relief nu).
 const OWNER_TERRAIN: u32 = u32::MAX;
-/// Idem pour la végétation. Sentinelle distincte du terrain : sans elle, une
-/// ombre d'arbre serait attribuée au relief, et `describe_blocker` irait chercher
-/// un bâtiment à un indice qui n'en désigne aucun.
-const OWNER_CANOPY: u32 = u32::MAX - 1;
+/// Idem pour la végétation. Sentinelles distinctes du terrain : sans elles,
+/// une ombre d'arbre serait attribuée au relief, et `describe_blocker` irait
+/// chercher un bâtiment à un indice qui n'en désigne aucun.
+///
+/// Deux valeurs et non une : la nature de l'ombre renvoyée au client
+/// distingue l'emprise boisée de l'arbre isolé (cf. `BlockerKind`).
+const OWNER_CANOPY_WOOD: u32 = u32::MAX - 1;
+const OWNER_CANOPY_TREE: u32 = u32::MAX - 2;
+
+/// Un indice de bâtiment n'atteint jamais ces valeurs : tout ce qui est
+/// au-dessus est une sentinelle, pas un objet.
+const OWNER_FIRST_SENTINEL: u32 = OWNER_CANOPY_TREE;
 
 struct AppState {
     auth: auth::FirebaseAuth,
@@ -241,6 +249,13 @@ struct SunlitResponse {
     /// Absent si le point est au soleil (ou le soleil couché) : ce qui bloque.
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker: Option<Blocker>,
+    /// Nature DOMINANTE de l'ombre, arbitrée sur tout le rayon
+    /// (`arbre` < `bois` < `batiment` < `relief`) — là où `blocker` décrit le
+    /// PREMIER obstacle rencontré. Les deux peuvent différer : à l'ombre d'un
+    /// arbre devant une falaise, `blocker` nomme l'arbre et celui-ci dit
+    /// « relief ».
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow_source: Option<BlockerKind>,
 }
 
 async fn sunlit(
@@ -637,17 +652,23 @@ fn stamp_canopy(
                     } else {
                         base
                     };
-                    wood_owner[i] = OWNER_CANOPY;
+                    wood_owner[i] = OWNER_CANOPY_TREE;
                 }
             }
         }
     }
 
     // Report final : la végétation ne réclame une case que si elle n'est pas
-    // déjà revendiquée par un bâtiment.
+    // déjà revendiquée par un bâtiment. `wood_owner` porte l'indice du bois
+    // (rasterisé comme une emprise) ou la sentinelle « arbre » ; on garde la
+    // distinction, seule la nature nous intéresse en aval.
     for (i, &w) in wood_owner.iter().enumerate() {
         if w != OWNER_TERRAIN && owner[i] == OWNER_TERRAIN {
-            owner[i] = OWNER_CANOPY;
+            owner[i] = if w == OWNER_CANOPY_TREE {
+                OWNER_CANOPY_TREE
+            } else {
+                OWNER_CANOPY_WOOD
+            };
         }
     }
 }
@@ -662,9 +683,9 @@ fn describe_blocker(
 ) -> Blocker {
     let (lat, lng) = latlon_of_world_px(origin_x + hit.x as f64 + 0.5, origin_y + hit.y as f64 + 0.5);
     let owner_at = owner.get(hit.y * dsm.width + hit.x).copied();
-    let is_canopy = owner_at == Some(OWNER_CANOPY);
+    let is_canopy = matches!(owner_at, Some(OWNER_CANOPY_WOOD) | Some(OWNER_CANOPY_TREE));
     let b = owner_at
-        .filter(|&o| o != OWNER_TERRAIN && o != OWNER_CANOPY)
+        .filter(|&o| o < OWNER_FIRST_SENTINEL)
         .and_then(|o| buildings.get(o as usize));
 
     Blocker {
@@ -756,7 +777,116 @@ struct PointCtx {
     max_elevation: f32,
 }
 
+/// Nature de ce qui ombre un point, sans autre détail.
+///
+/// L'ordre des variantes **est** l'ordre de priorité, du plus anodin au plus
+/// couvrant : `Ord` dérivé, `max()` arbitre. Un point à l'ombre d'un arbre et
+/// d'un bâtiment est renvoyé « batiment » ; sous un arbre dans une vallée
+/// déjà à l'ombre du versant, « relief ».
+///
+/// Volontairement sans identité (ni `osm_id`, ni nom) : c'est la nature de
+/// l'ombre qui se lit dans l'app, pas le coupable — que `Blocker` porte déjà
+/// pour les bâtiments.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[serde(rename_all = "lowercase")]
+enum BlockerKind {
+    Arbre,
+    Bois,
+    Batiment,
+    Relief,
+}
+
 impl PointCtx {
+    /// Nature dominante de l'ombre à cet instant, `None` si le point est au
+    /// soleil (ou la nuit).
+    ///
+    /// Parcourt le rayon en entier — contrairement à `classify_at`, qui
+    /// s'arrête au premier obstacle. À n'appeler qu'une fois par requête :
+    /// c'est le prix à payer pour voir la crête derrière le mur.
+    fn shadow_source_at(
+        &self,
+        sun: &helios_core::sun::SunPosition,
+        params: &ShadowParams,
+    ) -> Option<BlockerKind> {
+        if !sun.is_up() {
+            return None;
+        }
+        let width = self.dsm.width;
+        // Deux booléens par nature plutôt qu'un ensemble : la canopée n'est
+        // retenue que si elle a bel et bien éteint le soleil, or on ne le sait
+        // qu'à la fin du parcours.
+        let (mut tree, mut wood, mut building, mut terrain) = (false, false, false, false);
+
+        let causes = helios_core::shadow::shadow_causes_from_ground(
+            &self.dsm,
+            sun,
+            self.px,
+            self.py,
+            self.ground,
+            params,
+            self.max_elevation,
+            |cause, x, y| {
+                let at = |ix: usize, iy: usize| {
+                    self.owner.get(iy * width + ix).copied().unwrap_or(OWNER_TERRAIN)
+                };
+                match cause {
+                    helios_core::shadow::Cause::Opaque => {
+                        // Les QUATRE cellules que `sample` interpole, pas la
+                        // seule cellule arrondie : au bord d'un toit, la
+                        // hauteur interpolée dépasse le rayon alors que la
+                        // cellule la plus proche est encore du terrain nu —
+                        // l'ombre du bâtiment se retrouvait attribuée au
+                        // relief, jusqu'en plein Paris.
+                        let x0 = (x.floor().max(0.0) as usize).min(width - 1);
+                        let y0 = (y.floor().max(0.0) as usize).min(self.dsm.height - 1);
+                        let x1 = (x0 + 1).min(width - 1);
+                        let y1 = (y0 + 1).min(self.dsm.height - 1);
+                        if [at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1)]
+                            .iter()
+                            .any(|&o| o < OWNER_FIRST_SENTINEL)
+                        {
+                            building = true;
+                        } else {
+                            terrain = true;
+                        }
+                    }
+                    helios_core::shadow::Cause::Canopy => {
+                        // `canopy_at` lit une seule cellule arrondie : on la
+                        // consulte à l'identique.
+                        let ix = (x.round().max(0.0) as usize).min(width - 1);
+                        let iy = (y.round().max(0.0) as usize).min(self.dsm.height - 1);
+                        match at(ix, iy) {
+                            OWNER_CANOPY_TREE => tree = true,
+                            // Une cellule de canopée déjà revendiquée par un
+                            // bâtiment perd sa nature : comptée en bois, la
+                            // plus couvrante des deux. Cas marginal.
+                            _ => wood = true,
+                        }
+                    }
+                }
+            },
+        );
+
+        let mut kinds = Vec::new();
+        if causes.canopy_extinguished {
+            if tree {
+                kinds.push(BlockerKind::Arbre);
+            }
+            if wood {
+                kinds.push(BlockerKind::Bois);
+            }
+        }
+        if causes.opaque_blocked {
+            if building {
+                kinds.push(BlockerKind::Batiment);
+            }
+            if terrain {
+                kinds.push(BlockerKind::Relief);
+            }
+        }
+        kinds.into_iter().max()
+    }
+
     /// Le point est-il à l'ombre à cet instant, et si oui à cause de quoi ?
     fn classify_at(&self, sun: &helios_core::sun::SunPosition, params: &ShadowParams) -> (bool, Option<Blocker>) {
         if !sun.is_up() {
@@ -797,6 +927,8 @@ async fn classify(
         ..ShadowParams::default()
     };
     let (sunlit, blocker) = ctx.classify_at(&sun, &params);
+    // Un seul parcours complet du rayon, et seulement si le point est ombré.
+    let shadow_source = (!sunlit).then(|| ctx.shadow_source_at(&sun, &params)).flatten();
 
     Ok(SunlitResponse {
         sunlit,
@@ -805,6 +937,7 @@ async fn classify(
         sun_elevation_deg: sun.elevation_deg,
         t_unix,
         blocker,
+        shadow_source,
     })
 }
 
@@ -839,6 +972,9 @@ struct SunHoursResponse {
     /// Ce qui bloque le soleil à `t_unix` (absent si au soleil).
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker_now: Option<Blocker>,
+    /// Nature dominante de cette ombre (cf. `SunlitResponse::shadow_source`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shadow_source_now: Option<BlockerKind>,
     day_start_unix: f64,
     day_end_unix: f64,
     /// Décalage effectivement utilisé pour découper la journée — permet au
@@ -928,6 +1064,7 @@ async fn sun_hours(
     let mut intervals: Vec<SunInterval> = Vec::new();
     let mut state_now = SunState::Night;
     let mut blocker_now = None;
+    let mut shadow_source_now = None;
     let (mut sunlit_steps, mut shadow_steps, mut night_steps) = (0u32, 0u32, 0u32);
 
     for i in 0..steps {
@@ -949,6 +1086,11 @@ async fn sun_hours(
         if step_t <= t && t < step_t + STEP_S {
             state_now = state;
             blocker_now = blocker;
+            // Hors de la boucle de classification : un parcours complet par
+            // tranche de 5 min coûterait 288 fois ce qu'il faut.
+            if state == SunState::Shadow {
+                shadow_source_now = ctx.shadow_source_at(&sun, &params);
+            }
         }
 
         match intervals.last_mut() {
@@ -972,6 +1114,7 @@ async fn sun_hours(
         t_unix: t,
         state_now,
         blocker_now,
+        shadow_source_now,
         day_start_unix: day_start,
         day_end_unix: day_end,
         utc_offset_minutes,
@@ -1043,7 +1186,7 @@ fn open_view_bearing(
             return true;
         }
         let o = owner[iy as usize * dsm.width + ix as usize];
-        o != OWNER_TERRAIN && o != OWNER_CANOPY
+        o < OWNER_FIRST_SENTINEL
     };
 
     let max_steps = (max_distance_m / dsm.meters_per_pixel).max(1.0) as i32;
@@ -1128,7 +1271,7 @@ fn nudge_out_of_building(
             return None;
         }
         let o = owner[y as usize * dsm.width + x as usize];
-        Some(if o == OWNER_CANOPY { OWNER_TERRAIN } else { o })
+        Some(if o >= OWNER_FIRST_SENTINEL { OWNER_TERRAIN } else { o })
     };
 
     let (cx, cy) = (px.round() as i32, py.round() as i32);
@@ -2188,6 +2331,38 @@ fn parse_time(raw: Option<&str>) -> Result<f64, (StatusCode, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L'arbitrage entre natures d'ombre suit l'ordre déclaré, du plus anodin
+    /// au plus couvrant — c'est `Ord` dérivé qui le porte, donc l'ordre des
+    /// variantes de `BlockerKind` est du code, pas de la documentation.
+    #[test]
+    fn blocker_kind_priority_order() {
+        use BlockerKind::*;
+        assert!(Arbre < Bois && Bois < Batiment && Batiment < Relief);
+
+        // Le cas cité en exemple : à l'ombre d'un arbre ET d'un bâtiment, on
+        // annonce le bâtiment.
+        assert_eq!([Arbre, Batiment].into_iter().max(), Some(Batiment));
+        // Une crête derrière un mur l'emporte sur le mur.
+        assert_eq!([Batiment, Relief].into_iter().max(), Some(Relief));
+        // Sous les arbres d'un bois, l'emprise prime sur le sujet isolé.
+        assert_eq!([Arbre, Bois].into_iter().max(), Some(Bois));
+        assert_eq!(Vec::<BlockerKind>::new().into_iter().max(), None);
+    }
+
+    /// Les quatre natures se sérialisent en minuscules, sans accent : ce sont
+    /// des valeurs d'API, lues telles quelles par le client.
+    #[test]
+    fn blocker_kind_serializes_lowercase() {
+        let json = serde_json::to_string(&[
+            BlockerKind::Arbre,
+            BlockerKind::Bois,
+            BlockerKind::Batiment,
+            BlockerKind::Relief,
+        ])
+        .unwrap();
+        assert_eq!(json, r#"["arbre","bois","batiment","relief"]"#);
+    }
 
     /// Une emprise boisée en PENTE doit recevoir sa canopée sur toute sa
     /// hauteur, pas seulement autour de l'altitude de son centre.
