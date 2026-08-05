@@ -3,7 +3,8 @@
 ## Suivi de projet (Notion)
 
 Le suivi des tâches vit dans la base Notion **« Développements »** (workspace
-Sunmap). **Toute lecture ou écriture Notion passe par le serveur MCP
+Sunmap https://app.notion.com/p/3af049620a458087be6bc6abc529efcf?v=3af049620a458032b683000ca0c26eca).
+**Toute lecture ou écriture Notion passe par le serveur MCP
 `notion-sunmap`** (`.mcp.json`, jeton propre à ce workspace) — jamais par un
 autre connecteur Notion éventuellement configuré par ailleurs, qui pointerait
 sur un workspace différent.
@@ -22,6 +23,7 @@ une ville les endroits au soleil ou à l'ombre. Inspirée du site web
 "Where is the sun" / ShadeMap.
 
 Fonctionnalités cibles :
+
 - Carte avec ombres projetées tenant compte du **relief, des bâtiments ET de
   la végétation** (canopée semi-transparente, en place côté calcul).
 - **Timeline/slider** : faire défiler les heures et les jours de l'année et
@@ -34,6 +36,7 @@ Fonctionnalités cibles :
 ## Qui calcule quoi — répartition des responsabilités (état actuel)
 
 **Serveur (`helios-server`, Rust/axum) — la vérité soleil/ombre.**
+
 - Assemble la DSM par bbox : tuiles DEM Mapterhorn + rasterisation des
   bâtiments PostGIS (grille opaque) + végétation en couche canopée séparée
   (`canopy_top`/`canopy_base`), et la grille `owner` (qui occupe chaque
@@ -50,6 +53,7 @@ Fonctionnalités cibles :
   (terrasse, mobilier, historiques), traductions (i18n).
 
 **Client (app iOS SunMap) — le rendu, et la relecture locale.**
+
 - Ombres **visuelles** : lumières Mapbox (`DirectionalLight` pilotée par
   `SunPosition.swift`, port 1:1 de `sun.rs`) pour les bâtiments et le
   mobilier 3D, plus le masque d'ombre **terrain** calculé en Metal
@@ -67,6 +71,7 @@ Fonctionnalités cibles :
   Détail : `ios/SunMap/AGENTS.md` § « Végétation, partage du rendu ».
 
 **Écarts rendu/calcul assumés (et leurs limites connues).**
+
 - Les ombres visibles (Mapbox) et la classification (notre DSM) ne viennent
   pas des mêmes données pour les bâtiments : désaccords possibles en bord
   d'ombre.
@@ -123,7 +128,7 @@ Fonctionnalités cibles :
    tranche de 5 min ; 36 octets hex par lieu. Les tuiles raster d'ombre
    (options cross-fade / shader client) n'ont plus de raison d'être pour la
    classification — elles ne restent pertinentes que si un masque d'ombre
-   *visuel* complet devenait nécessaire (piste B).
+   _visuel_ complet devenait nécessaire (piste B).
 
 ## Sources de données (toutes open data)
 
