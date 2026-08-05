@@ -10,7 +10,11 @@ l'archive, directement.
 ## Prérequis
 
 - `osmium` (`brew install osmium-tool`) ;
-- Rust (binaires `tilegen`, `vegoverview` et `import` du workspace) ;
+- Rust (binaires `tilegen`, `vegoverview` et `import` du workspace) — ou
+  Docker, si la machine n'a pas de toolchain Rust : le script construit alors
+  `sunmap-tools:local` lui-même. **Il vérifie la présence des binaires dans
+  l'image, pas seulement celle de l'image** — une image datant d'avant l'ajout
+  d'un outil est reconstruite au lieu d'échouer en plein import ;
 - PostgreSQL + PostGIS joignable via `DATABASE_URL`, **sans valeur par
   défaut** — pour les lieux uniquement (établissements, mobilier urbain,
   comptes, contributions). Les migrations s'appliquent au démarrage du

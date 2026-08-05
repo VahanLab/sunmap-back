@@ -131,8 +131,9 @@ l'exception ATS HTTP de l'Info.plist peut disparaître (le trafic devient TLS).
 
 **Le pipeline d'import ne tourne PAS sur la VM applicative.** Une VM
 dédiée (à commander au besoin, éphémère si l'on veut) porte osmium,
-`bin/tilegen` et les jetons d'écriture : c'est elle qui télécharge le PBF
-Geofabrik, génère `sunmap.pmtiles` et le pousse sur R2 + purge le cache
+`bin/tilegen`, `bin/vegoverview` et les jetons d'écriture : c'est elle qui
+télécharge le PBF Geofabrik, génère `sunmap.pmtiles` **et son aperçu de
+canopée `sunmap-veg.pmtiles`**, pousse les deux sur R2 et purge le cache
 (`scripts/import-zone.sh <url> --upload`). Ses variables (`R2_*` en
 « Object Read & Write », `CLOUDFLARE_ZONE_ID`, `CLOUDFLARE_PURGE_TOKEN`)
 ne vivent que là — cf. `docs/import-zone.md`.
@@ -148,6 +149,13 @@ chaque import, rapatrier l'archive depuis R2 et redémarrer :
 python3 scripts/r2-download.py sunmap.pmtiles tiles/
 docker compose restart api
 ```
+
+**`sunmap.pmtiles` seule, et surtout pas l'aperçu de canopée.** Le bucket
+porte aussi `sunmap-veg.pmtiles` (couche `woods`, z12/z13) : c'est du
+**client uniquement**, le serveur ne l'ouvre jamais. Le rapatrier ici
+n'apporterait rien, et `VECTOR_TILES` pointé dessus ferait refuser le
+démarrage (`VectorStore::open` rejette une archive multi-zoom). Cf.
+`docs/tuiles-pmtiles.md`, § « Aperçu de canopée ».
 
 Notes :
 - **Séparation des jetons** : la VM applicative n'a qu'un jeton R2

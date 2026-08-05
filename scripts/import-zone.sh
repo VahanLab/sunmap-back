@@ -57,8 +57,28 @@ if command -v cargo >/dev/null 2>&1; then
   RUN_IMPORT=(cargo run --release --quiet --bin import --)
 else
   IMAGE=${SUNMAP_TOOLS_IMAGE:-sunmap-tools:local}
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "=== construction de $IMAGE (une fois)"
+  TOOLS=(tilegen vegoverview import)
+  # On vérifie la présence des BINAIRES, pas seulement celle de l'image : une
+  # image construite avant l'ajout d'un outil existe toujours et passerait un
+  # simple `image inspect`, pour échouer en plein import. C'est précisément ce
+  # qui attendait `vegoverview` sur une VM ayant déjà importé une fois.
+  has_tools() {
+    docker image inspect "$1" >/dev/null 2>&1 \
+      && docker run --rm --entrypoint /bin/sh "$1" -c \
+           'for t in "$@"; do command -v "$t" >/dev/null || exit 1; done' _ "${TOOLS[@]}" \
+           >/dev/null 2>&1
+  }
+  if ! has_tools "$IMAGE"; then
+    if [[ -n ${SUNMAP_TOOLS_IMAGE:-} ]]; then
+      # Image imposée (registre, tag précis) : la reconstruire sous son nom
+      # masquerait ce qui est réellement déployé. On s'arrête et on dit quoi
+      # faire.
+      echo "l'image $IMAGE n'a pas tous les outils attendus (${TOOLS[*]})." >&2
+      echo "Tirer une image à jour (docker pull $IMAGE) ou laisser" >&2
+      echo "SUNMAP_TOOLS_IMAGE vide pour en construire une localement." >&2
+      exit 1
+    fi
+    echo "=== construction de $IMAGE (outils manquants ou image absente)"
     docker build -q -t "$IMAGE" . >/dev/null
   fi
   # Image dédiée à l'outillage, jamais celle que sert `docker compose` : la
