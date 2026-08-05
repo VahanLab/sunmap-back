@@ -66,8 +66,12 @@ Fonctionnalités cibles :
 - Végétation visuelle **entièrement maison** (les arbres 3D du style Mapbox
   sont éteints) : arbres isolés et bosquets d'emprises boisées, silhouette
   choisie par `leaf_type` (feuillu / conifère / palmier), implantés dès z15
-  depuis les tuiles de canopée (`/canopy/{z}/{x}/{y}`, canal B = classe) ;
-  sous z15, le masque Metal ombre toute la canopée par transmittance.
+  depuis les tuiles vectorielles ; sous z15, le masque Metal ombre toute la
+  canopée par transmittance. **Deux archives selon le zoom** : `sunmap.pmtiles`
+  (z14, bois + arbres) dès z14, et sous z14 l'aperçu `sunmap-veg.pmtiles`
+  (z12/z13, bois seuls) — le coût suit l'aire visible, et une vue inclinée à
+  z12 réclamait ~1 100 tuiles z14 pour une information que douze tuiles z12
+  portent aussi bien à cette échelle.
   Détail : `ios/SunMap/AGENTS.md` § « Végétation, partage du rendu ».
 
 **Écarts rendu/calcul assumés (et leurs limites connues).**
@@ -270,8 +274,10 @@ l'archive vectorielle unique, MVT z14, couches `buildings`/`woods`/`trees`,
 
     scripts/import-zone.sh <URL Geofabrik | zone.osm.pbf> [--upload]
 
-Procédure détaillée, vérifications et configuration R2 :
-**`docs/import-zone.md`**. Format et service de l'archive :
+Puis `bin/vegoverview` en dérive `tiles/sunmap-veg.pmtiles`, l'**aperçu de
+canopée** (couche `woods` seule, z12/z13) que le client lit sous z14 —
+enchaîné par le même script. Procédure détaillée, vérifications et
+configuration R2 : **`docs/import-zone.md`**. Format et service des archives :
 `docs/tuiles-pmtiles.md`. À savoir : **les tables géométriques n'existent
 plus** (migration `drop_geometry_tables`) — PostgreSQL ne porte que lieux,
 comptes et contributions, et `VECTOR_TILES=tiles/sunmap.pmtiles` est
@@ -299,6 +305,10 @@ arbres à ±0,2 m.
    `VECTOR_TILES` ; reste à brancher le client dessus — masque Metal
    (rasterisation GPU de la même géométrie) et arbres 3D (`ModelLayer`),
    ce qui couvre aussi l'étape 2 ci-dessus.
+5. Bâtiments dans l'aperçu ? Aujourd'hui `sunmap-veg.pmtiles` ne porte que la
+   canopée, le masque client n'ayant pas de bâtiments dans sa DSM. Si la
+   piste B (masque Metal complet) revenait, c'est le même mécanisme qui
+   servirait — un niveau `buildings` grossier, simplifié.
 
 ## Backlog (décidé mais volontairement différé)
 

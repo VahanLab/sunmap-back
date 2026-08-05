@@ -4,12 +4,21 @@ Sert l'archive vectorielle stockée sur R2 comme un tileset classique :
 
 ```
 https://tiles.sunmap.tech/sunmap/14/8412/5844.mvt
+https://tiles.sunmap.tech/sunmap-veg/12/2074/1409.mvt
 https://tiles.sunmap.tech/sunmap.json          # TileJSON
 ```
 
 `sunmap` est le nom de l'archive (`sunmap.pmtiles` dans le bucket) ; le
 Worker traduit `/{name}/{z}/{x}/{y}.mvt` en une lecture Range sur
 `{name}.pmtiles`, avec cache au bord.
+
+**Deux archives dans le même bucket** : `sunmap.pmtiles` (tout, z14) et
+`sunmap-veg.pmtiles` (aperçu de canopée, couche `woods` seule, z12/z13, que
+le client lit sous z14 — cf. `docs/tuiles-pmtiles.md`). Le `{name}` de l'URL
+suffit à les distinguer : ajouter la seconde n'a demandé **aucun changement
+au Worker**, seulement un second objet dans le bucket. Les deux se poussent
+ensemble (`scripts/import-zone.sh --upload`) — pousser l'une sans l'autre
+laisserait le client lire une canopée d'une autre époque sous z14.
 
 ## Pourquoi ce Worker plutôt qu'un lecteur PMTiles côté client
 

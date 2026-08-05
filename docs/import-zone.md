@@ -1,7 +1,8 @@
 # Importer une nouvelle zone (extrait PBF)
 
 Procédure pour couvrir une zone géographique : générer l'archive vectorielle
-`tiles/sunmap.pmtiles` (bâtiments, végétation — cf. `docs/tuiles-pmtiles.md`)
+`tiles/sunmap.pmtiles` + son aperçu de canopée `tiles/sunmap-veg.pmtiles`
+(bâtiments, végétation — cf. `docs/tuiles-pmtiles.md`)
 et charger les lieux (établissements, mobilier urbain) en base. **La
 géométrie ne passe plus par PostgreSQL** : elle va de l'extrait OSM à
 l'archive, directement.
@@ -9,7 +10,7 @@ l'archive, directement.
 ## Prérequis
 
 - `osmium` (`brew install osmium-tool`) ;
-- Rust (binaires `tilegen` et `import` du workspace) ;
+- Rust (binaires `tilegen`, `vegoverview` et `import` du workspace) ;
 - PostgreSQL + PostGIS joignable via `DATABASE_URL`, **sans valeur par
   défaut** — pour les lieux uniquement (établissements, mobilier urbain,
   comptes, contributions). Les migrations s'appliquent au démarrage du
@@ -82,7 +83,13 @@ relançable sans risque.
    **mémoire bornée** (deux passes en flux + buckets disque par plage de
    tuiles Hilbert, blobs débordés dans un fichier temporaire) : le pic est
    le plus gros bucket, pas le pays — une VM de 4 Go passe la France.
-4. **`cargo run --release --bin import`** — lieux vers PostgreSQL (upsert).
+4. **`cargo run --release --bin vegoverview`** — `tiles/sunmap.pmtiles` →
+   `tiles/sunmap-veg.pmtiles`, l'**aperçu de canopée** que le client lit sous
+   z14 : couche `woods` seule, niveaux z12 et z13. Il **dérive** de l'archive
+   qu'on vient d'écrire et ne se fusionne pas — il se refait en entier à
+   chaque import, et sa couverture suit celle de l'archive. Détail et
+   justification : `docs/tuiles-pmtiles.md`, § « Aperçu de canopée ».
+5. **`cargo run --release --bin import`** — lieux vers PostgreSQL (upsert).
 
 Le serveur consomme l'archive via `VECTOR_TILES=tiles/sunmap.pmtiles`
 (`helios-server/.env`) — variable **obligatoire** : sans elle il refuse de

@@ -296,6 +296,25 @@ impl VectorStore {
         Ok((buildings, woods, trees))
     }
 
+    /// Emprises boisées d'une tuile, **telles que stockées** (avec leurs
+    /// objets débordants, non dédoublonnés). Ne décode que la couche `woods` :
+    /// c'est la lecture de `bin/vegoverview`, qui parcourt l'archive entière.
+    pub fn tile_woods(&self, x: u32, y: u32) -> std::io::Result<Vec<Building>> {
+        let Some(bytes) = self.tile_bytes(x, y)? else {
+            return Ok(Vec::new());
+        };
+        let mut layers = decode_mvt_layers(&bytes, self.zoom, x, y, Some(&["woods"]))?;
+        Ok(layers
+            .remove("woods")
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|f| {
+                let leaf = LeafType::parse(f.prop_str("leaf_type"));
+                f.into_building(Some(leaf))
+            })
+            .collect())
+    }
+
     /// Emprise déclarée dans l'en-tête (s, w, n, e), en degrés.
     pub fn bounds(&self) -> (f64, f64, f64, f64) {
         self.bounds
@@ -466,12 +485,35 @@ fn decode_mvt(
     x: u32,
     y: u32,
 ) -> std::io::Result<HashMap<String, Vec<Feature>>> {
+    decode_mvt_layers(bytes, z, x, y, None)
+}
+
+/// Variante filtrée : `keep` limite le décodage aux couches nommées.
+///
+/// Le filtre n'est pas un confort d'API mais une économie : `bin/vegoverview`
+/// relit toute l'archive pour n'y prendre que `woods`, et décoder au passage
+/// les 4 520 bâtiments d'une tuile parisienne pour les jeter aussitôt
+/// dominait le temps de génération.
+fn decode_mvt_layers(
+    bytes: &[u8],
+    z: u32,
+    x: u32,
+    y: u32,
+    keep: Option<&[&str]>,
+) -> std::io::Result<HashMap<String, Vec<Feature>>> {
     let mut layers = HashMap::new();
     let mut p = 0usize;
     while p < bytes.len() {
         let (field, wire) = read_tag(bytes, &mut p)?;
         if field == 3 && wire == 2 {
             let msg = read_bytes(bytes, &mut p)?;
+            if let Some(keep) = keep {
+                // Le nom (champ 1) se lit sans toucher aux features.
+                match layer_name(msg) {
+                    Some(name) if keep.contains(&name.as_str()) => {}
+                    _ => continue,
+                }
+            }
             let (name, features) = decode_layer(msg, z, x, y)?;
             layers.insert(name, features);
         } else {
@@ -479,6 +521,19 @@ fn decode_mvt(
         }
     }
     Ok(layers)
+}
+
+/// Nom d'une couche MVT (champ 1) sans décoder son contenu.
+fn layer_name(bytes: &[u8]) -> Option<String> {
+    let mut p = 0usize;
+    while p < bytes.len() {
+        let (field, wire) = read_tag(bytes, &mut p).ok()?;
+        if field == 1 && wire == 2 {
+            return Some(String::from_utf8_lossy(read_bytes(bytes, &mut p).ok()?).into_owned());
+        }
+        skip_field(bytes, &mut p, wire).ok()?;
+    }
+    None
 }
 
 fn decode_layer(bytes: &[u8], z: u32, x: u32, y: u32) -> std::io::Result<(String, Vec<Feature>)> {
@@ -692,6 +747,18 @@ fn skip_field(bytes: &[u8], p: &mut usize, wire: u64) -> std::io::Result<()> {
 pub const ZOOM: u32 = 14;
 const EXTENT: u64 = 4096;
 
+/// Métadonnées de `sunmap.pmtiles`.
+pub const ARCHIVE_METADATA: &str = r#"{"name":"sunmap","attribution":"© OpenStreetMap contributors","description":"Géométrie SunMap : buildings, woods, trees — objets entiers dupliqués par tuile (dédoublonner par id)"}"#;
+
+/// Métadonnées de `sunmap-veg.pmtiles`, l'aperçu de canopée.
+pub const OVERVIEW_METADATA: &str = r#"{"name":"sunmap-veg","attribution":"© OpenStreetMap contributors","description":"Aperçu de canopée SunMap : couche woods seule, niveaux z12/z13, dérivée de sunmap.pmtiles — objets entiers dupliqués par tuile (dédoublonner par id)"}"#;
+
+/// Niveaux de l'aperçu de canopée (`bin/vegoverview`), du plus grossier au
+/// plus fin. Sous z14 un arbre isolé pèse moins d'un pixel de DSM : l'aperçu
+/// ne porte que les emprises boisées, et l'archive principale reprend la
+/// main dès z14. Le client fait le même choix (`CanopyRegime`).
+pub const OVERVIEW_ZOOMS: [u32; 2] = [12, 13];
+
 fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     loop {
         let b = (v & 0x7f) as u8;
@@ -878,6 +945,20 @@ pub fn encode_tile(
     woods: &[&Building],
     trees: &[&Tree],
 ) -> Option<Vec<u8>> {
+    encode_tile_at(ZOOM, tx, ty, buildings, woods, trees)
+}
+
+/// Même encodage à un zoom quelconque — `bin/vegoverview` s'en sert pour les
+/// niveaux d'aperçu (z12/z13), où l'extent 4096 quantifie plus grossièrement
+/// et gomme de lui-même le détail sous-pixel.
+pub fn encode_tile_at(
+    zoom: u32,
+    tx: u32,
+    ty: u32,
+    buildings: &[&Building],
+    woods: &[&Building],
+    trees: &[&Tree],
+) -> Option<Vec<u8>> {
     if buildings.is_empty() && woods.is_empty() && trees.is_empty() {
         return None;
     }
@@ -893,7 +974,7 @@ pub fn encode_tile(
         }
         let mut layer = LayerEncoder::new(name);
         for b in list {
-            let geometry = polygon_geometry(&b.rings, ZOOM, tx, ty);
+            let geometry = polygon_geometry(&b.rings, zoom, tx, ty);
             if geometry.is_empty() {
                 continue;
             }
@@ -921,7 +1002,7 @@ pub fn encode_tile(
     if !trees.is_empty() {
         let mut layer = LayerEncoder::new("trees");
         for t in trees {
-            let (px, py) = tile_coord(t.lat, t.lng, ZOOM, tx, ty);
+            let (px, py) = tile_coord(t.lat, t.lng, zoom, tx, ty);
             let geometry = vec![1 << 3 | 1, zigzag_enc(px), zigzag_enc(py)];
             layer.push_feature(
                 &[
@@ -1000,9 +1081,27 @@ impl ArchiveWriter {
     }
 
     pub fn finish(
+        self,
+        out: impl std::io::Write,
+        bbox: (f64, f64, f64, f64), // (s, w, n, e)
+    ) -> std::io::Result<()> {
+        self.finish_levels(out, bbox, ZOOM, ZOOM, ARCHIVE_METADATA)
+    }
+
+    /// Variante multi-niveaux, pour `bin/vegoverview` : l'aperçu de canopée
+    /// porte z12 **et** z13, là où l'archive principale reste mono-zoom.
+    ///
+    /// Les tuiles doivent toujours arriver par `tile_id` croissant, ce qui
+    /// impose d'émettre les niveaux du plus grossier au plus fin —
+    /// l'identifiant PMTiles préfixe la distance de Hilbert par le compte des
+    /// zooms précédents, donc tout z12 précède tout z13.
+    pub fn finish_levels(
         mut self,
         mut out: impl std::io::Write,
         bbox: (f64, f64, f64, f64), // (s, w, n, e)
+        min_zoom: u32,
+        max_zoom: u32,
+        metadata_json: &str,
     ) -> std::io::Result<()> {
         if self.entries.is_empty() {
             std::fs::remove_file(&self.spill_path).ok();
@@ -1031,10 +1130,7 @@ impl ArchiveWriter {
             (gzip_bytes(&serialize_directory(&pointers))?, leaves)
         };
 
-        let metadata = gzip_bytes(
-            r#"{"name":"sunmap","attribution":"© OpenStreetMap contributors","description":"Géométrie SunMap : buildings, woods, trees — objets entiers dupliqués par tuile (dédoublonner par id)"}"#
-                .as_bytes(),
-        )?;
+        let metadata = gzip_bytes(metadata_json.as_bytes())?;
 
         let root_offset = 127u64;
         let metadata_offset = root_offset + root_bytes.len() as u64;
@@ -1063,13 +1159,13 @@ impl ArchiveWriter {
         header.push(2); // internal_compression gzip
         header.push(2); // tile_compression gzip
         header.push(1); // tile_type MVT
-        header.push(ZOOM as u8); // min_zoom
-        header.push(ZOOM as u8); // max_zoom
+        header.push(min_zoom as u8); // min_zoom
+        header.push(max_zoom as u8); // max_zoom
         let (s, w, n, e) = bbox;
         for v in [w, s, e, n] {
             header.extend_from_slice(&((v * 1e7) as i32).to_le_bytes());
         }
-        header.push(ZOOM as u8); // center_zoom
+        header.push(max_zoom as u8); // center_zoom
         for v in [(w + e) / 2.0, (s + n) / 2.0] {
             header.extend_from_slice(&((v * 1e7) as i32).to_le_bytes());
         }
@@ -1216,6 +1312,76 @@ mod tests {
     /// L'encodeur Rust doit produire une archive que son propre lecteur relit
     /// à l'identique — et le schéma des couches doit rester celui de la
     /// fixture historique (mêmes attributs, mêmes types).
+    /// L'aperçu de canopée (`bin/vegoverview`) encode aux niveaux grossiers :
+    /// les sommets doivent y retomber à la quantification de ce niveau près,
+    /// et la tuile ne porter que `woods`.
+    #[test]
+    fn encode_a_un_zoom_d_apercu_reste_fidele() {
+        let coarse = OVERVIEW_ZOOMS[0];
+        let rings = vec![
+            vec![(48.8500, 2.3400), (48.8500, 2.3450), (48.8540, 2.3450), (48.8540, 2.3400)],
+            vec![(48.8510, 2.3410), (48.8510, 2.3440), (48.8530, 2.3440), (48.8530, 2.3410)],
+        ];
+        let wood = Building {
+            osm_id: "relation/8".into(),
+            name: None,
+            rings: rings.clone(),
+            height_m: 18.0,
+            height_from_osm: false,
+            leaf_type: Some(LeafType::Needleleaved),
+        };
+
+        let (tx, ty) = tile_of(48.853, 2.348, coarse);
+        let mvt = encode_tile_at(coarse, tx, ty, &[], &[&wood], &[]).unwrap();
+        let layers = decode_mvt(&mvt, coarse, tx, ty).unwrap();
+        assert!(layers.get("buildings").is_none(), "l'aperçu ne porte pas les bâtiments");
+        assert!(layers.get("trees").is_none(), "l'aperçu ne porte pas les arbres");
+
+        let f = &layers["woods"][0];
+        assert_eq!(f.id, "relation/8");
+        assert_eq!(f.rings.len(), 2, "extérieur + clairière");
+        assert_eq!(f.prop_str("leaf_type"), Some("needleleaved"));
+
+        // Extent 4096 sur une tuile z12 (~9,8 km) ≈ 2,4 m ≈ 2,2e-5 degré —
+        // très en deçà du pixel de DSM à ce zoom (~12 m), qui est le seul
+        // consommateur de ces niveaux.
+        let tol = 3e-5;
+        for (got, want) in f.rings.iter().zip(rings.iter()) {
+            let bbox = |r: &[(f64, f64)]| {
+                r.iter().fold(
+                    (f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+                    |(s, w, n, e), &(lat, lon)| (s.min(lat), w.min(lon), n.max(lat), e.max(lon)),
+                )
+            };
+            let (gs, gw, gn, ge) = bbox(got);
+            let (ws, ww, wn, we) = bbox(want);
+            assert!((gs - ws).abs() < tol && (gn - wn).abs() < tol, "lat {gs}..{gn}");
+            assert!((gw - ww).abs() < tol && (ge - we).abs() < tol, "lon {gw}..{ge}");
+        }
+    }
+
+    /// Le filtre de couches sert `tile_woods`, qui relit l'archive entière :
+    /// décoder les bâtiments pour les jeter dominerait la génération.
+    #[test]
+    fn le_filtre_de_couches_ecarte_le_reste() {
+        let s = store();
+        let (tx, ty) = tile_of(48.853, 2.348, ZOOM);
+        let bytes = s.tile_bytes(tx, ty).unwrap().unwrap();
+        let all = decode_mvt(&bytes, ZOOM, tx, ty).unwrap();
+        assert!(all.contains_key("buildings") && all.contains_key("woods"));
+
+        let only = decode_mvt_layers(&bytes, ZOOM, tx, ty, Some(&["woods"])).unwrap();
+        assert_eq!(only.keys().collect::<Vec<_>>(), vec!["woods"]);
+        assert_eq!(only["woods"].len(), all["woods"].len());
+
+        // Et le chemin public qui s'en sert rend le même bois.
+        let woods = s.tile_woods(tx, ty).unwrap();
+        assert_eq!(woods.len(), all["woods"].len());
+        assert_eq!(woods[0].osm_id, "relation/2");
+        assert_eq!(woods[0].leaf_type, Some(LeafType::Needleleaved));
+        assert_eq!(woods[0].rings.len(), 2, "extérieur + clairière");
+    }
+
     #[test]
     fn encode_decode_roundtrip() {
         let (s, w) = (48.8525, 2.3480);

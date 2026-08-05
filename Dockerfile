@@ -32,10 +32,12 @@ RUN apt-get update \
 # Le serveur ET l'outillage d'import — la VM n'a pas de toolchain Rust, et
 # c'est là que les imports doivent tourner : les identifiants de la base
 # managée n'ont alors pas à quitter la production pour un poste de dev.
-# `tilegen` ne touche aucune base, `import` n'écrit que les lieux.
+# `tilegen` et `vegoverview` ne touchent aucune base, `import` n'écrit que les
+# lieux.
 COPY --from=builder /app/target/release/helios-server /usr/local/bin/helios-server
 COPY --from=builder /app/target/release/import /usr/local/bin/import
 COPY --from=builder /app/target/release/tilegen /usr/local/bin/tilegen
+COPY --from=builder /app/target/release/vegoverview /usr/local/bin/vegoverview
 
 # Processus non-root : l'app n'écrit rien sur disque, aucun privilège requis.
 RUN useradd --system --no-create-home sunmap

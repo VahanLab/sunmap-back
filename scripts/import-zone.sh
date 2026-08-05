@@ -15,7 +15,11 @@
 #      comprise), SANS base de données. La zone est FUSIONNÉE dans l'archive
 #      existante si elle est là : ajouter une région n'efface pas les
 #      précédentes (--replace pour repartir de zéro) ;
-#   4. bin/import — lieux (établissements + mobilier urbain) vers PostgreSQL,
+#   4. bin/vegoverview — sunmap.pmtiles → tiles/sunmap-veg.pmtiles, l'aperçu
+#      de canopée (couche woods seule, z12/z13) que le client lit sous z14.
+#      Toujours régénéré en entier : il DÉRIVE de l'archive, il ne se
+#      fusionne pas ;
+#   5. bin/import — lieux (établissements + mobilier urbain) vers PostgreSQL,
 #      la seule chose qui y reste. DATABASE_URL est OBLIGATOIRE et sans
 #      défaut ; la base visée est annoncée avant écriture.
 #
@@ -49,6 +53,7 @@ mkdir -p pbf tiles
 # (les identifiants de la base managée n'ont pas à en sortir).
 if command -v cargo >/dev/null 2>&1; then
   RUN_TILEGEN=(cargo run --release --quiet --bin tilegen --)
+  RUN_VEGOVERVIEW=(cargo run --release --quiet --bin vegoverview --)
   RUN_IMPORT=(cargo run --release --quiet --bin import --)
 else
   IMAGE=${SUNMAP_TOOLS_IMAGE:-sunmap-tools:local}
@@ -61,28 +66,29 @@ else
   # registre avec son tag.
   DOCKER_RUN=(docker run --rm -v "$PWD:/work" -w /work -u "$(id -u):$(id -g)")
   RUN_TILEGEN=("${DOCKER_RUN[@]}" "$IMAGE" tilegen)
+  RUN_VEGOVERVIEW=("${DOCKER_RUN[@]}" "$IMAGE" vegoverview)
   RUN_IMPORT=("${DOCKER_RUN[@]}" -e DATABASE_URL "$IMAGE" import)
 fi
 
 case "$SRC" in
   http://*|https://*)
     PBF="pbf/$(basename "$SRC")"
-    echo "=== 1/4 téléchargement → $PBF"
+    echo "=== 1/5 téléchargement → $PBF"
     curl -fL --retry 3 -o "$PBF" "$SRC"
     ;;
   *)
     [[ -f "$SRC" ]] || { echo "fichier introuvable : $SRC" >&2; exit 1; }
     PBF="$SRC"
-    echo "=== 1/4 PBF local : $PBF"
+    echo "=== 1/5 PBF local : $PBF"
     ;;
 esac
 
 BASE=$(basename "$PBF")
 GEOJSONL="pbf/${BASE%.osm.pbf}.geojsonl"
-echo "=== 2/4 extraction osmium → $GEOJSONL"
+echo "=== 2/5 extraction osmium → $GEOJSONL"
 scripts/osm-extract.sh "$PBF" "$GEOJSONL"
 
-echo "=== 3/4 archive vectorielle → tiles/sunmap.pmtiles"
+echo "=== 3/5 archive vectorielle → tiles/sunmap.pmtiles"
 # Fusion par-dessus l'archive existante : ajouter une région ne doit pas
 # effacer celles déjà couvertes. tilegen écrit dans un fichier temporaire —
 # il lit la base pendant qu'il produit la sortie, les deux ne peuvent pas
@@ -96,7 +102,16 @@ fi
 "${RUN_TILEGEN[@]}" "${MERGE[@]}" "$GEOJSONL" "$ARCHIVE.tmp"
 mv -f "$ARCHIVE.tmp" "$ARCHIVE"
 
-echo "=== 4/4 lieux (établissements + mobilier) → PostgreSQL"
+echo "=== 4/5 aperçu de canopée → tiles/sunmap-veg.pmtiles"
+# Dérivé de l'archive qu'on vient d'écrire, jamais de l'extrait : c'est ce qui
+# garantit que l'aperçu porte exactement les emprises boisées que le serveur
+# classe. Rien à fusionner ici — il se refait en entier à chaque import, et sa
+# couverture suit celle de l'archive.
+OVERVIEW=tiles/sunmap-veg.pmtiles
+"${RUN_VEGOVERVIEW[@]}" "$ARCHIVE" "$OVERVIEW.tmp"
+mv -f "$OVERVIEW.tmp" "$OVERVIEW"
+
+echo "=== 5/5 lieux (établissements + mobilier) → PostgreSQL"
 # `bin/import` charge lui-même `helios-server/.env` et annonce la base visée
 # avant d'écrire. Il n'y a plus de repli silencieux : sans DATABASE_URL il
 # s'arrête. Pour viser une autre base que celle du `.env` — la production
@@ -115,7 +130,7 @@ if [[ $UPLOAD == 1 ]]; then
     python3 -m venv "$VENV"
     "$VENV/bin/pip" install -q boto3
   fi
-  "$VENV/bin/python" scripts/r2-upload.py "$ARCHIVE"
+  "$VENV/bin/python" scripts/r2-upload.py "$ARCHIVE" "$OVERVIEW"
 
   # Le cache du Worker est indexé sur l'URL et ignore le remplacement de
   # l'archive : sans purge, les tuiles déjà servies restent périmées.
@@ -125,3 +140,4 @@ fi
 
 echo "=== terminé"
 echo "Serveur : VECTOR_TILES=tiles/sunmap.pmtiles (cf. helios-server/.env)."
+echo "Client  : sunmap.pmtiles dès z14, sunmap-veg.pmtiles (z12/z13) en dessous."
