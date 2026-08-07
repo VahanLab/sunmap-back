@@ -1660,9 +1660,10 @@ async fn report_terrace(
     headers: HeaderMap,
     Json(body): Json<TerraceReportBody>,
 ) -> Result<Json<TerraceReportResponse>, (StatusCode, String)> {
-    // Contribuer demande un compte : sans quoi n'importe qui écrase la
-    // contribution de n'importe qui, `osm_id` étant la clé primaire.
-    let identity = authenticate(&state, &headers).await?;
+    // Contribuer demande un compte (sans quoi n'importe qui écrase la
+    // contribution de n'importe qui, `osm_id` étant la clé primaire), une
+    // adresse vérifiée, et de ne pas être banni.
+    let identity = authenticate_contributor(&state, &headers).await?;
     if let (Some(lat), Some(lng)) = (body.lat, body.lng) {
         if !(-85.0..=85.0).contains(&lat) || !(-180.0..=180.0).contains(&lng) {
             return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
@@ -1768,7 +1769,7 @@ async fn add_furniture(
     headers: HeaderMap,
     Json(body): Json<FurnitureContributionBody>,
 ) -> Result<Json<FurnitureContributionResponse>, (StatusCode, String)> {
-    let identity = authenticate(&state, &headers).await?;
+    let identity = authenticate_contributor(&state, &headers).await?;
     if !matches!(body.category.as_str(), "bench" | "picnic_table") {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1867,7 +1868,7 @@ async fn edit_furniture(
     headers: HeaderMap,
     Json(body): Json<FurnitureEditBody>,
 ) -> Result<Json<FurnitureContributionResponse>, (StatusCode, String)> {
-    let identity = authenticate(&state, &headers).await?;
+    let identity = authenticate_contributor(&state, &headers).await?;
     if !(-85.0..=85.0).contains(&body.lat) || !(-180.0..=180.0).contains(&body.lng) {
         return Err((StatusCode::BAD_REQUEST, "lat/lng hors bornes".into()));
     }
@@ -2644,6 +2645,40 @@ async fn authenticate(
         .verify_header(header)
         .await
         .map_err(|e| (e.status(), e.message()))
+}
+
+/// Corps des 403 de contribution. Un **code** et pas une phrase : le client
+/// distingue là-dessus l'écran à montrer (renvoyer l'e-mail de vérification,
+/// ou l'alerte « contactez le support ») — une phrase se traduit et se
+/// reformule, un code se fige.
+const ERR_EMAIL_UNVERIFIED: &str = r#"{"code":"email_unverified"}"#;
+const ERR_CONTRIBUTION_BANNED: &str = r#"{"code":"contribution_banned"}"#;
+
+/// `authenticate`, plus les deux exigences propres à l'écriture.
+///
+/// - **Adresse vérifiée** pour un compte e-mail/mot de passe : le jeton
+///   Firebase porte `email_verified`, il suffit de le lire — Google et Apple
+///   livrent des adresses déjà confirmées chez eux, seul le fournisseur
+///   `password` peut arriver non vérifié. Contrôlé ici et pas seulement côté
+///   client : un jeton se rejoue hors de l'app.
+/// - **Compte non banni** (`users.banned`, posé à la main sur un troll) : la
+///   consultation reste libre, seul l'écrit est fermé.
+async fn authenticate_contributor(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<auth::Identity, (StatusCode, String)> {
+    let identity = authenticate(state, headers).await?;
+    if identity.sign_in_provider.as_deref() == Some("password") && !identity.email_verified {
+        return Err((StatusCode::FORBIDDEN, ERR_EMAIL_UNVERIFIED.into()));
+    }
+    let banned = db::is_banned(&state.pool, &identity.uid)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
+    if banned {
+        println!("[account] contribution refusée : {} est banni", identity.uid);
+        return Err((StatusCode::FORBIDDEN, ERR_CONTRIBUTION_BANNED.into()));
+    }
+    Ok(identity)
 }
 
 #[derive(Serialize)]

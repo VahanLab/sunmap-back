@@ -689,8 +689,24 @@ point est classé comme il l'est — bâtiment manquant, trop bas, mal placé.
 | Code | Cause |
 |---|---|
 | `400` | `lat`/`lng` hors bornes, `bbox` invalide ou trop grande, `t` invalide |
+| `403` | Contribution refusée — corps JSON `{"code":"…"}`, voir ci-dessous |
 | `500` | Requête PostGIS en erreur (base absente ou non ingérée ?) |
 | `502` | Tuile Mapterhorn inaccessible ou indécodable |
+
+Les endpoints de contribution (`POST /places/terrace`, `POST`/`PUT
+/places/furniture`) exigent, au-delà du jeton (`401` sinon) :
+
+- **une adresse vérifiée** pour un compte e-mail/mot de passe — lu dans le
+  claim `email_verified` du jeton Firebase (Google et Apple arrivent déjà
+  confirmés chez eux). Refus : `403 {"code":"email_unverified"}`.
+- **un compte non banni** — `users.banned`, posé à la main sur un troll ou un
+  spammeur (`UPDATE users SET banned = true WHERE username = '…'`). La
+  consultation reste libre, seul l'écrit est fermé. Refus :
+  `403 {"code":"contribution_banned"}` — le client affiche une alerte avec
+  l'accès au support.
+
+Un **code** et pas une phrase : c'est lui qui choisit l'écran côté client, et
+il se fige — une phrase se traduit et se reformule.
 
 ## Schéma PostGIS
 

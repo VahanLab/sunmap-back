@@ -62,6 +62,13 @@ pub struct Identity {
     /// pseudo plausible plutôt qu'un tirage au sort ; jamais utilisé tel quel,
     /// un nom d'affichage contient des espaces et des accents.
     pub display_name: Option<String>,
+    /// Adresse confirmée, telle que Firebase l'atteste dans le jeton. Ne dit
+    /// rien tout seul : ce qui compte est le couple avec `sign_in_provider` —
+    /// Google et Apple livrent une adresse déjà vérifiée chez eux, seul le
+    /// fournisseur `password` peut arriver non confirmé.
+    pub email_verified: bool,
+    /// Fournisseur du jeton (`password`, `google.com`, `apple.com`…).
+    pub sign_in_provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +76,14 @@ struct Claims {
     sub: String,
     email: Option<String>,
     name: Option<String>,
+    email_verified: Option<bool>,
+    firebase: Option<FirebaseClaims>,
+}
+
+/// Le bloc `firebase` du jeton — seul `sign_in_provider` nous sert.
+#[derive(Debug, Deserialize)]
+struct FirebaseClaims {
+    sign_in_provider: Option<String>,
 }
 
 /// Vérificateur de jetons, avec ses clés en cache.
@@ -203,6 +218,8 @@ fn verify_with(token: &str, key: &DecodingKey, project_id: &str) -> Result<Ident
         uid: data.claims.sub,
         email: data.claims.email,
         display_name: data.claims.name,
+        email_verified: data.claims.email_verified.unwrap_or(false),
+        sign_in_provider: data.claims.firebase.and_then(|f| f.sign_in_provider),
     })
 }
 
