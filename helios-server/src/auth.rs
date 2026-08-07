@@ -258,6 +258,15 @@ mod tests {
         email: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email_verified: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        firebase: Option<TestFirebase>,
+    }
+
+    #[derive(Serialize)]
+    struct TestFirebase {
+        sign_in_provider: String,
     }
 
     fn now() -> u64 {
@@ -286,7 +295,28 @@ mod tests {
             exp: now() + 3_600,
             email: Some("karl@example.com".into()),
             name: Some("Karl Gochgarian".into()),
+            email_verified: None,
+            firebase: None,
         }
+    }
+
+    #[test]
+    fn email_verified_et_fournisseur_sont_lus() {
+        let mut c = claims();
+        c.email_verified = Some(true);
+        c.firebase = Some(TestFirebase { sign_in_provider: "password".into() });
+        let identity = verify_with(&sign(c), &decoding_key(), PROJECT).unwrap();
+        assert!(identity.email_verified);
+        assert_eq!(identity.sign_in_provider.as_deref(), Some("password"));
+    }
+
+    #[test]
+    fn claims_absents_valent_non_verifie_et_fournisseur_inconnu() {
+        // Un jeton sans ces claims (anciens jetons, fournisseurs exotiques)
+        // doit se lire « non vérifié, fournisseur inconnu » — jamais paniquer.
+        let identity = verify_with(&sign(claims()), &decoding_key(), PROJECT).unwrap();
+        assert!(!identity.email_verified);
+        assert_eq!(identity.sign_in_provider, None);
     }
 
     #[test]

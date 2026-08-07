@@ -2668,17 +2668,93 @@ async fn authenticate_contributor(
     headers: &HeaderMap,
 ) -> Result<auth::Identity, (StatusCode, String)> {
     let identity = authenticate(state, headers).await?;
-    if identity.sign_in_provider.as_deref() == Some("password") && !identity.email_verified {
-        return Err((StatusCode::FORBIDDEN, ERR_EMAIL_UNVERIFIED.into()));
-    }
     let banned = db::is_banned(&state.pool, &identity.uid)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
-    if banned {
-        println!("[account] contribution refusée : {} est banni", identity.uid);
-        return Err((StatusCode::FORBIDDEN, ERR_CONTRIBUTION_BANNED.into()));
+    if let Some(code) = contribution_refusal(&identity, banned) {
+        println!("[account] contribution refusée ({code}) : {}", identity.uid);
+        return Err((StatusCode::FORBIDDEN, code.into()));
     }
     Ok(identity)
+}
+
+/// Le verdict d'écriture, séparé de l'IO pour être testable : ce que le jeton
+/// et la base disent, et le code de refus le cas échéant.
+///
+/// L'adresse non vérifiée prime sur le bannissement : c'est le seul des deux
+/// refus que l'utilisateur peut lever lui-même, autant le lui dire d'abord.
+fn contribution_refusal(identity: &auth::Identity, banned: bool) -> Option<&'static str> {
+    if identity.sign_in_provider.as_deref() == Some("password") && !identity.email_verified {
+        return Some(ERR_EMAIL_UNVERIFIED);
+    }
+    if banned {
+        return Some(ERR_CONTRIBUTION_BANNED);
+    }
+    None
+}
+
+#[cfg(test)]
+mod contribution_guard_tests {
+    use super::*;
+
+    fn identity(provider: Option<&str>, email_verified: bool) -> auth::Identity {
+        auth::Identity {
+            uid: "uid-test".into(),
+            email: None,
+            display_name: None,
+            email_verified,
+            sign_in_provider: provider.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn password_non_verifie_est_refuse() {
+        assert_eq!(
+            contribution_refusal(&identity(Some("password"), false), false),
+            Some(ERR_EMAIL_UNVERIFIED)
+        );
+    }
+
+    #[test]
+    fn password_verifie_passe() {
+        assert_eq!(contribution_refusal(&identity(Some("password"), true), false), None);
+    }
+
+    #[test]
+    fn google_et_apple_passent_sans_verification() {
+        // Même si le claim `email_verified` est faux : la règle ne vise que
+        // le fournisseur `password`, les autres arrivent confirmés chez eux.
+        assert_eq!(contribution_refusal(&identity(Some("google.com"), false), false), None);
+        assert_eq!(contribution_refusal(&identity(Some("apple.com"), false), false), None);
+    }
+
+    #[test]
+    fn fournisseur_absent_passe() {
+        // Jeton d'un fournisseur inconnu ou claim absent : on ne refuse que
+        // sur une certitude.
+        assert_eq!(contribution_refusal(&identity(None, false), false), None);
+    }
+
+    #[test]
+    fn banni_est_refuse_quel_que_soit_le_fournisseur() {
+        assert_eq!(
+            contribution_refusal(&identity(Some("google.com"), true), true),
+            Some(ERR_CONTRIBUTION_BANNED)
+        );
+        assert_eq!(
+            contribution_refusal(&identity(Some("password"), true), true),
+            Some(ERR_CONTRIBUTION_BANNED)
+        );
+    }
+
+    #[test]
+    fn adresse_non_verifiee_prime_sur_le_bannissement() {
+        // C'est le seul refus que l'utilisateur peut lever lui-même.
+        assert_eq!(
+            contribution_refusal(&identity(Some("password"), false), true),
+            Some(ERR_EMAIL_UNVERIFIED)
+        );
+    }
 }
 
 #[derive(Serialize)]
