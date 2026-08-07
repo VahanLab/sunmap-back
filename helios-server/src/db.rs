@@ -770,6 +770,19 @@ pub async fn delete_user(pool: &PgPool, uid: &str) -> Result<bool, sqlx::Error> 
     Ok(result.rows_affected() > 0)
 }
 
+/// Le compte est-il interdit de contribution (troll, spam) ?
+///
+/// Un uid inconnu n'est pas banni : le bannissement se pose sur un compte
+/// existant, et un compte tout juste créé n'a pas encore de ligne — le refuser
+/// ici fermerait la contribution à tous les nouveaux venus.
+pub async fn is_banned(pool: &PgPool, uid: &str) -> Result<bool, sqlx::Error> {
+    let banned: Option<bool> = sqlx::query_scalar("SELECT banned FROM users WHERE uid = $1")
+        .bind(uid)
+        .fetch_optional(pool)
+        .await?;
+    Ok(banned.unwrap_or(false))
+}
+
 /// Lieux auxquels un compte a contribué, du plus récent au plus ancien —
 /// terrasses signalées et mobilier posé ou corrigé, mêlés dans une seule liste.
 ///
