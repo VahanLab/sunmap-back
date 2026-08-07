@@ -619,6 +619,36 @@ Idempotent : supprimer un compte déjà parti renvoie `204`, pas `404`. Un clien
 qui réessaie après une coupure réseau ne doit pas se voir refuser l'état qu'il
 vient justement d'atteindre.
 
+### `GET /geocode`
+
+Recherche libre d'adresse ou d'établissement, en **passe-plat vers Nominatim**
+(la réponse est le JSON `jsonv2` de Nominatim, tel quel). Un proxy et non un
+appel direct depuis l'app :
+
+- **couper ou remplacer le service sans mise à jour de l'app** —
+  `GEOCODE_DISABLED=1` répond `503` à tout le monde ; `GEOCODE_UPSTREAM`
+  (défaut `https://nominatim.openstreetmap.org/search`) vise un autre service
+  compatible (Nominatim auto-hébergé, Photon…) si le volume dépasse ce que le
+  service public tolère ;
+- **honorer la politique d'usage**
+  (https://operations.osmfoundation.org/policies/nominatim/) — l'espacement
+  d'**une seconde entre appels sortants** se garantit ici, pour tous les
+  utilisateurs confondus, ce qu'une app distribuée ne peut pas faire ; le
+  User-Agent identifiant est celui du serveur ; les réponses sont **mises en
+  cache 24 h** (clé requête normalisée en minuscules + viewbox + langue,
+  plafond ~4 096 entrées, purge des périmées à l'insertion). Côté app, la
+  recherche ne part qu'à la validation du clavier — l'auto-complétion est
+  interdite par la même politique.
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `q` | string | oui | saisie libre |
+| `viewbox` | string | non | `x1,y1,x2,y2` (lon,lat) — préférence, pas restriction |
+| `accept-language` | string | non | langues des libellés, format `Accept-Language` |
+| `limit` | int | non | borné à 10 (défaut 10) |
+
+Erreurs : `503` service coupé, `502` amont injoignable ou non-200.
+
 ### `GET /trees`
 
 Arbres OSM (`natural=tree`) de la bbox — géométrie seule, aucun calcul

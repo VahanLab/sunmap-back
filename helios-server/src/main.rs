@@ -42,6 +42,10 @@ type BuildingCache = RwLock<HashMap<String, Arc<Vec<Building>>>>;
 /// clé bbox+instant+hauteur d'observateur — évite de refaire tout le ray
 /// marching quand la même requête (même minute, même zone) revient.
 type PlacesResultCache = RwLock<HashMap<String, Arc<PlacesResponse>>>;
+/// Réponses Nominatim déjà servies, par requête normalisée. La politique du
+/// service public demande expressément de mettre les résultats en cache, et
+/// une même saisie renvoie la même chose d'un jour à l'autre.
+type GeocodeCache = RwLock<HashMap<String, (std::time::Instant, Arc<String>)>>;
 
 /// Valeur de la grille `owner` pour « aucun bâtiment ici » (relief nu).
 const OWNER_TERRAIN: u32 = u32::MAX;
@@ -70,6 +74,12 @@ struct AppState {
     /// PostGIS correspondantes n'existent plus (cf. docs/tuiles-pmtiles.md),
     /// un serveur sans archive classerait tout au soleil.
     vstore: helios_server::vtiles::VectorStore,
+    geocode_cache: GeocodeCache,
+    /// Date du dernier appel sortant vers Nominatim : le verrou sérialise les
+    /// requêtes amont et impose l'espacement d'une seconde de la politique —
+    /// ce qu'une app dans chaque poche ne peut pas garantir, et qu'un proxy
+    /// central garantit par construction.
+    geocode_gate: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 /// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
@@ -174,6 +184,8 @@ async fn main() {
         tiles: RwLock::new(HashMap::new()),
         buildings: RwLock::new(HashMap::new()),
         places_results: RwLock::new(HashMap::new()),
+        geocode_cache: RwLock::new(HashMap::new()),
+        geocode_gate: tokio::sync::Mutex::new(None),
         // `filter` : docker-compose passe la variable vide quand elle n'est
         // pas définie dans `.env` — vide vaut absente. Mourir plutôt que
         // démarrer sans géométrie : un serveur sans archive classerait tout
@@ -239,6 +251,7 @@ async fn main() {
         .route("/trees", get(trees))
         .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
         .route("/sun-hours", get(sun_hours))
+        .route("/geocode", get(geocode))
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
 
@@ -3199,4 +3212,146 @@ async fn delete_current_user(
         if existed { "compte effacé" } else { "déjà absent" }
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- geocode
+
+/// Durée de vie d'une réponse de géocodage en cache. Longue à dessein : une
+/// même saisie renvoie la même chose d'un jour à l'autre, et la politique
+/// Nominatim demande expressément de mettre les résultats en cache.
+const GEOCODE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+/// Au-delà de cette taille, les entrées périmées sont purgées à l'insertion.
+/// Borne molle : elle limite la mémoire sans stratégie d'éviction savante —
+/// une réponse Nominatim pèse quelques Ko, le plafond vaut quelques Mo.
+const GEOCODE_CACHE_MAX: usize = 4096;
+/// Espacement minimal entre deux appels sortants vers Nominatim : la
+/// politique impose « une requête par seconde au maximum », tous nos
+/// utilisateurs confondus.
+const GEOCODE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Deserialize)]
+struct GeocodeQuery {
+    q: String,
+    /// `x1,y1,x2,y2` (lon,lat) — transmis tel quel à Nominatim, qui préfère
+    /// alors les résultats dans cette emprise sans s'y restreindre.
+    viewbox: Option<String>,
+    /// Langues des libellés, au format `Accept-Language`.
+    #[serde(rename = "accept-language")]
+    accept_language: Option<String>,
+    limit: Option<u32>,
+}
+
+/// `GET /geocode` — recherche libre d'adresse ou d'établissement, en
+/// passe-plat vers Nominatim.
+///
+/// Un proxy et non un appel direct depuis l'app, pour trois raisons :
+///
+/// - **couper ou remplacer le service sans mise à jour de l'app** :
+///   `GEOCODE_DISABLED=1` répond 503 à tout le monde ; `GEOCODE_UPSTREAM`
+///   vise un autre service compatible (Nominatim auto-hébergé, Photon…) si le
+///   volume dépasse un jour ce que le service public tolère ;
+/// - **honorer la politique d'usage** (operations.osmfoundation.org/policies/
+///   nominatim/) : l'espacement d'une seconde entre appels sortants se
+///   garantit ici et nulle part ailleurs — pas dans une app distribuée —,
+///   le User-Agent identifiant est celui du serveur, et les réponses sont
+///   mises en cache comme demandé ;
+/// - **garder le contrat client stable** si l'amont change.
+///
+/// La réponse est le JSON Nominatim (jsonv2) tel quel : le serveur ne fait
+/// que transporter, le client porte le décodage. Le jour où l'amont change
+/// de format, un mapping naîtra ici pour préserver ce contrat.
+async fn geocode(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<GeocodeQuery>,
+) -> Result<impl axum::response::IntoResponse, (StatusCode, String)> {
+    use axum::http::header::CONTENT_TYPE;
+
+    // Coupe-circuit : lu à chaque requête pour rester honnête avec la doc —
+    // en pratique l'environnement d'un conteneur ne change qu'au redéploiement.
+    if std::env::var("GEOCODE_DISABLED").is_ok_and(|v| v == "1") {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "géocodage désactivé".into()));
+    }
+
+    let query = q.q.trim().to_string();
+    if query.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "q vide".into()));
+    }
+    let limit = q.limit.unwrap_or(10).clamp(1, 10);
+    let viewbox = q.viewbox.unwrap_or_default();
+    let lang = q.accept_language.unwrap_or_default();
+
+    // La casse de la saisie ne change pas le géocodage : la clé la normalise
+    // pour que « Café de Flore » et « café de flore » partagent l'entrée.
+    let cache_key = format!("{}|{viewbox}|{lang}|{limit}", query.to_lowercase());
+    if let Some((at, body)) = state.geocode_cache.read().await.get(&cache_key) {
+        if at.elapsed() < GEOCODE_CACHE_TTL {
+            println!("[geocode] « {query} » → cache hit");
+            return Ok(([(CONTENT_TYPE, "application/json")], body.to_string()));
+        }
+    }
+
+    let upstream = std::env::var("GEOCODE_UPSTREAM")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "https://nominatim.openstreetmap.org/search".into());
+
+    let mut params: Vec<(&str, String)> = vec![
+        ("q", query.clone()),
+        ("format", "jsonv2".into()),
+        ("addressdetails", "1".into()),
+        ("dedupe", "1".into()),
+        ("limit", limit.to_string()),
+    ];
+    if !viewbox.is_empty() {
+        params.push(("viewbox", viewbox));
+    }
+    if !lang.is_empty() {
+        params.push(("accept-language", lang));
+    }
+
+    // Le verrou se tient pendant l'attente ET l'appel : deux requêtes
+    // concurrentes se sérialisent, l'espacement d'une seconde vaut donc pour
+    // le serveur entier — c'est tout l'objet du proxy.
+    let body = {
+        let mut gate = state.geocode_gate.lock().await;
+        if let Some(last) = *gate {
+            let elapsed = last.elapsed();
+            if elapsed < GEOCODE_MIN_INTERVAL {
+                tokio::time::sleep(GEOCODE_MIN_INTERVAL - elapsed).await;
+            }
+        }
+        *gate = Some(std::time::Instant::now());
+
+        let resp = state
+            .http
+            .get(&upstream)
+            .query(&params)
+            .send()
+            .await
+            .map_err(|e| {
+                (StatusCode::BAD_GATEWAY, format!("géocodage amont injoignable : {e}"))
+            })?;
+        if resp.status() != reqwest::StatusCode::OK {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("géocodage amont : HTTP {}", resp.status()),
+            ));
+        }
+        resp.text().await.map_err(|e| {
+            (StatusCode::BAD_GATEWAY, format!("géocodage amont : lecture — {e}"))
+        })?
+    };
+
+    {
+        let mut cache = state.geocode_cache.write().await;
+        if cache.len() >= GEOCODE_CACHE_MAX {
+            cache.retain(|_, (at, _)| at.elapsed() < GEOCODE_CACHE_TTL);
+        }
+        cache.insert(
+            cache_key,
+            (std::time::Instant::now(), Arc::new(body.clone())),
+        );
+    }
+    println!("[geocode] « {query} » → amont, {} octets", body.len());
+    Ok(([(CONTENT_TYPE, "application/json")], body))
 }
