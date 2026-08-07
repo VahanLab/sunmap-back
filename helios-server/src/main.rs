@@ -173,10 +173,19 @@ async fn main() {
 
     let state = Arc::new(AppState {
         auth: auth::FirebaseAuth::new(project_id),
-        // Ne sert plus qu'aux tuiles DEM Mapterhorn — la géométrie OSM vient
-        // de PostGIS, plus d'Overpass au runtime.
+        // Tuiles DEM Mapterhorn et géocodage Nominatim (`/geocode`) — la
+        // géométrie OSM vient de PostGIS, plus d'Overpass au runtime.
+        //
+        // Un build de dev se signale dans son User-Agent : les tests locaux
+        // partent vers les mêmes services publics que la production, et un
+        // pic de volume pendant un débogage ne doit pas faire bannir l'UA de
+        // prod — c'est l'UA marquée Debug qui prendrait, elle seule.
         http: reqwest::Client::builder()
-            .user_agent("sunmap-helios/0.1 (+https://github.com/VahanLab/sunmap-back)")
+            .user_agent(if cfg!(debug_assertions) {
+                "sunmap-helios/0.1 Debug (+https://github.com/VahanLab/sunmap-back)"
+            } else {
+                "sunmap-helios/0.1 (+https://github.com/VahanLab/sunmap-back)"
+            })
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("client HTTP"),
