@@ -2656,11 +2656,11 @@ const ERR_CONTRIBUTION_BANNED: &str = r#"{"code":"contribution_banned"}"#;
 
 /// `authenticate`, plus les deux exigences propres à l'écriture.
 ///
-/// - **Adresse vérifiée** pour un compte e-mail/mot de passe : le jeton
-///   Firebase porte `email_verified`, il suffit de le lire — Google et Apple
-///   livrent des adresses déjà confirmées chez eux, seul le fournisseur
-///   `password` peut arriver non vérifié. Contrôlé ici et pas seulement côté
-///   client : un jeton se rejoue hors de l'app.
+/// - **Adresse vérifiée**, lue dans le claim `email_verified` du jeton — une
+///   règle unique, sans cas par fournisseur : Google et Apple posent le claim
+///   à `true` d'eux-mêmes, seul un compte e-mail/mot de passe attend son lien
+///   de confirmation. Contrôlé ici et pas seulement côté client : un jeton se
+///   rejoue hors de l'app.
 /// - **Compte non banni** (`users.banned`, posé à la main sur un troll) : la
 ///   consultation reste libre, seul l'écrit est fermé.
 async fn authenticate_contributor(
@@ -2684,7 +2684,7 @@ async fn authenticate_contributor(
 /// L'adresse non vérifiée prime sur le bannissement : c'est le seul des deux
 /// refus que l'utilisateur peut lever lui-même, autant le lui dire d'abord.
 fn contribution_refusal(identity: &auth::Identity, banned: bool) -> Option<&'static str> {
-    if identity.sign_in_provider.as_deref() == Some("password") && !identity.email_verified {
+    if !identity.email_verified {
         return Some(ERR_EMAIL_UNVERIFIED);
     }
     if banned {
@@ -2697,52 +2697,34 @@ fn contribution_refusal(identity: &auth::Identity, banned: bool) -> Option<&'sta
 mod contribution_guard_tests {
     use super::*;
 
-    fn identity(provider: Option<&str>, email_verified: bool) -> auth::Identity {
+    fn identity(email_verified: bool) -> auth::Identity {
         auth::Identity {
             uid: "uid-test".into(),
             email: None,
             display_name: None,
             email_verified,
-            sign_in_provider: provider.map(Into::into),
         }
     }
 
     #[test]
-    fn password_non_verifie_est_refuse() {
+    fn adresse_non_verifiee_est_refusee() {
+        // Règle unique, quel que soit le fournisseur : Google et Apple posent
+        // le claim à vrai d'eux-mêmes, ils ne tombent jamais ici en pratique.
         assert_eq!(
-            contribution_refusal(&identity(Some("password"), false), false),
+            contribution_refusal(&identity(false), false),
             Some(ERR_EMAIL_UNVERIFIED)
         );
     }
 
     #[test]
-    fn password_verifie_passe() {
-        assert_eq!(contribution_refusal(&identity(Some("password"), true), false), None);
+    fn adresse_verifiee_passe() {
+        assert_eq!(contribution_refusal(&identity(true), false), None);
     }
 
     #[test]
-    fn google_et_apple_passent_sans_verification() {
-        // Même si le claim `email_verified` est faux : la règle ne vise que
-        // le fournisseur `password`, les autres arrivent confirmés chez eux.
-        assert_eq!(contribution_refusal(&identity(Some("google.com"), false), false), None);
-        assert_eq!(contribution_refusal(&identity(Some("apple.com"), false), false), None);
-    }
-
-    #[test]
-    fn fournisseur_absent_passe() {
-        // Jeton d'un fournisseur inconnu ou claim absent : on ne refuse que
-        // sur une certitude.
-        assert_eq!(contribution_refusal(&identity(None, false), false), None);
-    }
-
-    #[test]
-    fn banni_est_refuse_quel_que_soit_le_fournisseur() {
+    fn banni_est_refuse_meme_verifie() {
         assert_eq!(
-            contribution_refusal(&identity(Some("google.com"), true), true),
-            Some(ERR_CONTRIBUTION_BANNED)
-        );
-        assert_eq!(
-            contribution_refusal(&identity(Some("password"), true), true),
+            contribution_refusal(&identity(true), true),
             Some(ERR_CONTRIBUTION_BANNED)
         );
     }
@@ -2751,7 +2733,7 @@ mod contribution_guard_tests {
     fn adresse_non_verifiee_prime_sur_le_bannissement() {
         // C'est le seul refus que l'utilisateur peut lever lui-même.
         assert_eq!(
-            contribution_refusal(&identity(Some("password"), false), true),
+            contribution_refusal(&identity(false), true),
             Some(ERR_EMAIL_UNVERIFIED)
         );
     }

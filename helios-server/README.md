@@ -696,9 +696,10 @@ point est classé comme il l'est — bâtiment manquant, trop bas, mal placé.
 Les endpoints de contribution (`POST /places/terrace`, `POST`/`PUT
 /places/furniture`) exigent, au-delà du jeton (`401` sinon) :
 
-- **une adresse vérifiée** pour un compte e-mail/mot de passe — lu dans le
-  claim `email_verified` du jeton Firebase (Google et Apple arrivent déjà
-  confirmés chez eux). Refus : `403 {"code":"email_unverified"}`.
+- **une adresse vérifiée** — le claim `email_verified` du jeton Firebase,
+  règle unique sans cas par fournisseur : Google et Apple le posent à `true`
+  d'eux-mêmes, seul un compte e-mail/mot de passe attend son lien de
+  confirmation. Refus : `403 {"code":"email_unverified"}`.
 - **un compte non banni** — `users.banned`, posé à la main sur un troll ou un
   spammeur (`UPDATE users SET banned = true WHERE username = '…'`). La
   consultation reste libre, seul l'écrit est fermé. Refus :
