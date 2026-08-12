@@ -2186,8 +2186,10 @@ async fn places(
             // cartographié à sa position réelle : le recalage hors bâtiment,
             // pensé pour des nœuds d'établissement posés sur leur immeuble,
             // ne ferait que déplacer un meuble déjà bien placé.
-            let is_furniture =
-                matches!(p.amenity.as_deref(), Some("bench" | "picnic_table" | "playground"));
+            let is_furniture = matches!(
+                p.amenity.as_deref(),
+                Some("bench" | "picnic_table" | "playground" | "fitness_station")
+            );
             let (px, py, moved_m) = match terrace {
                 Some((lat, lng)) => {
                     let (tx, ty) = world_px(lat, lng);

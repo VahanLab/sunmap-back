@@ -171,10 +171,12 @@ pub const AMENITIES: &[&str] = &[
 /// est déjà la bonne, aucun recalage hors bâtiment à faire.
 ///
 /// Le banc arrive par `amenity=bench`, la table de pique-nique par
-/// `leisure=picnic_table`, l'aire de jeux par `leisure=playground` : cette
-/// fonction les ramène à une « amenity » unique, pour qu'ils traversent le
-/// pipeline des établissements sans le dupliquer. L'aire de jeux est le plus
-/// souvent un polygone — ramené à son centroïde comme tout objet surfacique.
+/// `leisure=picnic_table`, l'aire de jeux par `leisure=playground`, le
+/// street workout par `leisure=fitness_station` : cette fonction les ramène
+/// à une « amenity » unique, pour qu'ils traversent le pipeline des
+/// établissements sans le dupliquer. Aires de jeux et street workout sont le
+/// plus souvent des polygones — ramenés à leur centroïde comme tout objet
+/// surfacique.
 pub fn furniture_kind(tags: &HashMap<String, String>) -> Option<&'static str> {
     if tags.get("amenity").map(String::as_str) == Some("bench") {
         return Some("bench");
@@ -182,6 +184,7 @@ pub fn furniture_kind(tags: &HashMap<String, String>) -> Option<&'static str> {
     match tags.get("leisure").map(String::as_str) {
         Some("picnic_table") => Some("picnic_table"),
         Some("playground") => Some("playground"),
+        Some("fitness_station") => Some("fitness_station"),
         _ => None,
     }
 }
@@ -700,6 +703,11 @@ mod tests {
         playground.insert("leisure".to_string(), "playground".to_string());
         let g = place_from("way/3".into(), 48.0, 2.0, &playground);
         assert_eq!(g.amenity.as_deref(), Some("playground"));
+
+        let mut fitness = HashMap::new();
+        fitness.insert("leisure".to_string(), "fitness_station".to_string());
+        let f = place_from("way/4".into(), 48.0, 2.0, &fitness);
+        assert_eq!(f.amenity.as_deref(), Some("fitness_station"));
     }
 
     fn leaf_of(pairs: &[(&str, &str)]) -> LeafType {

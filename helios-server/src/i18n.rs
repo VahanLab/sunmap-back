@@ -103,6 +103,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("bench", "Banc public"),
             ("picnic_table", "Table de pique-nique"),
             ("playground", "Aire de jeux"),
+            ("fitness_station", "Street workout"),
         ],
         Lang::En => &[
             ("bar", "Bar"),
@@ -114,6 +115,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("bench", "Public bench"),
             ("picnic_table", "Picnic table"),
             ("playground", "Playground"),
+            ("fitness_station", "Outdoor gym"),
         ],
         Lang::Es => &[
             ("bar", "Bar"),
@@ -125,6 +127,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("bench", "Banco público"),
             ("picnic_table", "Mesa de pícnic"),
             ("playground", "Zona de juegos"),
+            ("fitness_station", "Gimnasio al aire libre"),
         ],
         Lang::It => &[
             ("bar", "Bar"),
@@ -136,6 +139,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("bench", "Panchina pubblica"),
             ("picnic_table", "Tavolo da picnic"),
             ("playground", "Parco giochi"),
+            ("fitness_station", "Palestra all'aperto"),
         ],
         Lang::De => &[
             ("bar", "Bar"),
@@ -147,6 +151,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("bench", "Sitzbank"),
             ("picnic_table", "Picknicktisch"),
             ("playground", "Spielplatz"),
+            ("fitness_station", "Fitnessstation"),
         ],
     };
     lookup(table, amenity)
@@ -604,6 +609,8 @@ mod tests {
         assert_eq!(amenity_label("fast_food", Lang::Fr), "Restauration rapide");
         assert_eq!(amenity_label("playground", Lang::Fr), "Aire de jeux");
         assert_eq!(amenity_label("playground", Lang::De), "Spielplatz");
+        assert_eq!(amenity_label("fitness_station", Lang::Fr), "Street workout");
+        assert_eq!(amenity_label("fitness_station", Lang::En), "Outdoor gym");
     }
 
     /// La traîne OSM est sans fin : une valeur inconnue doit rester lisible.

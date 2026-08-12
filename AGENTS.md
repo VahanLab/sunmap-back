@@ -186,7 +186,8 @@ Fonctionnalités cibles :
   EPSG:3857 sur AWS) ; OSM `natural=tree` (riche en France via imports
   municipaux), `tree_row`, `wood`/`forest`.
 - **Mobilier urbain (en place)** : bancs (`amenity=bench`), tables de
-  pique-nique (`leisure=picnic_table`) et aires de jeux (`leisure=playground`),
+  pique-nique (`leisure=picnic_table`), aires de jeux (`leisure=playground`)
+  et street workout (`leisure=fitness_station`),
   dans la **même table `places`** et le même endpoint que les établissements —
   la question « au soleil à quelle heure ? » y est identique. Deux différences
   assumées : **aucun recalage hors bâtiment** (un banc est cartographié là où
@@ -194,11 +195,12 @@ Fonctionnalités cibles :
   attributs propres — `direction` (orientation du regard assis, croisable avec
   l'azimut solaire), `covered`, `backrest`, `seats`, `material`. Volume :
   ~49 500 bancs et ~2 900 tables pour l'Île-de-France, d'où un affichage
-  **éteint par défaut** côté client. Les aires de jeux sont des **polygones**
-  ramenés à leur centroïde (comme tout objet surfacique du pipeline lieu) ;
-  elles sont **non contribuables** depuis l'app (créer un nœud OSM là où la
-  communauté attend un polygone serait une mauvaise donnée) et n'ont **pas de
-  modèle 3D** — côté client, seule leur pastille existe, décochée par défaut.
+  **éteint par défaut** côté client. Aires de jeux et street workout sont des
+  **polygones** (ou nœuds) ramenés à leur centroïde (comme tout objet
+  surfacique du pipeline lieu) ; ils sont **non contribuables** depuis l'app
+  (créer un nœud OSM là où la communauté attend un polygone serait une
+  mauvaise donnée) et n'ont **pas de modèle 3D** — côté client, seule leur
+  pastille existe, décochée par défaut.
   L'échantillonnage d'emprise (plutôt que le centroïde) reste une amélioration
   possible.
 - **Établissements (en place)** : OSM `amenity` = bar, pub, restaurant, cafe,
