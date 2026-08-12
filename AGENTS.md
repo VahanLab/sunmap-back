@@ -185,17 +185,22 @@ Fonctionnalités cibles :
 - **Arbres (backlog)** : Meta/WRI Canopy Height Map v2 (2026, ~1 m, COG
   EPSG:3857 sur AWS) ; OSM `natural=tree` (riche en France via imports
   municipaux), `tree_row`, `wood`/`forest`.
-- **Mobilier urbain (en place)** : bancs (`amenity=bench`) et tables de
-  pique-nique (`leisure=picnic_table`), dans la **même table `places`** et le
-  même endpoint que les établissements — la question « au soleil à quelle
-  heure ? » y est identique. Deux différences assumées : **aucun recalage hors
-  bâtiment** (un banc est cartographié là où il est, contrairement au nœud d'un
-  bar posé sur son immeuble), et cinq attributs propres — `direction`
-  (orientation du regard assis, croisable avec l'azimut solaire), `covered`,
-  `backrest`, `seats`, `material`. Volume : ~49 500 bancs et ~2 900 tables pour
-  l'Île-de-France, d'où un affichage **éteint par défaut** côté client.
-  Les aires de jeux (`leisure=playground`) restent au backlog : polygones, donc
-  centroïde ou échantillonnage d'emprise à trancher.
+- **Mobilier urbain (en place)** : bancs (`amenity=bench`), tables de
+  pique-nique (`leisure=picnic_table`) et aires de jeux (`leisure=playground`),
+  dans la **même table `places`** et le même endpoint que les établissements —
+  la question « au soleil à quelle heure ? » y est identique. Deux différences
+  assumées : **aucun recalage hors bâtiment** (un banc est cartographié là où
+  il est, contrairement au nœud d'un bar posé sur son immeuble), et cinq
+  attributs propres — `direction` (orientation du regard assis, croisable avec
+  l'azimut solaire), `covered`, `backrest`, `seats`, `material`. Volume :
+  ~49 500 bancs et ~2 900 tables pour l'Île-de-France, d'où un affichage
+  **éteint par défaut** côté client. Les aires de jeux sont des **polygones**
+  ramenés à leur centroïde (comme tout objet surfacique du pipeline lieu) ;
+  elles sont **non contribuables** depuis l'app (créer un nœud OSM là où la
+  communauté attend un polygone serait une mauvaise donnée) et n'ont **pas de
+  modèle 3D** — côté client, seule leur pastille existe, décochée par défaut.
+  L'échantillonnage d'emprise (plutôt que le centroïde) reste une amélioration
+  possible.
 - **Établissements (en place)** : OSM `amenity` = bar, pub, restaurant, cafe,
   fast_food, biergarten (`osm::AMENITIES`). **Pas de filtre sur
   `outdoor_seating`** à l'ingestion : le tag manque sur ~79 % des

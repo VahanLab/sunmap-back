@@ -321,15 +321,19 @@ serveur (crate `tzf-rs` par exemple).
 
 ### Mobilier urbain dans `/places`
 
-Les bancs (`amenity=bench`) et les tables de pique-nique
-(`leisure=picnic_table`) passent par la **même table et le même endpoint** que
-les établissements : la question « au soleil à quelle heure ? » y est
-identique, et les dupliquer aurait dupliqué tout le pipeline bbox +
-classification.
+Les bancs (`amenity=bench`), les tables de pique-nique
+(`leisure=picnic_table`) et les aires de jeux (`leisure=playground`) passent
+par la **même table et le même endpoint** que les établissements : la question
+« au soleil à quelle heure ? » y est identique, et les dupliquer aurait
+dupliqué tout le pipeline bbox + classification.
 
-`leisure=picnic_table` est normalisé en `amenity: "picnic_table"` dès
-l'extraction (`osm::furniture_kind`), pour que rien en aval n'ait à connaître
-deux clés de tag.
+`leisure=picnic_table` et `leisure=playground` sont normalisés en
+`amenity: "picnic_table"` / `"playground"` dès l'extraction
+(`osm::furniture_kind`), pour que rien en aval n'ait à connaître plusieurs
+clés de tag. Une aire de jeux est le plus souvent un **polygone**, ramené à
+son centroïde comme tout objet surfacique ; elle n'est **pas contribuable**
+(les gardes de `POST/PUT /places/furniture` ne connaissent que `bench` et
+`picnic_table`) et ne remonte donc jamais vers OSM.
 
 Deux différences de traitement, toutes deux volontaires :
 
