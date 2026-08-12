@@ -26,13 +26,14 @@ echo "1/2 — filtrage des tags…"
 # en `wr` : une grande forêt est presque toujours une relation multipolygone,
 # avec des clairières en anneaux intérieurs qu'il faut garder creuses. Le `-t`
 # conserve les objets référencés (nœuds des ways, membres des relations), sans
-# quoi il n'y aurait aucune géométrie à assembler.
+# quoi il n'y aurait aucune géométrie à assembler. Les aires de jeux sont en
+# `nwr` : le plus souvent des polygones, ramenés à leur centroïde côté Rust.
 osmium tags-filter --overwrite -t -o "$TMP" "$IN" \
   w/building r/building w/building:part \
   n/natural=tree \
   wr/natural=wood,tree_row,scrub wr/landuse=forest \
   nwr/amenity=bar,pub,restaurant,cafe,fast_food,biergarten \
-  n/amenity=bench n/leisure=picnic_table
+  n/amenity=bench n/leisure=picnic_table nwr/leisure=playground
 
 echo "2/2 — assemblage des aires et export GeoJSONSeq…"
 # osmium assemble les multipolygones ici : les relations sortent en Polygon /

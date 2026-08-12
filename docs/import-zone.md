@@ -75,7 +75,8 @@ relançable sans risque.
    `building:part`, relations multipolygones), végétation (`natural=tree`,
    `wood`, `tree_row`, `scrub`, `landuse=forest`), établissements
    (`amenity=bar|pub|restaurant|cafe|fast_food|biergarten`), mobilier urbain
-   (`amenity=bench`, `leisure=picnic_table`).
+   (`amenity=bench`, `leisure=picnic_table`, `leisure=playground` — ce dernier
+   en `nwr`, les aires de jeux étant surtout des polygones).
 3. **`cargo run --release --bin tilegen`** — extrait → `tiles/sunmap.pmtiles`
    (MVT z14, couches `buildings`/`woods`/`trees`, sans simplification),
    **fusionné** dans l'archive existante (`--merge`) : les tuiles que le

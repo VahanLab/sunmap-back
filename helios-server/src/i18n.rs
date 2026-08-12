@@ -102,6 +102,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("biergarten", "Biergarten"),
             ("bench", "Banc public"),
             ("picnic_table", "Table de pique-nique"),
+            ("playground", "Aire de jeux"),
         ],
         Lang::En => &[
             ("bar", "Bar"),
@@ -112,6 +113,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("biergarten", "Beer garden"),
             ("bench", "Public bench"),
             ("picnic_table", "Picnic table"),
+            ("playground", "Playground"),
         ],
         Lang::Es => &[
             ("bar", "Bar"),
@@ -122,6 +124,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("biergarten", "Biergarten"),
             ("bench", "Banco público"),
             ("picnic_table", "Mesa de pícnic"),
+            ("playground", "Zona de juegos"),
         ],
         Lang::It => &[
             ("bar", "Bar"),
@@ -132,6 +135,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("biergarten", "Biergarten"),
             ("bench", "Panchina pubblica"),
             ("picnic_table", "Tavolo da picnic"),
+            ("playground", "Parco giochi"),
         ],
         Lang::De => &[
             ("bar", "Bar"),
@@ -142,6 +146,7 @@ pub fn amenity_label(amenity: &str, lang: Lang) -> String {
             ("biergarten", "Biergarten"),
             ("bench", "Sitzbank"),
             ("picnic_table", "Picknicktisch"),
+            ("playground", "Spielplatz"),
         ],
     };
     lookup(table, amenity)
@@ -597,6 +602,8 @@ mod tests {
         assert_eq!(cuisine_label("coffee_shop", Lang::Fr), "Café");
         assert_eq!(cuisine_label("french", Lang::Fr), "Française");
         assert_eq!(amenity_label("fast_food", Lang::Fr), "Restauration rapide");
+        assert_eq!(amenity_label("playground", Lang::Fr), "Aire de jeux");
+        assert_eq!(amenity_label("playground", Lang::De), "Spielplatz");
     }
 
     /// La traîne OSM est sans fin : une valeur inconnue doit rester lisible.

@@ -2151,12 +2151,12 @@ async fn places(
             // La rectifier avec `nudge_out_of_building` détruirait justement la
             // précision qu'on lui a demandée — une terrasse sous arcade ou
             // adossée à la façade se retrouverait déplacée au milieu de la rue.
-            // Un banc ou une table de pique-nique est cartographié à sa
-            // position réelle : le recalage hors bâtiment, pensé pour des
-            // nœuds d'établissement posés sur leur immeuble, ne ferait que
-            // déplacer un meuble déjà bien placé.
+            // Un banc, une table de pique-nique ou une aire de jeux est
+            // cartographié à sa position réelle : le recalage hors bâtiment,
+            // pensé pour des nœuds d'établissement posés sur leur immeuble,
+            // ne ferait que déplacer un meuble déjà bien placé.
             let is_furniture =
-                matches!(p.amenity.as_deref(), Some("bench" | "picnic_table"));
+                matches!(p.amenity.as_deref(), Some("bench" | "picnic_table" | "playground"));
             let (px, py, moved_m) = match terrace {
                 Some((lat, lng)) => {
                     let (tx, ty) = world_px(lat, lng);
