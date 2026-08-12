@@ -42,6 +42,38 @@ migrations, dont un `DROP TABLE`, et seul un refus de droits l'a arrêté. Le
 serveur refuse d'ailleurs désormais toute base non locale sans
 `ALLOW_REMOTE_DB=1`, que docker-compose pose en production.
 
+### Lieux seuls, depuis la VM de production
+
+Quand seule la base doit être rafraîchie (pas les tuiles), tout se fait sur
+la VM — le PBF ne transite pas par un poste, et le binaire `import` vient de
+l'image GHCR déjà déployée. Fait pour la France entière en 2026-08 :
+
+1. Le PBF vit sur le volume dédié monté en `/mnt/data` (100 Go, entrée
+   fstab `nofail`) — le disque système (50 Go) ne suffit pas.
+2. Filtre osmium **lieux seuls** (pas celui d'`osm-extract.sh`, dont les
+   bâtiments et la végétation ne servent qu'aux tuiles) :
+
+   ```
+   osmium tags-filter --overwrite -t -o places.filtre.osm.pbf france-latest.osm.pbf \
+     nwr/amenity=bar,pub,restaurant,cafe,fast_food,biergarten \
+     n/amenity=bench n/leisure=picnic_table nwr/leisure=playground
+   osmium export --overwrite -u type_id -f geojsonseq -o places.geojsonl places.filtre.osm.pbf
+   ```
+
+   France entière : 153 Mo, ~620 000 features. Lancer les étapes longues en
+   `systemd-run --user` (avec `loginctl enable-linger ubuntu`) : un travail
+   accroché à la session SSH meurt avec elle.
+3. Import avec l'image déployée (le tag est dans `~/sun-shadow/.env`) :
+
+   ```
+   docker run --rm -v /mnt/data:/data \
+     --env-file ~/sun-shadow/helios-server/.env \
+     ghcr.io/vahanlab/sunmap-api:<API_TAG> import /data/places.geojsonl
+   ```
+
+   `import` streame l'extrait (RAM bornée aux lieux — ~571 000 lignes pour
+   la France, quelques minutes) et annonce l'hôte visé avant d'écrire.
+
 ## La commande
 
 Tout le pipeline tient en une commande, URL Geofabrik ou PBF déjà téléchargé :
