@@ -169,6 +169,7 @@ dernier cas : l'absence d'information n'est pas une absence de terrasse.
 | `t` | string | non | Défaut : maintenant |
 | `observer_height` | f64 | non | Défaut : **1.5** |
 | `lang` | string | non | Langue des libellés (`fr`, `en`). Défaut : **fr** |
+| `categories` | string | non | `amenity` que le client sait afficher, séparées par des virgules (`bar,pub,…,playground`). Absent = **liste figée des catégories d'avant le paramètre** (`LEGACY_CATEGORIES`, 2026-08) : les apps qui ne l'envoient pas reçoivent exactement ce qu'elles connaissaient, jamais une catégorie plus récente. **Le client doit l'envoyer** pour voir les nouvelles. Filtré à la sortie du cache — la clé de cache reste par bbox |
 
 Les valeurs de tags OSM sont des clés techniques anglaises (`coffee_shop`,
 `fast_food`) inutilisables telles quelles. Le serveur renvoie donc
