@@ -53,7 +53,19 @@ async fn main() {
         if db::is_local_url(&url) { "locale" } else { "DISTANTE" }
     );
 
-    let extract = match &path {
+    // En flux, et en ne retenant QUE les lieux : bâtiments, arbres et bois de
+    // l'extrait sont jetés au fil de l'eau — ils vont dans l'archive
+    // vectorielle via `bin/tilegen`, pas en base. `read_geojsonseq` gardait
+    // tout en mémoire pour combler les hauteurs de bâtiments, dont l'import
+    // n'a aucun usage : sur le geojsonl de la France entière (~39 Go), c'est
+    // la différence entre quelques centaines de Mo et un OOM sur une VM.
+    let mut places = Vec::new();
+    let keep_places = |f: pbf::StreamedFeature| {
+        if let pbf::StreamedFeature::Place(p) = f {
+            places.push(p);
+        }
+    };
+    let result = match &path {
         Some(p) => {
             let file = match File::open(p) {
                 Ok(f) => f,
@@ -62,26 +74,30 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            // Tampon large : le fichier fait des centaines de Mo en une seule
-            // passe séquentielle.
-            pbf::read_geojsonseq(BufReader::with_capacity(1 << 20, file))
+            // Tampon large : le fichier fait des Go en une seule passe
+            // séquentielle.
+            pbf::stream_geojsonseq(BufReader::with_capacity(1 << 20, file), keep_places)
         }
         None => {
             if std::io::stdin().is_terminal() {
                 eprintln!("Usage : import <extrait.geojsonl>  (ou sur stdin)");
                 std::process::exit(1);
             }
-            pbf::read_geojsonseq(BufReader::with_capacity(1 << 20, std::io::stdin().lock()))
+            pbf::stream_geojsonseq(
+                BufReader::with_capacity(1 << 20, std::io::stdin().lock()),
+                keep_places,
+            )
         }
     };
 
-    let extract = match extract {
-        Ok(e) => e,
+    let ignored = match result {
+        Ok(n) => n,
         Err(e) => {
             eprintln!("Lecture de l'extrait : {e}");
             std::process::exit(1);
         }
     };
+    println!("extrait : {} lieux ({ignored} features ignorées)", places.len());
 
     let pool = match db::connect().await {
         Ok(p) => p,
@@ -95,7 +111,7 @@ async fn main() {
     // géométrie (bâtiments, arbres, bois) part dans l'archive vectorielle via
     // `bin/tilegen`, sans passer par PostgreSQL. Upsert sur l'identifiant
     // OSM : réimporter un extrait plus récent met à jour en place.
-    match db::upsert_places(&pool, &extract.places).await {
+    match db::upsert_places(&pool, &places).await {
         Ok(n) => println!("établissements : {n} lignes écrites"),
         Err(e) => eprintln!("établissements : ÉCHEC : {e}"),
     }
