@@ -84,7 +84,14 @@ else
   # Image dédiée à l'outillage, jamais celle que sert `docker compose` : la
   # construire ici ne doit pas remplacer l'image de production, qui vient du
   # registre avec son tag.
-  DOCKER_RUN=(docker run --rm -v "$PWD:/work" -w /work -u "$(id -u):$(id -g)")
+  #
+  # `pbf/` est monté par sa cible RÉELLE : sur la VM c'est un lien vers le
+  # volume de données (/mnt/data/pbf), et un lien qui sort du bind-mount du
+  # repo pointe dans le vide vu du conteneur — l'extraction écrivait un
+  # geojsonl que tilegen ne trouvait pas. Sans lien, ce second montage est
+  # simplement redondant.
+  DOCKER_RUN=(docker run --rm -v "$PWD:/work" -v "$(readlink -f pbf):/work/pbf" \
+              -w /work -u "$(id -u):$(id -g)")
   RUN_TILEGEN=("${DOCKER_RUN[@]}" "$IMAGE" tilegen)
   RUN_VEGOVERVIEW=("${DOCKER_RUN[@]}" "$IMAGE" vegoverview)
   RUN_IMPORT=("${DOCKER_RUN[@]}" -e DATABASE_URL "$IMAGE" import)
