@@ -1519,7 +1519,24 @@ struct PlacesQuery {
     /// journée locale — sans lui, la journée découpée serait celle d'UTC,
     /// décalée de deux heures en été à Paris.
     utc_offset_minutes: Option<i32>,
+    /// Catégories (`amenity`) que le client sait afficher, séparées par des
+    /// virgules. Absent = [`LEGACY_CATEGORIES`] : les apps d'avant le
+    /// paramètre reçoivent exactement ce qu'elles connaissaient, et une
+    /// catégorie ajoutée côté serveur ne fuit jamais vers une app qui ne
+    /// sait ni la nommer ni la filtrer.
+    categories: Option<String>,
 }
+
+/// Catégories servies quand le client n'envoie pas `categories` : celles qui
+/// existaient à l'introduction du paramètre (2026-08). Liste **figée** — ne
+/// jamais y ajouter une catégorie future : les apps d'avant le paramètre
+/// affichent tout ce qu'on leur renvoie, et un kind qu'elles ne connaissent
+/// pas devient chez elles une pastille générique, visible d'office et non
+/// filtrable.
+const LEGACY_CATEGORIES: &[&str] = &[
+    "bar", "pub", "restaurant", "cafe", "fast_food", "biergarten",
+    "bench", "picnic_table",
+];
 
 #[derive(Serialize, Clone)]
 struct PlacesResponse {
@@ -2083,10 +2100,24 @@ async fn places(
     let result_key = format!(
         "{w:.4},{s:.4},{e:.4},{n:.4},{bucket},{h:.2},{lang:?},{utc_offset_minutes}"
     );
+    // Le filtre de catégories s'applique à la **sortie**, jamais dans la clé :
+    // le cache garde la réponse complète par bbox, deux clients aux listes
+    // différentes la partagent, et retenir quelques lieux d'un clone est
+    // négligeable devant le ray marching évité.
+    let categories: std::collections::HashSet<&str> = match q.categories.as_deref() {
+        Some(c) => c.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
+        None => LEGACY_CATEGORIES.iter().copied().collect(),
+    };
+    let filtered = |mut resp: PlacesResponse| -> PlacesResponse {
+        resp.places
+            .retain(|p| p.amenity.as_deref().is_some_and(|a| categories.contains(a)));
+        resp.count = resp.places.len();
+        resp
+    };
     if let Some(hit) = state.places_results.read().await.get(&result_key) {
         println!("[places] {result_key} → cache hit ({:.1} ms)",
                  request_start.elapsed().as_secs_f64() * 1000.0);
-        return Ok(Json((**hit).clone()));
+        return Ok(Json(filtered((**hit).clone())));
     }
 
     // Intervalle de tuiles couvrant la bbox + 1 tuile de marge (casters).
@@ -2291,7 +2322,7 @@ async fn places(
               tuiles DEM {t_dsm_ms:.1} ms, bâtiments+canopée {t_buildings_ms:.1} ms, \
               classification {t_classify_ms:.1} ms, TOTAL {:.1} ms",
              response.count, request_start.elapsed().as_secs_f64() * 1000.0);
-    Ok(Json(response))
+    Ok(Json(filtered(response)))
 }
 
 // ---------------------------------------------------------------- arbres
