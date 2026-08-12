@@ -56,7 +56,7 @@ l'image GHCR déjà déployée. Fait pour la France entière en 2026-08 :
    ```
    osmium tags-filter --overwrite -t -o places.filtre.osm.pbf france-latest.osm.pbf \
      nwr/amenity=bar,pub,restaurant,cafe,fast_food,biergarten \
-     n/amenity=bench n/leisure=picnic_table nwr/leisure=playground
+     n/amenity=bench n/leisure=picnic_table nwr/leisure=playground,fitness_station
    osmium export --overwrite -u type_id -f geojsonseq -o places.geojsonl places.filtre.osm.pbf
    ```
 
@@ -107,8 +107,9 @@ relançable sans risque.
    `building:part`, relations multipolygones), végétation (`natural=tree`,
    `wood`, `tree_row`, `scrub`, `landuse=forest`), établissements
    (`amenity=bar|pub|restaurant|cafe|fast_food|biergarten`), mobilier urbain
-   (`amenity=bench`, `leisure=picnic_table`, `leisure=playground` — ce dernier
-   en `nwr`, les aires de jeux étant surtout des polygones).
+   (`amenity=bench`, `leisure=picnic_table`, `leisure=playground`,
+   `leisure=fitness_station` — ces deux derniers en `nwr`, aires de jeux et
+   street workout étant surtout des polygones).
 3. **`cargo run --release --bin tilegen`** — extrait → `tiles/sunmap.pmtiles`
    (MVT z14, couches `buildings`/`woods`/`trees`, sans simplification),
    **fusionné** dans l'archive existante (`--merge`) : les tuiles que le
