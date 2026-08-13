@@ -35,3 +35,6 @@ cloudflare/.wrangler/
 
 # Aide-mémoire du DSN de production — jamais commité, jamais chargé.
 .env.production
+
+# Repo Android séparé (github.com/VahanLab/sunmap-android)
+/android/
