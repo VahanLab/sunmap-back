@@ -399,7 +399,12 @@ async fn assemble_grid(
 
     for tyi in y0..=y1 {
         for txi in x0..=x1 {
-            let tile = fetch_tile(state, ZOOM, txi, tyi).await?;
+            // Avec repli multi-zoom : hors pays à LiDAR ouvert (l'Italie
+            // s'arrête à z13), la tuile z15 est synthétisée depuis le premier
+            // ancêtre couvert au lieu de faire tomber la requête en 502.
+            let tile = dem::fetch_tile_or_ancestor(&state.http, &state.tiles, ZOOM, txi, tyi)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
             let ox = (txi - x0) as usize * TILE_SIZE;
             let oy = (tyi - y0) as usize * TILE_SIZE;
             for row in 0..TILE_SIZE {
@@ -1490,18 +1495,6 @@ async fn debug_ray(
         sunlit: !blocked && sun.is_up(),
         steps,
     }))
-}
-
-/// Tuile Mapterhorn décodée, via le cache partagé du process.
-async fn fetch_tile(
-    state: &AppState,
-    z: u32,
-    x: u32,
-    y: u32,
-) -> Result<Arc<Vec<f32>>, (StatusCode, String)> {
-    dem::fetch_tile(&state.http, &state.tiles, z, x, y)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e))
 }
 
 // ---------------------------------------------------------- établissements
