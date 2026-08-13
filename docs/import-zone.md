@@ -211,6 +211,17 @@ La purge est **totale sur la zone** : purger par nom d'hôte ou par préfixe
 est réservé aux offres Enterprise. Sans conséquence ici, `sunmap.tech` et
 `www` étant en « DNS only » (Vercel), les tuiles sont seules en cache.
 
+**Piège du répertoire d'isolate** (vécu à l'import UK) : le Worker garde le
+répertoire pmtiles en mémoire d'isolate (`ResolvedValueCache`), que ni le
+remplacement de l'archive ni la purge de zone n'invalident — le chemin
+« tuile absente » ne relit jamais R2, donc pas de garde-fou etag. Une
+requête arrivée entre l'upload et le recyclage de l'isolate peut alors
+recacher un **204 mensonger pour 24 h** dans le cache de zone. Si des tuiles
+présentes dans l'archive sortent en 204 après un import : `npx wrangler
+deploy` (recycle les isolates — Node ≥ 22), **puis re-purger**. Éviter
+surtout de sonder les nouvelles tuiles avant la fin de l'upload : c'est ce
+qui charge le vieux répertoire dans l'isolate.
+
 ## Limites connues
 
 - `tilegen` est borné en mémoire (buckets disque), mais `osmium`
