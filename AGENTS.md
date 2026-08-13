@@ -140,8 +140,13 @@ Fonctionnalités cibles :
 > mesure : **`docs/recherche-donnees-elevation.md`**. À lire avant d'envisager
 > de changer de source. Conclusion courte : aucun DSM public mondial n'est
 > assez fin (le meilleur gratuit est à 30 m), notre assemblage DEM + emprises
-> est l'état de l'art, mais **Mapterhorn s'arrête à z12 hors pays à LiDAR
-> ouvert** — le serveur y tombe en 502 aujourd'hui.
+> est l'état de l'art, mais **Mapterhorn s'arrête à z12-z13 hors pays à LiDAR
+> ouvert** (l'Italie s'arrête à z13). Le serveur s'y **replie** désormais sur
+> le premier zoom parent couvert (`dem::fetch_tile_or_ancestor`,
+> agrandissement bilinéaire) au lieu de tomber en 502 — relief moins fin, et
+> la base GLO-30 étant un DSM, bâtiments fondus dans le relief sous les
+> emprises OSM stampées. Le masque Metal client a la même limite de
+> couverture, sans repli à ce jour.
 
 - **Terrain (monde)** : tuiles DEM **Mapterhorn**
   (`https://tiles.mapterhorn.com/{z}/{x}/{y}.webp`, webp 512 px, encodage
