@@ -145,8 +145,9 @@ Fonctionnalités cibles :
 > le premier zoom parent couvert (`dem::fetch_tile_or_ancestor`,
 > agrandissement bilinéaire) au lieu de tomber en 502 — relief moins fin, et
 > la base GLO-30 étant un DSM, bâtiments fondus dans le relief sous les
-> emprises OSM stampées. Le masque Metal client a la même limite de
-> couverture, sans repli à ce jour.
+> emprises OSM stampées. Le masque Metal client porte le même repli
+> (`TerrariumLoader.tileOrAncestor`, port de `fetch_tile_or_ancestor`) —
+> les deux côtés doivent rester des miroirs.
 
 - **Terrain (monde)** : tuiles DEM **Mapterhorn**
   (`https://tiles.mapterhorn.com/{z}/{x}/{y}.webp`, webp 512 px, encodage
