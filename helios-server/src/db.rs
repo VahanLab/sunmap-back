@@ -336,14 +336,22 @@ pub async fn terrace_contributions(
     })
 }
 
-/// L'établissement existe-t-il ? Garde-fou avant d'accepter une contribution,
-/// pour ne pas accumuler des lignes orphelines sur des identifiants inventés.
-pub async fn place_exists(pool: &PgPool, osm_id: &str) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, i64>("SELECT count(*) FROM places WHERE osm_id = $1")
-        .bind(osm_id)
-        .fetch_one(pool)
-        .await
-        .map(|n| n > 0)
+/// Position du nœud d'un établissement, ou `None` s'il est inconnu — auquel
+/// cas la contribution est refusée, pour ne pas accumuler des lignes
+/// orphelines sur des identifiants inventés.
+///
+/// Le nœud OSM et pas une position déjà contribuée, qui ferait dériver le
+/// point de proche en proche à chaque correction.
+pub async fn place_coordinate(
+    pool: &PgPool,
+    osm_id: &str,
+) -> Result<Option<(f64, f64)>, sqlx::Error> {
+    sqlx::query_as::<_, (f64, f64)>(
+        "SELECT ST_Y(geom) AS lat, ST_X(geom) AS lng FROM places WHERE osm_id = $1",
+    )
+    .bind(osm_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Ajoute un banc ou une table de pique-nique contribué depuis l'app.

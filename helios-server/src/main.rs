@@ -1652,6 +1652,22 @@ struct TerraceReportBody {
     lng: Option<f64>,
 }
 
+/// Rayon maximal, en mètres, entre le nœud d'un établissement et la terrasse
+/// qu'on lui attribue. Doit rester aligné sur `ContentView.terraceMaxOffsetM`
+/// côté app, qui ferme le bouton avant l'envoi.
+const TERRACE_MAX_OFFSET_M: f64 = 50.0;
+
+/// Distance orthodromique en mètres. Formule sphérique : à cette échelle,
+/// l'aplatissement de l'ellipsoïde pèse moins que la précision du pointage.
+fn haversine_m(lat1: f64, lng1: f64, lat2: f64, lng2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let d_lat = (lat2 - lat1).to_radians();
+    let d_lng = (lng2 - lng1).to_radians();
+    let a = (d_lat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (d_lng / 2.0).sin().powi(2);
+    2.0 * EARTH_RADIUS_M * a.sqrt().asin()
+}
+
 #[derive(Serialize)]
 struct TerraceReportResponse {
     osm_id: String,
@@ -1682,14 +1698,33 @@ async fn report_terrace(
 
     // Refuse les identifiants inconnus, sinon la table se remplit de lignes
     // orphelines qu'aucune requête ne rattachera jamais à un établissement.
-    let exists = db::place_exists(&state.pool, &body.osm_id)
+    let anchor = db::place_coordinate(&state.pool, &body.osm_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("PostGIS : {e}")))?;
-    if !exists {
+    let Some((anchor_lat, anchor_lng)) = anchor else {
         return Err((
             StatusCode::NOT_FOUND,
             format!("établissement inconnu : {}", body.osm_id),
         ));
+    };
+
+    // Une terrasse appartient à son établissement : au-delà du rayon, ce n'est
+    // plus la même adresse. Le client borne déjà le pointage, mais une position
+    // contribuée prime sur le repli calculé — une valeur aberrante déplacerait
+    // durablement le point analysé, donc la garde doit aussi être ici.
+    if body.has_terrace {
+        if let (Some(lat), Some(lng)) = (body.lat, body.lng) {
+            let distance_m = haversine_m(anchor_lat, anchor_lng, lat, lng);
+            if distance_m > TERRACE_MAX_OFFSET_M {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "terrasse à {distance_m:.0} m de l'établissement, \
+                         maximum {TERRACE_MAX_OFFSET_M:.0} m"
+                    ),
+                ));
+            }
+        }
     }
 
     let report = db::TerraceReport {
@@ -3088,6 +3123,10 @@ struct TierPayload {
     label: &'static str,
     /// Contributions nécessaires pour l'atteindre.
     threshold: i64,
+    /// Rang dans le barème, à partir de 1 — « niveau 3 ».
+    level: usize,
+    /// Nombre total de paliers, pour « niveau 3 sur 5 ».
+    level_count: usize,
 }
 
 impl TierPayload {
@@ -3096,6 +3135,8 @@ impl TierPayload {
             key: tier.key(),
             label: tier.label(lang),
             threshold: tier.threshold(),
+            level: tier.level(),
+            level_count: tiers::Tier::COUNT,
         }
     }
 }
