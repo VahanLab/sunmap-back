@@ -58,6 +58,18 @@ impl Tier {
             .unwrap_or(Tier::Novice)
     }
 
+    /// Rang du palier dans le barème, **à partir de 1** — c'est un rang lu par
+    /// un humain, pas un index.
+    ///
+    /// Servi au client comme le libellé et le seuil : il ne reçoit que le
+    /// palier courant et le suivant, il n'a pas de quoi compter.
+    pub fn level(&self) -> usize {
+        Tier::ALL.iter().position(|t| t == self).unwrap_or(0) + 1
+    }
+
+    /// Nombre total de paliers, pour dire « niveau 3 sur 5 ».
+    pub const COUNT: usize = Tier::ALL.len();
+
     /// Palier suivant, ou `None` au sommet du barème.
     pub fn next(&self) -> Option<Tier> {
         match self {
@@ -219,6 +231,16 @@ mod tests {
         let p = Progress::of(-5);
         assert_eq!(p.tier, Tier::Novice);
         assert_eq!(p.count, 0);
+    }
+
+    #[test]
+    fn levels_are_one_based_and_ordered() {
+        assert_eq!(Tier::Novice.level(), 1);
+        assert_eq!(Tier::Established.level(), 3);
+        assert_eq!(Tier::Influential.level(), Tier::COUNT);
+        for pair in Tier::ALL.windows(2) {
+            assert_eq!(pair[1].level(), pair[0].level() + 1);
+        }
     }
 
     #[test]
