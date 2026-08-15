@@ -256,7 +256,7 @@ oblique (`node/123`), qui casserait le routage.
 |---|---|---|---|
 | `osm_id` | string | oui | `node/123`, `way/456`… doit exister dans `places` |
 | `has_terrace` | bool | oui | Prime sur le tag OSM, y compris pour le contredire |
-| `lat`, `lng` | f64 | non | Position de la terrasse. Ignorées si `has_terrace` est faux |
+| `lat`, `lng` | f64 | non | Position de la terrasse. Ignorées si `has_terrace` est faux. **Au plus 50 m du nœud de l'établissement** |
 
 ```bash
 curl -X POST http://localhost:8080/places/terrace \
@@ -269,7 +269,18 @@ curl -X POST http://localhost:8080/places/terrace \
 ```
 
 `404` si l'établissement est inconnu — sans quoi la table se remplirait de
-lignes orphelines. La contribution est stockée dans `place_terraces`, **table
+lignes orphelines.
+
+`400` si la position pointée est à plus de `TERRACE_MAX_OFFSET_M` (50 m) du
+nœud de l'établissement. Une terrasse appartient à son établissement : au-delà,
+ce n'est plus la même adresse — c'est l'autre bout de la place, ou le café d'en
+face. La garde est ici et pas seulement dans l'app parce qu'une position
+contribuée **prime sur le repli calculé** : une valeur aberrante déplace
+durablement le point analysé de l'établissement. Le rayon se mesure au nœud OSM
+et non à une position déjà contribuée, qui ferait dériver le point de proche en
+proche à chaque correction. L'app ferme déjà le bouton de validation au-delà du
+même rayon (`ContentView.terraceMaxOffsetM`) : les deux valeurs doivent rester
+alignées. La contribution est stockée dans `place_terraces`, **table
 séparée de `places`** : `bin/import` fait un upsert sur `places` à chaque
 réimport d'extrait OSM, ce qui effacerait toute colonne de contribution qu'on y
 aurait ajoutée.
@@ -410,9 +421,12 @@ vues.
   "contribution_count": 5,
   "tier": {
     "key": "budding", "label": "Contributeur en herbe",
-    "threshold": 3
+    "threshold": 3, "level": 2, "level_count": 5
   },
-  "next_tier": { "key": "established", "label": "Contributeur affirmé", "threshold": 10 },
+  "next_tier": {
+    "key": "established", "label": "Contributeur affirmé",
+    "threshold": 10, "level": 3, "level_count": 5
+  },
   "remaining_to_next": 5,
   "progress": 0.2857,
   "contributions": [
@@ -437,6 +451,12 @@ vues.
 Barème dans `src/tiers.rs` — **côté serveur et pas dans les clients** : les
 seuils bougeront avec l'usage, et une app déjà installée afficherait sinon
 l'ancien. Le client n'accroche son décor qu'à `key`, jamais au libellé traduit.
+
+`level` (à partir de **1**) et `level_count` disent où le palier se situe dans
+le barème : « niveau 3 sur 5 ». Servis pour la même raison que le libellé, plus
+une qui leur est propre — le client ne reçoit que le palier courant et le
+suivant, il n'a donc pas de quoi compter lui-même. Le nombre de paliers peut
+changer, et un rang déduit d'une liste locale deviendrait faux en silence.
 
 `next_tier` est absent au sommet du barème, `remaining_to_next` vaut alors `0` et
 `progress` vaut `1`.

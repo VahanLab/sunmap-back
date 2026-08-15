@@ -342,6 +342,41 @@ arbres à ±0,2 m.
   UniFFI / WASM) ; les dépendances vivent dans les binaires (serveur, CLI).
 - Langue du projet : commentaires et docs en français.
 
+## ⚠️ Rétrocompatibilité de l'API serveur
+
+**Toute modification de helios-server doit rester compatible avec les versions
+d'app déjà en ligne.** Une app installée n'est pas mise à jour parce qu'on
+déploie : le serveur sert en permanence des clients d'anciennes versions, et
+c'est le serveur qui doit s'y plier.
+
+Interdit sans plan de migration :
+
+- **retirer ou renommer un champ de réponse** qu'un client décode en
+  non-optionnel — un `Decodable` Swift échoue sur la clé manquante et fait
+  disparaître l'écran entier, pas seulement la valeur ;
+- **changer le type** d'un champ (`i64` → `string`, scalaire → objet) ;
+- **rendre obligatoire** un paramètre de requête jusque-là facultatif ;
+- **supprimer une route** ou changer sa méthode.
+
+Autorisé :
+
+- **ajouter** un champ de réponse : les décodeurs ignorent les clés inconnues.
+  Le nouveau champ doit être **optionnel côté client**, avec un repli explicite
+  pour les serveurs qui ne le servent pas encore ;
+- ajouter une route, ou un paramètre de requête facultatif ;
+- retirer un champ dont on a vérifié qu'**aucune version en ligne** ne le
+  décode en non-optionnel.
+
+**Un nouveau code d'erreur est aussi un changement de contrat.** Il ne casse
+pas le décodage, mais un ancien client tombe dans son `default:` et affiche un
+message générique — souvent « vérifiez votre connexion », qui accuse le réseau
+à tort. Refuser une requête que les versions en ligne acceptaient est une
+régression fonctionnelle même sans plantage : le décider en connaissance de
+cause, et le noter ici.
+
+Un champ optionnel de plus n'a jamais coûté cher ; un écran blanc sur toutes
+les installations d'une version, si.
+
 ## Sous-projets
 
 - **App iOS SunMap** : voir `ios/SunMap/AGENTS.md` pour l'architecture SwiftUI,
