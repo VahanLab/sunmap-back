@@ -1,0 +1,26 @@
+Im Hochsommer eine schattige Terrasse finden, oder im Frühling eine sonnige Bank für die ersten warmen Strahlen: SunMap beantwortet dieses einfache Bedürfnis, für das es bisher keine Lösung gab.
+
+Anhand des realen Sonnenstands und der Umgebung (Gebäude, Bäume, Berge) berechnet SunMap in Echtzeit die exakte Lage der Schlagschatten. Eine klare Information, direkt auf der Karte.
+
+In der Stadt: Café- und Restaurantterrassen, öffentliche Bänke, Kinderspielplätze, Street-Workout-Stationen — jeder Ort trägt sein Sonne-oder-Schatten-Abzeichen, zur Uhrzeit Ihrer Wahl.
+
+In der Natur: Ihr idealer Platz zum Biwakieren im Schatten, ein Picknicktisch in der Sonne, die Besonnung eines Hangs — Gelände und Vegetation werfen ihre Schatten genau wie die Stadt.
+
+Hauptfunktionen:
+
+Sonne und Schatten in Echtzeit: Gebäude, Bäume und Gelände berücksichtigt, jederzeit
+Vorausplanen: erfahren Sie, um wie viel Uhr ein Ort in den Schatten oder die Sonne wechselt
+Sonnenkompass: Aufgang, Untergang und Sonnenstand zur gewählten Uhrzeit
+Sonnenzeiten überall: Aufgang, Untergang und Golden Hour, überall auf der Welt
+
+Von der Schattenberechnung abgedeckte Länder: Frankreich, Belgien, Luxemburg, Schweiz, Italien, Spanien und das Vereinigte Königreich — weitere Länder folgen in Kürze. Überall sonst bleiben Sonnenkompass und Auf-/Untergangszeiten verfügbar.
+
+So funktioniert es:
+SunMap kombiniert die Sonnenbahn mit Gelände-, Gebäude- und Vegetationsdaten und projiziert die Schatten direkt auf die Karte. Eine Zeitleiste pro Ort zeigt die sonnigen und schattigen Stunden im Voraus — ohne vor Ort sein zu müssen.
+
+Ob Terrasse, Bank, Spielplatz oder Biwakplatz: SunMap liefert eine Information, die es sonst nirgends gibt — die genaue Besonnung eines Ortes, zu jedem Zeitpunkt.
+
+Sonne und Schatten vorausahnen, wo immer Sie sind.
+
+Nutzungsbedingungen
+https://sunmap.tech/de/terms

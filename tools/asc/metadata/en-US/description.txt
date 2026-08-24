@@ -1,0 +1,26 @@
+Finding a shaded terrace at the height of summer, or a sunlit bench in spring to enjoy the first warm rays: SunMap answers this simple need that had no solution until now.
+
+Using the sun's real position and the surrounding relief (buildings, trees, mountains), SunMap computes the exact location of cast shadows in real time. Clear information, right on the map.
+
+In the city: café and restaurant terraces, public benches, children's playgrounds, street workout stations — every spot carries its sun-or-shade badge, at the time you choose.
+
+In nature: your ideal spot for camping in the shade, a picnic table in the sun, the exposure of a hillside — terrain and vegetation cast their shadows just like the city does.
+
+Key features:
+
+Sun and shade, live: buildings, trees and terrain taken into account, at any moment
+Plan ahead: find out what time a spot switches to shade or to sun
+Sun compass: sunrise, sunset and the sun's position at the time you choose
+Sun times everywhere: sunrise, sunset and golden hour, anywhere on the globe
+
+Countries covered by shadow computation: France, Belgium, Luxembourg, Switzerland, Italy, Spain and the United Kingdom — more countries coming soon. Everywhere else, the sun compass and sunrise/sunset times remain available.
+
+How it works:
+SunMap combines the sun's trajectory with terrain, building and vegetation data to project shadows directly onto the map. A per-place timeline lets you see the sunny and shaded hours in advance, without waiting to be there.
+
+Whether you're picking a terrace, a bench, a playground or a camp spot, SunMap gives you information found nowhere else: a place's precise sun exposure, at any moment.
+
+Anticipate sun and shade, wherever you are.
+
+Terms of use
+https://sunmap.tech/en/terms

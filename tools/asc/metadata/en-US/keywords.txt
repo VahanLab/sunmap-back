@@ -1,0 +1,1 @@
+bench,picnic,map,terrain,bivouac,hiking,sunlight,exposure,street,workout,playground,shade

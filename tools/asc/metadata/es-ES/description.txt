@@ -1,0 +1,26 @@
+Encontrar una terraza a la sombra en pleno verano, o un banco al sol en primavera para disfrutar de los primeros rayos cálidos: SunMap responde a esta necesidad simple que hasta ahora no tenía solución.
+
+Gracias a la posición real del sol y al relieve circundante (edificios, árboles, montañas), SunMap calcula en tiempo real la ubicación exacta de las sombras proyectadas. Una información clara, directamente en el mapa.
+
+En la ciudad: terrazas de cafés y restaurantes, bancos públicos, parques infantiles, estaciones de street workout — cada lugar lleva su distintivo de sol o sombra, a la hora que elijas.
+
+En la naturaleza: tu sitio ideal para vivaquear a la sombra, una mesa de pícnic al sol, la exposición de una ladera — el relieve y la vegetación proyectan sus sombras igual que la ciudad.
+
+Funciones principales:
+
+Sol y sombra en directo: edificios, árboles y relieve tenidos en cuenta, en todo momento
+Anticípate: descubre a qué hora un lugar pasa a la sombra o al sol
+Brújula solar: amanecer, atardecer y posición del sol a la hora elegida
+Horarios de sol en todas partes: amanecer, atardecer y golden hour, en cualquier lugar del mundo
+
+Países cubiertos por el cálculo de sombras: Francia, Bélgica, Luxemburgo, Suiza, Italia, España y Reino Unido — pronto llegarán más países. En el resto del mundo, la brújula solar y los horarios de amanecer y atardecer siguen disponibles.
+
+Cómo funciona:
+SunMap combina la trayectoria solar con datos de relieve, edificación y vegetación para proyectar las sombras directamente sobre el mapa. Una línea de tiempo por lugar permite ver con antelación los momentos de sol y de sombra, sin esperar a estar allí.
+
+Ya sea para elegir una terraza, un banco, un parque infantil o un sitio de vivac, SunMap ofrece una información inédita: la exposición solar precisa de un lugar, en todo momento.
+
+Anticipa el sol y la sombra, estés donde estés.
+
+Condiciones de uso
+https://sunmap.tech/es/terms

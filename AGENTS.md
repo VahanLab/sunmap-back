@@ -106,7 +106,11 @@ Fonctionnalités cibles :
    - `GET /sunlit` + `POST /sunlit/batch`, `GET /places` (avec `sun_day`),
      `POST/PUT /places/furniture` + `GET /places/furniture/contributions`,
      `POST /places/terrace` + `GET /places/terrace/contributions`,
-     `GET /sun-hours`, `GET /trees`, `GET /debug/ray`, comptes/profils.
+     `GET /sun-hours`, `GET /trees`, `GET /debug/ray`, comptes/profils,
+     `GET /settings` (configuration poussée aux apps au lancement : style
+     Mapbox, jeton d'accès — rotation de clé — et politique de version par
+     plateforme, version obligatoire/disponible + URL de store ; valeurs dans
+     `MAPBOX_STYLE_URI`/`MAPBOX_ACCESS_TOKEN`/`IOS_*`/`ANDROID_*`).
 6. Géométrie OSM d'abord en **PostgreSQL/PostGIS** (plus d'Overpass au
    runtime — 5-20 s par bbox dense, 504 fréquents), puis **sortie de la base
    au profit de l'archive vectorielle** `sunmap.pmtiles` (2026-08) : les

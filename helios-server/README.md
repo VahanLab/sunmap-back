@@ -421,11 +421,11 @@ vues.
   "contribution_count": 5,
   "tier": {
     "key": "budding", "label": "Contributeur en herbe",
-    "threshold": 3, "level": 2, "level_count": 5
+    "threshold": 3, "level": 2, "level_count": 9
   },
   "next_tier": {
     "key": "established", "label": "Contributeur affirmé",
-    "threshold": 10, "level": 3, "level_count": 5
+    "threshold": 10, "level": 3, "level_count": 9
   },
   "remaining_to_next": 5,
   "progress": 0.2857,
@@ -452,8 +452,28 @@ Barème dans `src/tiers.rs` — **côté serveur et pas dans les clients** : les
 seuils bougeront avec l'usage, et une app déjà installée afficherait sinon
 l'ancien. Le client n'accroche son décor qu'à `key`, jamais au libellé traduit.
 
+Barème actuel — les **clés sont stables, les libellés non** : `innovator` et
+`influential` portaient « Novateur » et « Influent », ils portent aujourd'hui
+« Influenceur local » et « Influenceur ». Renommer une clé ferait retomber les
+apps installées sur leur icône générique.
+
+| Niveau | Clé | Libellé (fr) | Seuil |
+|---|---|---|---|
+| 1 | `novice` | Novice | 0 |
+| 2 | `budding` | Contributeur en herbe | 3 |
+| 3 | `established` | Contributeur affirmé | 10 |
+| 4 | `innovator` | Influenceur local | 25 |
+| 5 | `influential` | Influenceur | 60 |
+| 6 | `star_influencer` | Influenceur star | 120 |
+| 7 | `vip` | VIP | 250 |
+| 8 | `lover` | SunMap Lover | 500 |
+| 9 | `got` | SunMap GoT | 1 000 |
+
+`VIP`, `SunMap Lover` et `SunMap GoT` sont **identiques dans les cinq langues** :
+ce sont des noms propres du produit, pas des descriptions de rang.
+
 `level` (à partir de **1**) et `level_count` disent où le palier se situe dans
-le barème : « niveau 3 sur 5 ». Servis pour la même raison que le libellé, plus
+le barème. Servis pour la même raison que le libellé, plus
 une qui leur est propre — le client ne reçoit que le palier courant et le
 suivant, il n'a donc pas de quoi compter lui-même. Le nombre de paliers peut
 changer, et un rang déduit d'une liste locale deviendrait faux en silence.
@@ -674,6 +694,55 @@ appel direct depuis l'app :
 | `limit` | int | non | borné à 10 (défaut 10) |
 
 Erreurs : `503` service coupé, `502` amont injoignable ou non-200.
+
+### `GET /settings`
+
+Configuration poussée aux apps **à leur lancement** — fait basculer le parc
+installé sans mise à jour :
+
+```json
+{
+  "styleURI": "mapbox://styles/vahan-lab/cms3ojxhw00vy01sc3vfc2m2t",
+  "token": "pk.eyJ1Ijoi…",
+  "ios": {
+    "requiredVersion": "1.0",
+    "latestVersion": "1.2",
+    "storeURL": "itms-apps://apps.apple.com/app/id6796004778"
+  },
+  "android": {
+    "latestVersion": "1.1"
+  }
+}
+```
+
+- `styleURI` — style Mapbox à charger. Changer `MAPBOX_STYLE_URI` dans `.env`
+  et redémarrer suffit à rhabiller toutes les apps.
+- `token` — jeton d'accès Mapbox, pour la **rotation de clé** : distribuer un
+  nouveau `pk.…` via `MAPBOX_ACCESS_TOKEN`, laisser le parc le récupérer,
+  puis révoquer l'ancien côté Mapbox. **Jamais un jeton secret (`sk.…`)** :
+  tout ce qui passe ici est lisible par n'importe quel client.
+- `ios` / `android` — politique de version, chaque client ne lit que son bloc
+  (variables `IOS_*` / `ANDROID_*`). La comparaison se fait **côté client**,
+  numériquement par composant (« 1.10 » > « 1.9 »), avec sa propre version :
+  - en dessous de `requiredVersion` → écran de mise à jour **bloquant** (pas
+    de fermeture possible). À réserver aux versions qui font de vrais dégâts —
+    c'est un mur ;
+  - sinon, en dessous de `latestVersion` → mise à jour **proposée**, fermable ;
+  - `storeURL` — où télécharger. Le client iOS a un repli embarqué
+    (`itms-apps://apps.apple.com/app/id6796004778`) ; servir l'URL permet de
+    la corriger sans mise à jour, et c'est le seul canal tant que la fiche
+    Play Store Android n'existe pas.
+
+**Chaque champ est optionnel des deux côtés.** Non configuré côté serveur, il
+est absent de la réponse et le client garde sa valeur embarquée ; un client
+qui ne connaît pas un champ l'ignore. C'est ce qui laisse déployer serveur et
+apps dans n'importe quel ordre, et ajouter des réglages plus tard sans casser
+le parc (cf. « Rétrocompatibilité de l'API serveur », AGENTS.md racine).
+
+Protégé comme le reste par la clé d'API globale (`X-API-Key`) — filtre, pas
+secret : un jeton `pk.` se lit de toute façon dans le trafic Mapbox de
+n'importe quel client équipé d'un proxy. La valeur du service est la
+**réactivité de rotation**, pas la confidentialité.
 
 ### `GET /trees`
 

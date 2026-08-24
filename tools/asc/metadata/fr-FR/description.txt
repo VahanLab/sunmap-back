@@ -1,0 +1,26 @@
+Trouver une terrasse à l'ombre en plein été, ou un banc bien exposé au printemps pour profiter des premiers rayons chauds : SunMap répond à ce besoin simple mais jusqu'ici sans solution.
+
+Grâce à la position réelle du soleil et à la prise en compte du relief environnant (bâtiments, arbres, montagnes), SunMap calcule en temps réel l'emplacement exact des ombres portées. Une information claire, directement sur la carte.
+
+En ville : terrasses de cafés et restaurants, bancs publics, aires de jeux pour enfants, stations de street workout — chaque lieu porte sa pastille soleil ou ombre, à l'heure que vous choisissez.
+
+Dans la nature : votre site idéal pour bivouaquer à l'ombre, une table de pique-nique au soleil, l'exposition d'un versant — le relief et la végétation projettent leurs ombres comme en ville.
+
+Fonctionnalités principales :
+
+Ombre et soleil en direct : immeubles, arbres et relief pris en compte, à tout instant
+Anticipez les horaires : découvrez à quelle heure un lieu bascule à l'ombre ou au soleil
+Boussole solaire : lever, coucher et position du soleil à l'heure choisie
+Horaires d'ensoleillement partout : lever, coucher et golden hour, où que ce soit sur le globe
+
+Pays couverts par le calcul des ombres : France, Belgique, Luxembourg, Suisse, Italie, Espagne et Royaume-Uni — d'autres pays arrivent prochainement. Partout ailleurs, la boussole solaire et les horaires de lever et coucher restent disponibles.
+
+Fonctionnement :
+SunMap combine la trajectoire solaire et les données de relief, de bâti et de végétation pour projeter les ombres directement sur la carte. Une frise horaire par lieu permet de visualiser à l'avance les moments d'ombre et de soleil, sans attendre d'être sur place.
+
+Que ce soit pour choisir une terrasse, un banc, une aire de jeux ou un site de bivouac, SunMap fournit une information inédite : l'exposition solaire précise d'un lieu, à tout moment.
+
+Anticipez le soleil et l'ombre, où que vous soyez.
+
+Conditions générales d'utilisation
+https://sunmap.tech/fr/terms

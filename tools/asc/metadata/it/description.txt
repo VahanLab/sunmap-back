@@ -1,0 +1,26 @@
+Trovare una terrazza all'ombra in piena estate, o una panchina al sole in primavera per godersi i primi raggi caldi: SunMap risponde a questo bisogno semplice ma finora senza soluzione.
+
+Grazie alla posizione reale del sole e al rilievo circostante (edifici, alberi, montagne), SunMap calcola in tempo reale la posizione esatta delle ombre proiettate. Un'informazione chiara, direttamente sulla mappa.
+
+In città: terrazze di caffè e ristoranti, panchine pubbliche, parchi giochi per bambini, stazioni di street workout — ogni luogo porta il suo contrassegno sole o ombra, all'ora che scegli.
+
+Nella natura: il tuo posto ideale per bivaccare all'ombra, un tavolo da picnic al sole, l'esposizione di un versante — rilievo e vegetazione proiettano le loro ombre come la città.
+
+Funzionalità principali:
+
+Sole e ombra in diretta: edifici, alberi e rilievo presi in conto, in ogni momento
+Pianifica in anticipo: scopri a che ora un luogo passa all'ombra o al sole
+Bussola solare: alba, tramonto e posizione del sole all'ora scelta
+Orari del sole ovunque: alba, tramonto e golden hour, in qualsiasi punto del globo
+
+Paesi coperti dal calcolo delle ombre: Francia, Belgio, Lussemburgo, Svizzera, Italia, Spagna e Regno Unito — altri paesi in arrivo. Ovunque altrove restano disponibili la bussola solare e gli orari di alba e tramonto.
+
+Come funziona:
+SunMap combina la traiettoria solare con i dati di rilievo, edifici e vegetazione per proiettare le ombre direttamente sulla mappa. Una linea temporale per ogni luogo mostra in anticipo i momenti di sole e di ombra, senza aspettare di essere sul posto.
+
+Che si tratti di scegliere una terrazza, una panchina, un parco giochi o un posto per il bivacco, SunMap offre un'informazione inedita: l'esposizione solare precisa di un luogo, in ogni momento.
+
+Anticipa il sole e l'ombra, ovunque tu sia.
+
+Condizioni d'uso
+https://sunmap.tech/it/terms

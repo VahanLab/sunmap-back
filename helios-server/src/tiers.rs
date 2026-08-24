@@ -17,18 +17,26 @@ pub enum Tier {
     Novice,
     Budding,
     Established,
-    Innovator,
-    Influential,
+    LocalInfluencer,
+    Influencer,
+    StarInfluencer,
+    Vip,
+    Lover,
+    Got,
 }
 
 impl Tier {
     /// Dans l'ordre, du plus bas au plus haut.
-    pub const ALL: [Tier; 5] = [
+    pub const ALL: [Tier; 9] = [
         Tier::Novice,
         Tier::Budding,
         Tier::Established,
-        Tier::Innovator,
-        Tier::Influential,
+        Tier::LocalInfluencer,
+        Tier::Influencer,
+        Tier::StarInfluencer,
+        Tier::Vip,
+        Tier::Lover,
+        Tier::Got,
     ];
 
     /// Nombre de contributions à partir duquel le palier est atteint.
@@ -42,8 +50,12 @@ impl Tier {
             Tier::Novice => 0,
             Tier::Budding => 3,
             Tier::Established => 10,
-            Tier::Innovator => 25,
-            Tier::Influential => 60,
+            Tier::LocalInfluencer => 25,
+            Tier::Influencer => 60,
+            Tier::StarInfluencer => 120,
+            Tier::Vip => 250,
+            Tier::Lover => 500,
+            Tier::Got => 1_000,
         }
     }
 
@@ -72,54 +84,77 @@ impl Tier {
 
     /// Palier suivant, ou `None` au sommet du barème.
     pub fn next(&self) -> Option<Tier> {
-        match self {
-            Tier::Novice => Some(Tier::Budding),
-            Tier::Budding => Some(Tier::Established),
-            Tier::Established => Some(Tier::Innovator),
-            Tier::Innovator => Some(Tier::Influential),
-            Tier::Influential => None,
-        }
+        let i = self.level(); // `level` est 1-based : c'est déjà l'index du suivant.
+        Tier::ALL.get(i).copied()
     }
 
     /// Clé stable, pour que le client choisisse son icône et sa couleur sans
     /// dépendre du libellé traduit.
+    ///
+    /// **Une clé ne se renomme pas**, même quand le libellé change : les apps
+    /// déjà installées y accrochent leur icône, et une clé inconnue les fait
+    /// retomber sur un symbole générique. D'où `innovator` et `influential`,
+    /// hérités des libellés « Novateur » et « Influent » que ces deux paliers
+    /// portaient avant de devenir « Influenceur local » et « Influenceur ».
     pub fn key(&self) -> &'static str {
         match self {
             Tier::Novice => "novice",
             Tier::Budding => "budding",
             Tier::Established => "established",
-            Tier::Innovator => "innovator",
-            Tier::Influential => "influential",
+            Tier::LocalInfluencer => "innovator",
+            Tier::Influencer => "influential",
+            Tier::StarInfluencer => "star_influencer",
+            Tier::Vip => "vip",
+            Tier::Lover => "lover",
+            Tier::Got => "got",
         }
     }
 
+    /// Libellé traduit du palier.
+    ///
+    /// **`Vip`, `Lover` et `Got` ne se traduisent pas** : ce sont des noms
+    /// propres du produit, pas des descriptions de rang. Les décliner par
+    /// langue en ferait cinq titres différents pour une même distinction.
     pub fn label(&self, lang: Lang) -> &'static str {
+        match self {
+            Tier::Vip => return "VIP",
+            Tier::Lover => return "SunMap Lover",
+            Tier::Got => return "SunMap GoT",
+            _ => {}
+        }
         match (self, lang) {
             (Tier::Novice, Lang::Fr) => "Novice",
             (Tier::Budding, Lang::Fr) => "Contributeur en herbe",
             (Tier::Established, Lang::Fr) => "Contributeur affirmé",
-            (Tier::Innovator, Lang::Fr) => "Novateur",
-            (Tier::Influential, Lang::Fr) => "Influent",
+            (Tier::LocalInfluencer, Lang::Fr) => "Influenceur local",
+            (Tier::Influencer, Lang::Fr) => "Influenceur",
+            (Tier::StarInfluencer, Lang::Fr) => "Influenceur star",
             (Tier::Novice, Lang::En) => "Novice",
             (Tier::Budding, Lang::En) => "Budding contributor",
             (Tier::Established, Lang::En) => "Established contributor",
-            (Tier::Innovator, Lang::En) => "Innovator",
-            (Tier::Influential, Lang::En) => "Influential",
+            (Tier::LocalInfluencer, Lang::En) => "Local influencer",
+            (Tier::Influencer, Lang::En) => "Influencer",
+            (Tier::StarInfluencer, Lang::En) => "Star influencer",
             (Tier::Novice, Lang::Es) => "Novato",
             (Tier::Budding, Lang::Es) => "Contribuidor en ciernes",
             (Tier::Established, Lang::Es) => "Contribuidor consolidado",
-            (Tier::Innovator, Lang::Es) => "Innovador",
-            (Tier::Influential, Lang::Es) => "Influyente",
+            (Tier::LocalInfluencer, Lang::Es) => "Influyente local",
+            (Tier::Influencer, Lang::Es) => "Influyente",
+            (Tier::StarInfluencer, Lang::Es) => "Influyente estrella",
             (Tier::Novice, Lang::It) => "Novizio",
             (Tier::Budding, Lang::It) => "Contributore in erba",
             (Tier::Established, Lang::It) => "Contributore affermato",
-            (Tier::Innovator, Lang::It) => "Innovatore",
-            (Tier::Influential, Lang::It) => "Influente",
+            (Tier::LocalInfluencer, Lang::It) => "Influencer locale",
+            (Tier::Influencer, Lang::It) => "Influencer",
+            (Tier::StarInfluencer, Lang::It) => "Influencer star",
             (Tier::Novice, Lang::De) => "Neuling",
             (Tier::Budding, Lang::De) => "Angehender Beitragender",
             (Tier::Established, Lang::De) => "Etablierter Beitragender",
-            (Tier::Innovator, Lang::De) => "Innovator",
-            (Tier::Influential, Lang::De) => "Einflussreich",
+            (Tier::LocalInfluencer, Lang::De) => "Lokaler Influencer",
+            (Tier::Influencer, Lang::De) => "Influencer",
+            (Tier::StarInfluencer, Lang::De) => "Star-Influencer",
+            // Traités plus haut, quelle que soit la langue.
+            (Tier::Vip | Tier::Lover | Tier::Got, _) => unreachable!(),
         }
     }
 }
@@ -190,10 +225,16 @@ mod tests {
         assert_eq!(Tier::for_count(9), Tier::Budding);
         assert_eq!(Tier::for_count(10), Tier::Established);
         assert_eq!(Tier::for_count(24), Tier::Established);
-        assert_eq!(Tier::for_count(25), Tier::Innovator);
-        assert_eq!(Tier::for_count(59), Tier::Innovator);
-        assert_eq!(Tier::for_count(60), Tier::Influential);
-        assert_eq!(Tier::for_count(10_000), Tier::Influential);
+        assert_eq!(Tier::for_count(25), Tier::LocalInfluencer);
+        assert_eq!(Tier::for_count(59), Tier::LocalInfluencer);
+        assert_eq!(Tier::for_count(60), Tier::Influencer);
+        assert_eq!(Tier::for_count(119), Tier::Influencer);
+        assert_eq!(Tier::for_count(120), Tier::StarInfluencer);
+        assert_eq!(Tier::for_count(250), Tier::Vip);
+        assert_eq!(Tier::for_count(500), Tier::Lover);
+        assert_eq!(Tier::for_count(999), Tier::Lover);
+        assert_eq!(Tier::for_count(1_000), Tier::Got);
+        assert_eq!(Tier::for_count(10_000), Tier::Got);
     }
 
     #[test]
@@ -217,8 +258,8 @@ mod tests {
 
     #[test]
     fn top_tier_has_no_next() {
-        let p = Progress::of(100);
-        assert_eq!(p.tier, Tier::Influential);
+        let p = Progress::of(5_000);
+        assert_eq!(p.tier, Tier::Got);
         assert_eq!(p.next, None);
         assert_eq!(p.remaining, 0);
         assert!((p.fraction - 1.0).abs() < 1e-9);
@@ -237,9 +278,26 @@ mod tests {
     fn levels_are_one_based_and_ordered() {
         assert_eq!(Tier::Novice.level(), 1);
         assert_eq!(Tier::Established.level(), 3);
-        assert_eq!(Tier::Influential.level(), Tier::COUNT);
+        assert_eq!(Tier::Got.level(), Tier::COUNT);
         for pair in Tier::ALL.windows(2) {
             assert_eq!(pair[1].level(), pair[0].level() + 1);
+        }
+    }
+
+    #[test]
+    fn next_walks_the_whole_scale() {
+        for pair in Tier::ALL.windows(2) {
+            assert_eq!(pair[0].next(), Some(pair[1]));
+        }
+        assert_eq!(Tier::Got.next(), None);
+    }
+
+    #[test]
+    fn product_names_are_not_translated() {
+        for lang in [Lang::Fr, Lang::En, Lang::Es, Lang::It, Lang::De] {
+            assert_eq!(Tier::Vip.label(lang), "VIP");
+            assert_eq!(Tier::Lover.label(lang), "SunMap Lover");
+            assert_eq!(Tier::Got.label(lang), "SunMap GoT");
         }
     }
 

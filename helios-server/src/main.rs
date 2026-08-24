@@ -261,6 +261,7 @@ async fn main() {
         .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
         .route("/sun-hours", get(sun_hours))
         .route("/geocode", get(geocode))
+        .route("/settings", get(settings))
         .route("/debug/ray", get(debug_ray))
         .with_state(state);
 
@@ -3523,4 +3524,84 @@ async fn geocode(
     }
     println!("[geocode] « {query} » → amont, {} octets", body.len());
     Ok(([(CONTENT_TYPE, "application/json")], body))
+}
+
+// ---------------------------------------------------------------- settings
+
+#[derive(Serialize)]
+struct SettingsResponse {
+    /// Style Mapbox à charger (`mapbox://styles/…`). Absent si non configuré :
+    /// le client garde alors son style embarqué.
+    #[serde(rename = "styleURI", skip_serializing_if = "Option::is_none")]
+    style_uri: Option<String>,
+    /// Jeton d'accès Mapbox (pk.…, jamais un jeton secret sk.…). Absent si non
+    /// configuré : le client garde le jeton embarqué dans son binaire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// Versions d'app par plateforme — chaque client ne lit que son bloc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ios: Option<PlatformVersions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    android: Option<PlatformVersions>,
+}
+
+/// Politique de version d'une plateforme. Comparaison côté client, numérique
+/// par composant (« 1.10 » > « 1.9 ») avec sa propre version :
+/// en dessous de `required_version`, mise à jour **bloquante** (l'écran ne se
+/// ferme pas) ; sinon en dessous de `latest_version`, mise à jour proposée.
+#[derive(Serialize)]
+struct PlatformVersions {
+    #[serde(rename = "requiredVersion", skip_serializing_if = "Option::is_none")]
+    required_version: Option<String>,
+    #[serde(rename = "latestVersion", skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
+    /// Où télécharger — le client a un repli embarqué, mais servir l'URL
+    /// permet de la corriger sans mise à jour (précieux tant que la fiche
+    /// Play Store n'existe pas côté Android).
+    #[serde(rename = "storeURL", skip_serializing_if = "Option::is_none")]
+    store_url: Option<String>,
+}
+
+impl PlatformVersions {
+    /// Bloc d'une plateforme depuis l'environnement (`IOS_*` / `ANDROID_*`).
+    /// `None` si rien n'est configuré : le champ disparaît de la réponse.
+    fn from_env(prefix: &str) -> Option<Self> {
+        let env = |name: &str| {
+            std::env::var(format!("{prefix}_{name}")).ok().filter(|v| !v.is_empty())
+        };
+        let block = Self {
+            required_version: env("REQUIRED_VERSION"),
+            latest_version: env("LATEST_VERSION"),
+            store_url: env("STORE_URL"),
+        };
+        (block.required_version.is_some()
+            || block.latest_version.is_some()
+            || block.store_url.is_some())
+        .then_some(block)
+    }
+}
+
+/// `GET /settings` — configuration poussée aux apps à leur lancement.
+///
+/// Sert à faire basculer le parc installé sans mise à jour : changer de style
+/// Mapbox, distribuer un nouveau jeton d'accès après une rotation de clé, ou
+/// annoncer une version d'app disponible/obligatoire (blocs `ios`/`android`).
+/// Les valeurs viennent de l'environnement (`MAPBOX_STYLE_URI`,
+/// `MAPBOX_ACCESS_TOKEN`, `IOS_*`/`ANDROID_*` — cf. `.env.example`) — un
+/// changement = éditer `.env` et redémarrer, sans
+/// rebuild. Chaque champ est optionnel des deux côtés : un champ absent dit au
+/// client « garde ta valeur embarquée », ce qui laisse déployer serveur et
+/// apps dans n'importe quel ordre.
+///
+/// Protégé comme le reste par la clé d'API globale (`X-API-Key`) — filtre,
+/// pas secret : un jeton pk. Mapbox se lit de toute façon dans le trafic de
+/// n'importe quel client.
+async fn settings() -> Json<SettingsResponse> {
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    Json(SettingsResponse {
+        style_uri: env("MAPBOX_STYLE_URI"),
+        token: env("MAPBOX_ACCESS_TOKEN"),
+        ios: PlatformVersions::from_env("IOS"),
+        android: PlatformVersions::from_env("ANDROID"),
+    })
 }
