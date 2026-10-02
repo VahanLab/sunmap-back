@@ -334,6 +334,11 @@ arbres à ±0,2 m.
 - Android (Kotlin) après validation iOS.
 - Cumul annuel d'ensoleillement par point ("cette terrasse est au soleil
   220 jours par an à 12h").
+- **API B2B** (exposition solaire d'un point GPS ou d'une liste de 25, par clé
+  d'API — ce que fait l'appui long) : la page vitrine du site (`/api`) recueille
+  les demandes par courrier ; le backend est volontairement différé jusqu'à la
+  **première demande réelle**. Constats, contrat `/v1` prévu, plan validé et
+  procédure de reprise : **`docs/api-b2b.md`**.
 
 ## Conventions
 

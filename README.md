@@ -29,7 +29,7 @@ slider fluide sans une requête par cran.
 | [`cloudflare/`](cloudflare/) | Worker qui sert `sunmap.pmtiles` (sur R2) en `/{z}/{x}/{y}.mvt` pour le client. [README](cloudflare/README.md) |
 | [`scripts/`](scripts/) | Pipeline de données : extraction osmium, import d'une zone, envoi R2, purge de cache, allègement de modèles 3D. |
 | [`tools/asc/`](tools/asc/) | Fiche App Store (textes + captures, 5 langues) poussée par l'API App Store Connect. Node, zéro dépendance. [README](tools/asc/README.md) |
-| [`docs/`](docs/) | Déploiement OVH, procédure d'import de zone, format PMTiles, état de l'art des données d'élévation. |
+| [`docs/`](docs/) | Déploiement OVH, procédure d'import de zone, format PMTiles, état de l'art des données d'élévation, dossier de reprise de l'API B2B. |
 | `Dockerfile`, `docker-compose.yml` | Image de production et pile déployée sur la VM. |
 
 ### Présents localement, hors du dépôt
