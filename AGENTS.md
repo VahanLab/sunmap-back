@@ -107,6 +107,8 @@ Fonctionnalités cibles :
      `POST/PUT /places/furniture` + `GET /places/furniture/contributions`,
      `POST /places/terrace` + `GET /places/terrace/contributions`,
      `GET /sun-hours`, `GET /trees`, `GET /debug/ray`, comptes/profils,
+     exposition annuelle (`GET /buildings/at`, `/exposure/facade`,
+     `/exposure/point` — marché immobilier, cf. § « Exposition annuelle »),
      `GET /settings` (configuration poussée aux apps au lancement : style
      Mapbox, jeton d'accès — rotation de clé — et politique de version par
      plateforme, version obligatoire/disponible + URL de store ; valeurs dans
@@ -261,6 +263,28 @@ Fonctionnalités cibles :
   correction), historiques par lieu, comptes/pseudos/paliers.
 - Bitfield `sun_day` (slider sans réseau) et transmittance de canopée.
 
+## Exposition annuelle (marché immobilier)
+
+Combien de soleil direct reçoit sur l'année un appartement (façade × étage)
+ou un extérieur. Spec : `docs/superpowers/specs/2026-11-01-exposition-immobiliere-design.md`,
+API : `helios-server/README.md` § « Exposition annuelle ».
+
+- **Serveur seul juge**, comme le reste : façades dérivées de **notre archive**
+  (`facade.rs`, pur), profil agrégé par `exposure.rs` (pur), handlers dans
+  `exposure_api.rs` sur la même DSM et le même ray marching que `/places`.
+- **365 jours** d'une année de référence fixe, pas un échantillon : un jour
+  sur 7 s'écartait jusqu'à 34 min/jour de la vérité (bascules d'ombre de
+  bâtiments), et le calcul complet ne coûte que ~0,2 s par façade.
+- Étages **déduits de la hauteur** (l'archive ne garde pas
+  `building:levels`), corrigeables par le client (`levels`).
+- Murs mitoyens écartés, cours intérieures proposées.
+- `/places` n'embarque **pas** le profil annuel : un lieu ne le calcule que sur
+  demande (« Voir sur l'année » → `/exposure/point?place=`), à la position
+  exacte de `/places` (`place_position`, partagé — ne pas le dupliquer).
+- Clients iOS et Android uniquement (pas de web ni de PDF).
+- **Limite principale** : végétation feuillue toute l'année — le τ saisonnier
+  par `leaf_type` (backlog) devient prioritaire pour ce marché.
+
 ## Remontée vers OpenStreetMap
 
 Un compte peut être **lié à OSM** pour que les contributions corrigent la carte
@@ -330,7 +354,11 @@ arbres à ±0,2 m.
 ## Backlog (décidé mais volontairement différé)
 
 - **Végétation, suite** : hauteurs réelles de canopée (Meta/WRI CHM v2,
-  IGN MNH), τ saisonnier par `leaf_type` (feuillu d'hiver quasi transparent).
+  IGN MNH), τ saisonnier par `leaf_type` (feuillu d'hiver quasi transparent) —
+  **prioritaire pour l'exposition annuelle**, qui sous-estime le soleil
+  d'hiver derrière un feuillu.
+- Exposition annuelle, suite : `building:levels` conservé dans l'archive,
+  persistance/remontée OSM des corrections d'étages, partage d'un rapport.
 - Android (Kotlin) après validation iOS.
 - Cumul annuel d'ensoleillement par point ("cette terrasse est au soleil
   220 jours par an à 12h").

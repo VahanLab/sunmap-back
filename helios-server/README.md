@@ -331,6 +331,107 @@ du lieu regardé. Correct tant qu'on consulte sa propre ville — le cas dominan
 Une vraie résolution lat/lng → fuseau demanderait une base de fuseaux côté
 serveur (crate `tzf-rs` par exemple).
 
+### Exposition annuelle : `GET /buildings/at` · `/exposure/facade` · `/exposure/point`
+
+Combien de soleil direct reçoit, **sur toute l'année**, un appartement (une
+façade, un étage) ou un extérieur (jardin, cour, terrasse) — et à quelle heure.
+Pensé pour l'immobilier. Spec :
+`docs/superpowers/specs/2026-11-01-exposition-immobiliere-design.md`.
+
+Calcul sur **les 365 jours** d'une année de référence fixe (2027), tranches de
+10 min, même DSM et même ray marching que `/places`. Le résultat ne dépend pas
+de la date de la requête : cache mémoire (2 000 réponses) et
+`Cache-Control: public, max-age=86400`. Un jour sur 7 avait été envisagé, mais
+mesuré, il s'écartait jusqu'à 34 min/jour de la moyenne mensuelle dans une rue
+étroite — pour un gain inutile : une façade de 36 cases coûte ~0,2 s de CPU.
+
+#### `GET /buildings/at?lat=&lng=`
+
+Le bâtiment sous le doigt et ses façades proposables. Léger : ni DEM ni rayon.
+
+```json
+{
+  "id": "way/123456", "name": null,
+  "height_m": 21.0, "height_from_osm": false,
+  "levels": 6, "levels_estimated": true,
+  "facades": [
+    {"index": 0, "azimuth_deg": 172.4, "orientation": "S", "length_m": 18.2,
+     "courtyard": false, "line": [[48.85, 2.34], [48.85, 2.341]]}
+  ]
+}
+```
+
+- Bâtiment = la plus grande emprise de l'archive contenant le point.
+- Façades = anneaux découpés en portions quasi rectilignes (fusion sous 15°,
+  écartées sous 3 m), **cours comprises** (`courtyard`). `azimuth_deg` : normale
+  sortante ; `orientation` : `N NE E SE S SO O NO`.
+- **Murs mitoyens exclus** : façade dont la majorité des points, à 2 m du mur,
+  tombe dans un bâtiment voisin.
+- `levels` : déduit de la hauteur (`round((h − 3) / 3)`, l'inverse de la règle
+  d'import), toujours `levels_estimated: true` — l'archive ne garde pas
+  `building:levels`. Le client le corrige via `levels` sur la route suivante.
+
+#### `GET /exposure/facade?lat=&lng=&building=&facade=[&levels=][&tz=]`
+
+| Paramètre | Type | Obligatoire | Description |
+|---|---|---|---|
+| `lat`, `lng` | f64 | oui | Le point tapé (retrouve le bâtiment) |
+| `building` | string | oui | `id` reçu de `/buildings/at` — 409 s'il a changé |
+| `facade` | usize | oui | `index` reçu de `/buildings/at` |
+| `levels` | u32 | non | Correction du nombre d'étages, 1 à 60 |
+| `tz` | string | non | Fuseau IANA, défaut `Europe/Paris` |
+
+```json
+{
+  "building": "way/123456", "facade": 0, "levels": 7, "levels_estimated": false,
+  "columns": 3, "tz": "Europe/Paris", "vegetation_seasonal": false,
+  "cells": [{"level": 0, "column": 0, "blind": false, "profile": {"…": "…"}}]
+}
+```
+
+Grille étages × tronçons (`clamp(round(longueur / 8 m), 1, 6)` colonnes), toutes
+les cases en une réponse. Étage *n* observé à `n × 3 + 1,5 m` au-dessus du sol
+du bâtiment, à 2 m du mur. Soleil derrière la façade = ombre sans rayon.
+`blind: true` (sans `profile`) : case sous le toit d'un voisin accolé.
+
+#### `GET /exposure/point?lat=&lng=[&height=][&tz=]` · `?place=[&tz=]`
+
+Profil d'un point au sol (`height` 0 à 200 m, défaut 1,5) ou d'un lieu de
+`/places` (`place=node/123`) — à **la même position** que `/places`
+(`place_position` partagé : terrasse contribuée, mobilier tel quel, sinon
+recalage hors bâtiment). À n'appeler que sur demande (« Voir sur l'année ») :
+`/places` n'embarque pas ce profil.
+
+```json
+{"lat": 48.85, "lng": 2.34, "height": 1.5, "place": null,
+ "tz": "Europe/Paris", "vegetation_seasonal": false, "profile": {"…": "…"}}
+```
+
+#### `profile`
+
+```json
+{
+  "annual_avg_sunlit_minutes": 292, "annual_avg_daylight_minutes": 731,
+  "months": [
+    {"month": 1, "avg_sunlit_minutes": 74, "avg_daylight_minutes": 522,
+     "slots": [0, 0, 50, 100, 33]}
+  ]
+}
+```
+
+`slots` : 48 tranches de 30 min en **heure légale locale** (00:00 → 23:30), % du
+temps au soleil (0–100). Le changement d'heure est traité côté serveur
+(`chrono-tz`) : jours de 23 h et 25 h rangés dans leurs tranches locales.
+
+**Limites** : végétation feuillue toute l'année (`vegetation_seasonal: false`,
+soleil d'hiver derrière un feuillu sous-estimé) ; hauteurs parfois devinées ;
+relief lointain au-delà de la marge DSM.
+
+**Erreurs** propres à ces routes (nouvelles, aucun client existant ne les
+appelle) : 400 (bornes, `levels`, `height`, `tz`, ni `lat/lng` ni `place`), 404
+(pas de bâtiment, façade inexistante, lieu inconnu), 409 (`building` différent
+de celui trouvé au point), 502 (DEM).
+
 ### Mobilier urbain dans `/places`
 
 Les bancs (`amenity=bench`), les tables de pique-nique

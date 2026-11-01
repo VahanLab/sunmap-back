@@ -187,21 +187,26 @@ appelle, donc aucun contrat existant n'est modifié.
 
 ### Échantillonnage temporel
 
-- **Un jour sur 7** (52 jours) d'une **année de référence fixe** (2027, non
-  bissextile) : résultat indépendant de la date de requête, donc cachable ;
-  l'écart de position solaire d'une année à l'autre est négligeable.
+- **Les 365 jours** d'une **année de référence fixe** (2027, non bissextile) :
+  résultat indépendant de la date de requête, donc cachable ; l'écart de
+  position solaire d'une année à l'autre est négligeable.
 - Tranches de **10 min** (pas de `sun_day`), échantillonnées en leur milieu.
 - Chaque jour est parcouru de **minuit local à minuit local** (23 h ou 25 h les
   jours de bascule) ; chaque instant tombe dans sa tranche locale de 30 min.
-- **Précision vérifiée par test** : sur une scène synthétique (mur au sud,
-  rue étroite), l'échantillonnage 1/7 reste à moins de **5 min/jour** du
-  calcul sur 365 jours pour chaque moyenne mensuelle.
+- **Révisé à l'implémentation** : le brainstorming prévoyait un jour sur 7,
+  validé par un test de précision (< 5 min/jour). Le test a échoué : dans une
+  rue étroite, l'écart mensuel atteint 34 min/jour (12 min encore à un jour
+  sur 2) — une ombre de bâtiment bascule brutalement quand le soleil franchit
+  une ligne de toit, et les jours sautés ratent ces bascules. Mesuré en
+  release, le calcul complet coûte ~0,2 s de CPU pour 36 cases (780 000
+  rayons), réparti sur les cœurs : aucune raison d'approximer.
 
 ### Coût
 
-Point : 52 × ~70 tranches de jour ≈ 3 600 rayons. Façade 6 × 6 : ≈ 65 000
-rayons, dont la moitié écartée sans rayon (soleil dans le dos). Le poste
-dominant reste l'assemblage DSM (déjà mis en cache par le serveur).
+Point : 365 × ~70 tranches de jour ≈ 25 000 rayons. Façade 6 × 6 : ≈ 780 000
+rayons au pire (~0,2 s de CPU, parallélisé par case), la moitié environ
+écartée sans rayon (soleil dans le dos). L'assemblage DSM (tuiles DEM en
+cache serveur) reste du même ordre.
 
 ### Cache
 
@@ -269,6 +274,10 @@ corrections d'étages, remontée vers OSM, τ saisonnier.
   vs fournis ; point de départ hors de l'emprise ; sélection de la plus grande
   emprise contenant le point.
 - `exposure.rs` : classifieur « toujours au soleil » → soleil = durée du jour ;
-  jours de 23 h / 25 h correctement rangés ; moyennes mensuelles ;
-  **précision 1/7 vs 365 jours** sur DSM synthétique (< 5 min/jour).
+  jours de 23 h / 25 h correctement rangés ; moyennes mensuelles ; 365 jours
+  par défaut.
+- Calcul de bout en bout sans réseau : `find_target` sur `mini.pmtiles`, et
+  grille de façade sur une scène synthétique tamponnée par `stamp_buildings`
+  (soleil croissant avec l'étage face à un immeuble, façade nord sans soleil
+  en décembre).
 - Handlers : validation des paramètres (fonctions pures : bornes, `levels`, `tz`). Les handlers eux-mêmes demandent PostgreSQL et les tuiles DEM, et sont vérifiés à la main sur un serveur de dev.
