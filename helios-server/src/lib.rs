@@ -9,6 +9,7 @@ pub mod auth;
 pub mod canopy_tiles;
 pub mod db;
 pub mod dem;
+pub mod exposure;
 pub mod i18n;
 pub mod opening_hours;
 pub mod osm;
