@@ -117,12 +117,14 @@ fn check_tz(raw: Option<&str>) -> Result<Tz, ApiError> {
 
 // --------------------------------------------------------- bâtiment ciblé
 
-/// Le bâtiment sous un point et ses façades proposables (murs mitoyens
-/// écartés). L'index d'une façade est sa position dans `facades` : les deux
-/// routes le recalculent à l'identique depuis la même archive.
+/// Le bâtiment sous un point, ses façades proposables et ses murs mitoyens.
+/// L'index d'une façade est sa position dans `facades` : les deux routes le
+/// recalculent à l'identique depuis la même archive. Les murs mitoyens n'y
+/// entrent pas — les y mêler décalerait les index.
 struct Target {
     building: Building,
     facades: Vec<Facade>,
+    party_walls: Vec<Facade>,
 }
 
 fn find_target(vstore: &VectorStore, lat: f64, lng: f64) -> Result<Target, ApiError> {
@@ -148,11 +150,10 @@ fn find_target(vstore: &VectorStore, lat: f64, lng: f64) -> Result<Target, ApiEr
     let occupied = |x: f64, y: f64| neighbours.iter().any(|rings| facade::point_in_rings(rings, x, y));
 
     let mpp = facade::meters_per_px(lat);
-    let facades = facade::facades(&building)
+    let (party_walls, facades) = facade::facades(&building)
         .into_iter()
-        .filter(|f| !facade::is_party_wall(f, mpp, occupied))
-        .collect();
-    Ok(Target { building, facades })
+        .partition(|f| facade::is_party_wall(f, mpp, occupied));
+    Ok(Target { building, facades, party_walls })
 }
 
 // ---------------------------------------------------------- /buildings/at
@@ -175,6 +176,16 @@ struct FacadeDto {
     line: Vec<[f64; 2]>,
 }
 
+/// Mur collé à un voisin : pas de soleil à mesurer, mais il fait partie du
+/// volume que le client dessine.
+#[derive(Serialize)]
+struct PartyWallDto {
+    azimuth_deg: f64,
+    length_m: f64,
+    courtyard: bool,
+    line: Vec<[f64; 2]>,
+}
+
 #[derive(Serialize)]
 struct BuildingAtResponse {
     id: String,
@@ -186,6 +197,11 @@ struct BuildingAtResponse {
     /// nombre d'étages en est déduit. Le client le corrige via `levels`.
     levels_estimated: bool,
     facades: Vec<FacadeDto>,
+    /// Murs mitoyens, écartés de `facades`. Hors numérotation des façades.
+    party_walls: Vec<PartyWallDto>,
+    /// Emprise complète, anneaux `[lat, lng]` (extérieurs et cours, règle
+    /// pair-impair), murs mitoyens compris : le client en tire le volume.
+    footprint: Vec<Vec<[f64; 2]>>,
 }
 
 fn round1(v: f64) -> f64 {
@@ -219,6 +235,17 @@ pub(crate) async fn building_at(
                 line: f.line_latlng(),
             })
             .collect(),
+        party_walls: target
+            .party_walls
+            .iter()
+            .map(|f| PartyWallDto {
+                azimuth_deg: round1(f.azimuth_deg),
+                length_m: round1(f.length_m),
+                courtyard: f.courtyard,
+                line: f.line_latlng(),
+            })
+            .collect(),
+        footprint: b.rings.iter().map(|r| r.iter().map(|p| [p.0, p.1]).collect()).collect(),
     };
     let json = serde_json::to_string(&body).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(json_response(Arc::new(json)))

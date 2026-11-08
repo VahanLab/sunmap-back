@@ -357,7 +357,12 @@ Le bâtiment sous le doigt et ses façades proposables. Léger : ni DEM ni rayon
   "facades": [
     {"index": 0, "azimuth_deg": 172.4, "orientation": "S", "length_m": 18.2,
      "courtyard": false, "line": [[48.85, 2.34], [48.85, 2.341]]}
-  ]
+  ],
+  "party_walls": [
+    {"azimuth_deg": 82.0, "length_m": 12.5, "courtyard": false,
+     "line": [[48.85, 2.341], [48.8501, 2.341]]}
+  ],
+  "footprint": [[[48.85, 2.34], [48.85, 2.341], [48.8501, 2.341], [48.85, 2.34]]]
 }
 ```
 
@@ -366,7 +371,13 @@ Le bâtiment sous le doigt et ses façades proposables. Léger : ni DEM ni rayon
   écartées sous 3 m), **cours comprises** (`courtyard`). `azimuth_deg` : normale
   sortante ; `orientation` : `N NE E SE S SO O NO`.
 - **Murs mitoyens exclus** : façade dont la majorité des points, à 2 m du mur,
-  tombe dans un bâtiment voisin.
+  tombe dans un bâtiment voisin. Ils sont renvoyés à part dans `party_walls`
+  (mêmes champs, sans `index` ni `orientation`) : hors numérotation, sinon
+  l'`index` des façades — que `/exposure/facade` recalcule — se décalerait.
+- `footprint` : emprise complète, anneaux `[lat, lng]` (extérieurs et cours,
+  règle pair-impair), murs mitoyens compris — le client en tire le volume du
+  bâtiment. `party_walls` et `footprint` sont des ajouts : à décoder en
+  optionnel côté client.
 - `levels` : déduit de la hauteur (`round((h − 3) / 3)`, l'inverse de la règle
   d'import), toujours `levels_estimated: true` — l'archive ne garde pas
   `building:levels`. Le client le corrige via `levels` sur la route suivante.
