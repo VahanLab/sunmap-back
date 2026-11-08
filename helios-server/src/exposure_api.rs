@@ -125,6 +125,22 @@ struct Target {
     building: Building,
     facades: Vec<Facade>,
     party_walls: Vec<Facade>,
+    /// Bâtiments qui touchent l'emprise, en pixels monde : c'est sur eux que
+    /// se décident, à l'identique, murs mitoyens et cases aveugles.
+    neighbours: Vec<Neighbour>,
+}
+
+/// Voisin d'un bâtiment ciblé : son emprise exacte et sa hauteur.
+#[derive(Clone)]
+struct Neighbour {
+    rings: Vec<Vec<(f64, f64)>>,
+    height_m: f64,
+}
+
+impl Neighbour {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        facade::point_in_rings(&self.rings, x, y)
+    }
 }
 
 fn find_target(vstore: &VectorStore, lat: f64, lng: f64) -> Result<Target, ApiError> {
@@ -140,20 +156,20 @@ fn find_target(vstore: &VectorStore, lat: f64, lng: f64) -> Result<Target, ApiEr
     let (s, n) = points.clone().fold((f64::MAX, f64::MIN), |(s, n), p| (s.min(p.0), n.max(p.0)));
     let (w, e) = points.fold((f64::MAX, f64::MIN), |(w, e), p| (w.min(p.1), e.max(p.1)));
     let m = NEIGHBOUR_MARGIN_DEG;
-    let neighbours: Vec<Vec<Vec<(f64, f64)>>> = vstore
+    let neighbours: Vec<Neighbour> = vstore
         .buildings(s - m, w - m, n + m, e + m)
         .map_err(vtiles_err)?
         .iter()
         .filter(|b| b.osm_id != building.osm_id)
-        .map(facade::rings_px)
+        .map(|b| Neighbour { rings: facade::rings_px(b), height_m: b.height_m as f64 })
         .collect();
-    let occupied = |x: f64, y: f64| neighbours.iter().any(|rings| facade::point_in_rings(rings, x, y));
+    let occupied = |x: f64, y: f64| neighbours.iter().any(|n| n.contains(x, y));
 
     let mpp = facade::meters_per_px(lat);
     let (party_walls, facades) = facade::facades(&building)
         .into_iter()
         .partition(|f| facade::is_party_wall(f, mpp, occupied));
-    Ok(Target { building, facades, party_walls })
+    Ok(Target { building, facades, party_walls, neighbours })
 }
 
 // ---------------------------------------------------------- /buildings/at
@@ -410,10 +426,11 @@ pub(crate) async fn facade_exposure(
     let started = std::time::Instant::now();
     let scene = assemble_scene(&state, q.lat, q.lng).await?;
     let building = target.building;
+    let neighbours = target.neighbours;
     let building_id = building.osm_id.clone();
     let columns = chosen.columns();
     let body = tokio::task::spawn_blocking(move || {
-        compute_facade(&scene, &building, &chosen, levels, tz)
+        compute_facade(&scene, &building, &neighbours, &chosen, levels, tz)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("calcul : {e}")))?;
@@ -442,7 +459,14 @@ pub(crate) async fn facade_exposure(
 
 /// Toutes les cases d'une façade, réparties sur les cœurs disponibles :
 /// ~0,2 s de CPU pour 36 cases × 365 jours, autant ne pas les enchaîner.
-fn compute_facade(scene: &Scene, building: &Building, chosen: &Facade, levels: u32, tz: Tz) -> Vec<CellDto> {
+fn compute_facade(
+    scene: &Scene,
+    building: &Building,
+    neighbours: &[Neighbour],
+    chosen: &Facade,
+    levels: u32,
+    tz: Tz,
+) -> Vec<CellDto> {
     let days = sampled_days(tz, REFERENCE_YEAR, DEFAULT_DAY_STRIDE);
     let (wx, wy) = chosen.line_px[chosen.line_px.len() / 2];
     let (lat, lng) = latlon_of_world_px(wx, wy);
@@ -466,8 +490,17 @@ fn compute_facade(scene: &Scene, building: &Building, chosen: &Facade, levels: u
     // Points d'observation dans la DSM. Si la rasterisation déborde du mur
     // (cellule de ~1,6 m), on s'écarte encore d'une cellule à la fois : un
     // rayon parti du dedans de son propre immeuble ne verrait jamais le jour.
-    let columns: Vec<(f64, f64)> = chosen
-        .observation_points(facade::meters_per_px(lat))
+    let observation = chosen.observation_points(facade::meters_per_px(lat));
+    // Hauteur du voisin qui occupe chaque point d'observation, sur son emprise
+    // exacte : le même test que `is_party_wall`, et non la DSM pixelisée
+    // (~1,6 m), qui avalait un passage de 2 m entre deux bâtiments.
+    let blocker: Vec<Option<f64>> = observation
+        .iter()
+        .map(|&(x, y)| {
+            neighbours.iter().filter(|n| n.contains(x, y)).map(|n| n.height_m).reduce(f64::max)
+        })
+        .collect();
+    let columns: Vec<(f64, f64)> = observation
         .into_iter()
         .map(|(x, y)| {
             let (mut px, mut py) = scene.local(x, y);
@@ -490,16 +523,15 @@ fn compute_facade(scene: &Scene, building: &Building, chosen: &Facade, levels: u
         let handles: Vec<_> = cells
             .chunks(chunk)
             .map(|part| {
-                let (days, suns, columns) = (&days, &suns, &columns);
+                let (days, suns, columns, blocker) = (&days, &suns, &columns, &blocker);
                 s.spawn(move || {
                     part.iter()
                         .map(|&(level, column)| {
                             let (px, py) = columns[column];
                             let height = facade::level_height_m(level);
-                            // Fenêtre impossible : sous le toit d'un voisin
-                            // accolé, plus haut que cet étage.
-                            let blind = scene.owner_at(px, py).is_some_and(|b| b.osm_id != building.osm_id)
-                                && scene.dsm.sample(px, py).is_some_and(|top| top as f64 >= ground as f64 + height);
+                            // Fenêtre impossible : le point d'observation est
+                            // dans un voisin accolé, plus haut que cet étage.
+                            let blind = blocker[column].is_some_and(|top| top >= height);
                             let profile = (!blind).then(|| {
                                 point_profile(scene, days, suns, (px, py), ground, height, Some(chosen))
                             });
@@ -718,8 +750,9 @@ mod tests {
         let facades = facade::facades(&target);
         let pick = |label| facades.iter().find(|f| facade::orientation_label(f.azimuth_deg) == label).unwrap();
         let tz = exposure::DEFAULT_TZ;
-        let south = compute_facade(&scene, &target, pick("S"), 7, tz);
-        let north_cells = compute_facade(&scene, &target, pick("N"), 7, tz);
+        let neighbours = neighbours_of(&target, &scene.buildings);
+        let south = compute_facade(&scene, &target, &neighbours, pick("S"), 7, tz);
+        let north_cells = compute_facade(&scene, &target, &neighbours, pick("N"), 7, tz);
 
         assert_eq!(south.len(), 7 * 3);
         assert!(south.iter().all(|c| !c.blind && c.profile.is_some()));
@@ -740,5 +773,84 @@ mod tests {
         let december = |c: &CellDto| c.profile.as_ref().unwrap().months[11].avg_sunlit_minutes;
         assert!(north_cells.iter().all(|c| december(c) == 0));
         assert!(north_cells.iter().any(|c| c.profile.as_ref().unwrap().months[5].avg_sunlit_minutes > 60));
+    }
+
+    /// Voisins de `target` parmi `buildings`, comme `find_target` les monte.
+    fn neighbours_of(target: &Building, buildings: &[Building]) -> Vec<Neighbour> {
+        buildings
+            .iter()
+            .filter(|b| b.osm_id != target.osm_id)
+            .map(|b| Neighbour { rings: facade::rings_px(b), height_m: b.height_m as f64 })
+            .collect()
+    }
+
+    /// Cases aveugles et murs mitoyens se décident sur la même emprise exacte :
+    /// un voisin accolé sur un tiers de la façade n'aveugle que son tronçon, et
+    /// seulement jusqu'à sa hauteur ; un voisin de l'autre côté d'un passage de
+    /// 3 m n'aveugle rien, même si la DSM (~1,6 m) l'en rapproche.
+    #[test]
+    fn blind_cells_follow_exact_neighbour_footprints() {
+        const LAT: f64 = 48.85;
+        const LNG: f64 = 2.35;
+        let north = |m: f64| m / 111_320.0;
+        let east = |m: f64| m / (111_320.0 * LAT.to_radians().cos());
+        let rect = |x0: f64, y0: f64, w: f64, h: f64| {
+            vec![
+                (LAT + north(y0), LNG + east(x0)),
+                (LAT + north(y0), LNG + east(x0 + w)),
+                (LAT + north(y0 + h), LNG + east(x0 + w)),
+                (LAT + north(y0 + h), LNG + east(x0)),
+                (LAT + north(y0), LNG + east(x0)),
+            ]
+        };
+        let building = |id: &str, ring, height| Building {
+            osm_id: id.into(),
+            name: None,
+            rings: vec![ring],
+            height_m: height,
+            height_from_osm: true,
+            leaf_type: None,
+        };
+        // Immeuble de 4 étages, 24 m est-ouest × 24 m nord-sud : 3 tronçons
+        // sur chaque façade.
+        let target = building("way/1", rect(0.0, 0.0, 24.0, 24.0), 15.0);
+        // Accolé à l'est sur le tiers sud de la façade (y 0 → 8), 6 m de haut.
+        let attached = building("way/2", rect(24.0, 0.0, 10.0, 8.0), 6.0);
+        // À l'ouest, de l'autre côté d'un passage de 3 m, 30 m de haut.
+        let across = building("way/3", rect(-13.0, 0.0, 10.0, 24.0), 30.0);
+        let buildings = vec![target.clone(), attached, across];
+
+        let mpp = facade::meters_per_px(LAT);
+        let terrain = Dsm::flat(300, 300, mpp, 35.0);
+        let (cx, cy) = world_px(LAT, LNG);
+        let (origin_x, origin_y) = (cx.floor() - 150.0, cy.floor() - 150.0);
+        let mut dsm = terrain.clone();
+        let mut owner = vec![OWNER_TERRAIN; 300 * 300];
+        stamp_buildings(&mut dsm, &terrain, &mut owner, origin_x, origin_y, &buildings, GroundRef::BboxCenter);
+        let max_elevation = dsm.max_elevation();
+        let scene = Scene { dsm, terrain, owner, buildings: Arc::new(buildings), origin_x, origin_y, max_elevation };
+        let neighbours = neighbours_of(&target, &scene.buildings);
+
+        let facades = facade::facades(&target);
+        let pick = |label| facades.iter().find(|f| facade::orientation_label(f.azimuth_deg) == label).unwrap();
+        let tz = exposure::DEFAULT_TZ;
+
+        // Est : un tronçon sur trois touche le voisin, pas la majorité — la
+        // façade reste proposable, et son seul tronçon accolé est aveugle tant
+        // que le voisin dépasse l'étage (6 m : fenêtres à 1,5 et 4,5 m).
+        let east_facade = pick("E");
+        let occupied = |x: f64, y: f64| neighbours.iter().any(|n| n.contains(x, y));
+        assert!(!facade::is_party_wall(east_facade, mpp, occupied));
+        let cells = compute_facade(&scene, &target, &neighbours, east_facade, 4, tz);
+        let blind: Vec<(u32, usize)> = cells.iter().filter(|c| c.blind).map(|c| (c.level, c.column)).collect();
+        assert_eq!(blind.len(), 2, "{blind:?}");
+        assert!(blind.iter().all(|&(level, _)| level < 2), "{blind:?}");
+        let column = blind[0].1;
+        assert!(blind.iter().all(|&(_, c)| c == column), "{blind:?}");
+        assert!(cells.iter().filter(|c| !c.blind).all(|c| c.profile.is_some()));
+
+        // Ouest : le passage de 3 m garde chaque fenêtre mesurable.
+        let west = compute_facade(&scene, &target, &neighbours, pick("O"), 4, tz);
+        assert!(west.iter().all(|c| !c.blind && c.profile.is_some()));
     }
 }

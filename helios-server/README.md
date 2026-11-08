@@ -403,7 +403,13 @@ Le bâtiment sous le doigt et ses façades proposables. Léger : ni DEM ni rayon
 Grille étages × tronçons (`clamp(round(longueur / 8 m), 1, 6)` colonnes), toutes
 les cases en une réponse. Étage *n* observé à `n × 3 + 1,5 m` au-dessus du sol
 du bâtiment, à 2 m du mur. Soleil derrière la façade = ombre sans rayon.
-`blind: true` (sans `profile`) : case sous le toit d'un voisin accolé.
+`blind: true` (sans `profile`) : case sous le toit d'un voisin accolé — son
+point d'observation (à 2 m du mur) tombe dans l'**emprise exacte** d'un voisin
+plus haut que l'étage. C'est le même test, sur la même emprise, que celui des
+murs mitoyens de `/buildings/at` : une façade y est mitoyenne quand la majorité
+de ses cases de rez-de-chaussée seraient aveugles. La DSM pixelisée (~1,6 m) ne
+sert pas à cette décision : elle avalait un passage de 2 à 3 m entre deux
+bâtiments et rendait aveugle un tronçon pourtant libre devant lui.
 
 #### `GET /exposure/point?lat=&lng=[&height=][&tz=]` · `?place=[&tz=]`
 
