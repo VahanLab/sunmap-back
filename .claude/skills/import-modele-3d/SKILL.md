@@ -45,7 +45,7 @@ si `vertices` ≈ `triangles` dans `inspect`, la topologie est éclatée.
 modèle. Le constater, le dire, et prendre le gain partiel — ne pas s'acharner
 sur les réglages.
 
-### Diorama texturé : cuire la texture en couleurs de sommet
+### Diorama texturé : simplifier sans les UV, puis recuire la texture
 
 Autre plafond, autre cause : un **atlas de texture découpé en mille cartes**
 (diorama Meshy de l'aire de jeux, 1,76 M triangles → plafond à 16 000 même en
@@ -54,23 +54,43 @@ meshoptimizer refuse de les franchir. Les franchir de force — flag
 `Permissive` ou `simplifySloppy` — **brouille la texture** : les UV
 interpolés tombent n'importe où dans l'atlas.
 
-Remède : `ios/SunMap/scripts/bake-diorama.mjs` — échantillonne la texture,
-la moyenne sur les sommets **fusionnés par position** (les coutures
-disparaissent avec les UV), simplifie position + couleur, et sort des
-triangles à normales plates avec `COLOR_0`, **sans texture**. 4 000 triangles
-en 475 Ko, 1 500 en 178 Ko. Il coupe aussi le **socle** du diorama (la dalle
-sous le sol, invisible sur une carte) et tasse la hauteur (`YSCALE`) quand
-les proportions du diorama sont exagérées.
+Remède : `ios/SunMap/scripts/bake-diorama.mjs` — fusionne les sommets **par
+position** (les coutures disparaissent avec les UV), simplifie position +
+couleur moyenne, puis **recuit une texture neuve** : une case de 8 × 8 px par
+triangle simplifié, chaque texel prenant la couleur du triangle d'origine le
+plus proche (grille de recherche, en préférant ceux qui regardent du même
+côté). Triangles à normales plates, **indexés**. Il coupe aussi le **socle**
+du diorama (la dalle sous le sol, invisible sur une carte) et tasse la hauteur
+(`YSCALE`) quand les proportions du diorama sont exagérées. Aire de jeux :
+14 972 triangles + texture 1 024 px en 2,2 Mo (proche), 2 960 + 512 px en
+480 Ko (loin) — du même ordre que les autres modèles proches.
+
+**Le budget de triangles se juge sur les pièces fines**, pas sur la
+silhouette. À 4 000, l'aire de jeux gardait sa forme mais les chaînes des
+balançoires avaient disparu : assises flottant en l'air. Les pièces fines
+partent les premières à la simplification ; les chercher à l'œil sur le rendu,
+de près.
+
+**Ce qui a été essayé et ne marche pas** :
+- couleurs de sommet (`COLOR_0`) — Mapbox (11.17) les ignore, le modèle sort
+  **gris** ;
+- une couleur unie par triangle (texture palette) — Mapbox l'affiche, mais en
+  facettes criardes, tout le détail de la texture Meshy est perdu.
+
+**Ce que Mapbox (11.17) n'accepte pas** :
+- une primitive **non indexée** → SIGSEGV dans `MapboxCoreMaps` dès
+  l'enregistrement du modèle, sans aucune frame de l'app dans la pile ;
+- des **couleurs de sommet**, cf. ci-dessus.
+
+Un aperçu three.js ne voit ni l'un ni l'autre : il rend les deux sans broncher.
+Avant de câbler, comparer la structure du `.glb` à celle d'un modèle qui marche
+(`bench.glb` : indices, `POSITION`/`NORMAL`/`TEXCOORD_0`, texture de
+`baseColor`). Un build qui passe ne prouve rien ici : le crash n'arrive qu'au
+lancement — le dire au développeur quand on lui rend la main.
 
 À l'entrée, le `.glb` passé par `optimize` + `resize` 1024. Trouver le plan du
 sol : histogramme des hauteurs des triangles horizontaux, pondéré par l'aire —
-le sol est le pic non nul juste au-dessus de la face inférieure. Le rendu
-s'évalue **avant** de câbler : page three.js avec les `.glb` en base64,
-capturée par Chrome headless (cf. mémoire projet), le navigateur intégré ne
-lisant pas le scratchpad.
-
-Pour un modèle sans texture, le lointain se dégrade plus vite : 1 000
-triangles effondraient la silhouette de l'aire de jeux, 1 500 la tiennent.
+le sol est le pic non nul juste au-dessus de la face inférieure.
 
 ## 2. Deux modèles : proche et loin
 
