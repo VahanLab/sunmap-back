@@ -37,3 +37,4 @@ sqlx = { version = "0.8", default-features = false, features = [
     # démarrage : un déploiement ne peut pas oublier une évolution de schéma.
     "migrate",
 ] }
+chrono-tz = "0.10"

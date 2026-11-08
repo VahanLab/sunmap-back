@@ -34,6 +34,8 @@ use helios_server::osm_api;
 use helios_server::osm_push;
 use helios_server::username;
 
+mod exposure_api;
+
 /// Emprises déjà lues en base pour une bbox de tuiles donnée. PostGIS répond
 /// en quelques ms, mais la même fenêtre est redemandée à chaque tick du slider
 /// et le cache évite surtout de refaire le parsing WKT.
@@ -80,6 +82,8 @@ struct AppState {
     /// ce qu'une app dans chaque poche ne peut pas garantir, et qu'un proxy
     /// central garantit par construction.
     geocode_gate: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// Profils annuels déjà calculés (`/exposure/*`), cf. `exposure_api`.
+    exposure_cache: exposure_api::ExposureCache,
 }
 
 /// Charge `helios-server/.env`, quel que soit l'endroit d'où l'on lance.
@@ -195,6 +199,7 @@ async fn main() {
         places_results: RwLock::new(HashMap::new()),
         geocode_cache: RwLock::new(HashMap::new()),
         geocode_gate: tokio::sync::Mutex::new(None),
+        exposure_cache: exposure_api::ExposureCache::default(),
         // `filter` : docker-compose passe la variable vide quand elle n'est
         // pas définie dans `.env` — vide vaut absente. Mourir plutôt que
         // démarrer sans géométrie : un serveur sans archive classerait tout
@@ -260,6 +265,9 @@ async fn main() {
         .route("/trees", get(trees))
         .route("/canopy/{z}/{x}/{y}", get(canopy_tile))
         .route("/sun-hours", get(sun_hours))
+        .route("/buildings/at", get(exposure_api::building_at))
+        .route("/exposure/facade", get(exposure_api::facade_exposure))
+        .route("/exposure/point", get(exposure_api::point_exposure))
         .route("/geocode", get(geocode))
         .route("/settings", get(settings))
         .route("/debug/ray", get(debug_ray))
@@ -1215,6 +1223,48 @@ async fn sun_hours(
         total_night_minutes,
         intervals,
     }))
+}
+
+
+/// Mobilier urbain : cartographié à sa position réelle, jamais recalé.
+fn is_furniture(amenity: Option<&str>) -> bool {
+    matches!(amenity, Some("bench" | "picnic_table" | "playground" | "fitness_station"))
+}
+
+/// Où mesurer le soleil d'un lieu, en pixels de la DSM : `(px, py, déplacement
+/// en mètres depuis le nœud OSM)`. Partagé par `/places` et
+/// `/exposure/point?place=` — le profil annuel doit porter sur le même point
+/// que la classification du jour, sinon les deux se contrediraient.
+///
+/// - Une terrasse située par un utilisateur est prise telle quelle : il l'a
+///   pointée sur la carte, donc elle est déjà au bon endroit. La rectifier
+///   avec `nudge_out_of_building` détruirait justement la précision qu'on lui
+///   a demandée — une terrasse sous arcade ou adossée à la façade se
+///   retrouverait déplacée au milieu de la rue.
+/// - Un banc, une table de pique-nique ou une aire de jeux est cartographié à
+///   sa position réelle : le recalage hors bâtiment, pensé pour des nœuds
+///   d'établissement posés sur leur immeuble, ne ferait que déplacer un
+///   meuble déjà bien placé.
+/// - Sinon le nœud OSM est presque toujours posé sur le bâtiment et non sur
+///   la terrasse : on le ramène sur le sol libre voisin (12 m max).
+fn place_position(
+    p: &helios_server::osm::Place,
+    terrace: Option<(f64, f64)>,
+    dsm: &Dsm,
+    owner: &[u32],
+    origin_x: f64,
+    origin_y: f64,
+) -> (f64, f64, f64) {
+    let (osm_wx, osm_wy) = world_px(p.lat, p.lng);
+    match terrace {
+        Some((lat, lng)) => {
+            let (tx, ty) = world_px(lat, lng);
+            let moved = ((tx - osm_wx).hypot(ty - osm_wy)) * dsm.meters_per_pixel;
+            (tx - origin_x, ty - origin_y, moved)
+        }
+        None if is_furniture(p.amenity.as_deref()) => (osm_wx - origin_x, osm_wy - origin_y, 0.0),
+        None => nudge_out_of_building(dsm, owner, osm_wx - origin_x, osm_wy - origin_y, 8),
+    }
 }
 
 /// Déplace un point tombé *dans* une emprise bâtie vers le sol libre le plus
@@ -2204,34 +2254,8 @@ async fn places(
         .map(|p| {
             let report = reports.get(&p.osm_id);
             let terrace = report.and_then(|r| Some((r.lat?, r.lng?)));
-            let (osm_wx, osm_wy) = world_px(p.lat, p.lng);
-
-            // Une terrasse située par un utilisateur est prise telle quelle :
-            // il l'a pointée sur la carte, donc elle est déjà au bon endroit.
-            // La rectifier avec `nudge_out_of_building` détruirait justement la
-            // précision qu'on lui a demandée — une terrasse sous arcade ou
-            // adossée à la façade se retrouverait déplacée au milieu de la rue.
-            // Un banc, une table de pique-nique ou une aire de jeux est
-            // cartographié à sa position réelle : le recalage hors bâtiment,
-            // pensé pour des nœuds d'établissement posés sur leur immeuble,
-            // ne ferait que déplacer un meuble déjà bien placé.
-            let is_furniture = matches!(
-                p.amenity.as_deref(),
-                Some("bench" | "picnic_table" | "playground" | "fitness_station")
-            );
-            let (px, py, moved_m) = match terrace {
-                Some((lat, lng)) => {
-                    let (tx, ty) = world_px(lat, lng);
-                    let moved = ((tx - osm_wx).hypot(ty - osm_wy)) * dsm.meters_per_pixel;
-                    (tx - origin_x, ty - origin_y, moved)
-                }
-                None if is_furniture => (osm_wx - origin_x, osm_wy - origin_y, 0.0),
-                // Sinon le nœud OSM est presque toujours posé sur le bâtiment
-                // et non sur la terrasse : on le ramène sur le sol libre
-                // voisin (12 m max).
-                None => nudge_out_of_building(&dsm, &owner, osm_wx - origin_x,
-                                              osm_wy - origin_y, 8),
-            };
+            let is_furniture = is_furniture(p.amenity.as_deref());
+            let (px, py, moved_m) = place_position(p, terrace, &dsm, &owner, origin_x, origin_y);
             let ground = terrain_only.sample(px, py).unwrap_or(0.0);
             let hit = sun
                 .is_up()
