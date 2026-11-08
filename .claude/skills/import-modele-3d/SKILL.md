@@ -45,6 +45,33 @@ si `vertices` ≈ `triangles` dans `inspect`, la topologie est éclatée.
 modèle. Le constater, le dire, et prendre le gain partiel — ne pas s'acharner
 sur les réglages.
 
+### Diorama texturé : cuire la texture en couleurs de sommet
+
+Autre plafond, autre cause : un **atlas de texture découpé en mille cartes**
+(diorama Meshy de l'aire de jeux, 1,76 M triangles → plafond à 16 000 même en
+CLI v4 avec `--lock-border false`). Chaque couture UV dédouble les sommets et
+meshoptimizer refuse de les franchir. Les franchir de force — flag
+`Permissive` ou `simplifySloppy` — **brouille la texture** : les UV
+interpolés tombent n'importe où dans l'atlas.
+
+Remède : `ios/SunMap/scripts/bake-diorama.mjs` — échantillonne la texture,
+la moyenne sur les sommets **fusionnés par position** (les coutures
+disparaissent avec les UV), simplifie position + couleur, et sort des
+triangles à normales plates avec `COLOR_0`, **sans texture**. 4 000 triangles
+en 475 Ko, 1 500 en 178 Ko. Il coupe aussi le **socle** du diorama (la dalle
+sous le sol, invisible sur une carte) et tasse la hauteur (`YSCALE`) quand
+les proportions du diorama sont exagérées.
+
+À l'entrée, le `.glb` passé par `optimize` + `resize` 1024. Trouver le plan du
+sol : histogramme des hauteurs des triangles horizontaux, pondéré par l'aire —
+le sol est le pic non nul juste au-dessus de la face inférieure. Le rendu
+s'évalue **avant** de câbler : page three.js avec les `.glb` en base64,
+capturée par Chrome headless (cf. mémoire projet), le navigateur intégré ne
+lisant pas le scratchpad.
+
+Pour un modèle sans texture, le lointain se dégrade plus vite : 1 000
+triangles effondraient la silhouette de l'aire de jeux, 1 500 la tiennent.
+
 ## 2. Deux modèles : proche et loin
 
 **Tout modèle instancié en masse a une variante lointaine.** Le principe :
@@ -98,7 +125,9 @@ sourd au doigt sous le seuil de détail — ce qui se lit comme une panne.
 Seuils en place : `VegetationModel.detailedZoom` = 17 (arbres isolés),
 `VegetationModel.detailedClusterZoom` = 18 (bosquets),
 `FurnitureModelLayer.detailedZoom` = `TerraceModelLayer.detailedZoom` = 19,5
-(le zoom d'arrivée du survol vers un lieu, `CameraFraming.baseZoom`).
+(le zoom d'arrivée du survol vers un lieu, `CameraFraming.baseZoom`). Un
+meuble plus grand peut porter les siens : l'aire de jeux s'affiche dès z15 et
+passe au détail à z18 (`Model.floorZoom`, `Model.detailedZoom`).
 
 ## 3. Relever les mesures
 
@@ -129,6 +158,9 @@ metersPerUnit_loin = metersPerUnit_proche × (emprise_proche / emprise_loin)
   qui enregistre les maillages dans le style au démarrage.
 - **Mobilier** → `FurnitureModelLayer.Model` + sa `Far`, et `all`.
 - **Terrasse** → constantes de `TerraceModelLayer`.
+- **Android** : mêmes `.glb` dans `android/app/src/main/assets/models/`
+  (repo git séparé), mêmes constantes dans le miroir Kotlin
+  (`features/places/ui/FurnitureModelLayer.kt`, etc.).
 - Fichiers dans `Features/<Feature>/Resources/`. Les groupes Xcode sont
   synchronisés au système de fichiers : déposer le `.glb` suffit, il n'y a pas
   de `project.pbxproj` à éditer.

@@ -209,8 +209,10 @@ Fonctionnalités cibles :
   **polygones** (ou nœuds) ramenés à leur centroïde (comme tout objet
   surfacique du pipeline lieu) ; ils sont **non contribuables** depuis l'app
   (créer un nœud OSM là où la communauté attend un polygone serait une
-  mauvaise donnée) et n'ont **pas de modèle 3D** — côté client, seule leur
-  pastille existe, décochée par défaut.
+  mauvaise donnée). L'**aire de jeux** a un modèle 3D (diorama de 14 m posé
+  au centroïde, dès z15 — pas l'emprise réelle) et suit donc la règle des
+  bancs : modèle toujours là, pastille décochée par défaut. Le **street
+  workout** n'a que sa pastille, décochée par défaut.
   L'échantillonnage d'emprise (plutôt que le centroïde) reste une amélioration
   possible.
 - **Établissements (en place)** : OSM `amenity` = bar, pub, restaurant, cafe,
