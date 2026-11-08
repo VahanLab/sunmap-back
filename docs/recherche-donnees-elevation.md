@@ -71,9 +71,10 @@ LoD1. Source : imagerie PlanetScope 3 m (2018-2019) + LiDAR gouvernemental pour
 l'entraînement sur 168 villes.
 
 **Pourquoi ça nous intéresse.** Aujourd'hui, quand OSM n'a ni `height` ni
-`building:levels` — 31 % des bâtiments parisiens — on met la médiane du
-quartier (21 m à Paris centre). C'est un pis-aller grossier. Une estimation par
-bâtiment ferait nettement mieux.
+`building:levels` — 63 % des emprises parisiennes de l'archive en 2026-11 —
+on met la médiane des hauteurs taggées de la cellule de 250 m (15 m en
+médiane sur Paris). C'est un pis-aller grossier. Une estimation par bâtiment
+ferait nettement mieux.
 
 **Nuance importante.** À Paris, les `building:levels` relevés à pied par les
 contributeurs OSM valent probablement mieux que du ML. Le gain est surtout

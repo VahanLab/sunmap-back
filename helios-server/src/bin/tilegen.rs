@@ -10,9 +10,9 @@
 //!
 //! La mémoire ne dépend pas de la taille du pays (une VM de 4 Go suffit) :
 //!
-//! 1. **Passe 1** (flux) : hauteurs taggées → médiane du lot (c'est le seul
-//!    calcul qui a besoin de voir tout l'extrait, et il ne retient que des
-//!    `f32`).
+//! 1. **Passe 1** (flux) : hauteurs taggées → médianes locales par cellule
+//!    de 250 m (`osm::LocalHeights` — c'est le seul calcul qui a besoin de
+//!    voir tout l'extrait, et il ne retient qu'un `f32` par bâtiment taggé).
 //! 2. **Passe 2** (flux) : chaque objet est sérialisé compact dans un
 //!    **bucket disque** par plage d'identifiants de tuile (courbe de
 //!    Hilbert : un bucket = une région contiguë) — dupliqué dans chaque
@@ -75,16 +75,14 @@ fn main() {
         std::process::exit(1);
     };
 
-    // ------------------------------------------------ passe 1 : la médiane
-    let mut known: Vec<f32> = Vec::new();
+    // ------------------------------------- passe 1 : les médianes locales
+    let mut heights = osm::LocalHeights::default();
     let mut counts = (0usize, 0usize, 0usize); // bâtiments, bois, arbres
     if let Err(e) = pbf::stream_geojsonseq(open(&input), |f| {
         match f {
             StreamedFeature::Building(b) => {
                 counts.0 += 1;
-                if b.height_from_osm {
-                    known.push(b.height_m);
-                }
+                heights.add(&b);
             }
             StreamedFeature::Wood(_) => counts.1 += 1,
             StreamedFeature::Tree(_) => counts.2 += 1,
@@ -93,20 +91,15 @@ fn main() {
     }) {
         fail("Passe 1 (médiane)", &e);
     }
-    known.sort_by(f32::total_cmp);
-    let fallback = if known.is_empty() {
-        osm::DEFAULT_BUILDING_HEIGHT_M
-    } else {
-        known[known.len() / 2].clamp(6.0, 40.0)
-    };
+    heights.finish();
     println!(
-        "passe 1 : {} bâtiments ({} avec hauteur OSM, défaut {fallback:.1} m), {} bois, {} arbres",
+        "passe 1 : {} bâtiments ({} avec hauteur OSM, médiane locale, repli {:.1} m), {} bois, {} arbres",
         counts.0,
-        known.len(),
+        heights.tagged(),
+        heights.fallback(),
         counts.1,
         counts.2
     );
-    drop(known);
 
     // ---------------------------------------- passe 2 : spill par bucket
     let spill_dir = std::env::temp_dir().join(format!("sunmap-tilegen-{}", std::process::id()));
@@ -143,7 +136,7 @@ fn main() {
         if let Err(e) = pbf::stream_geojsonseq(open(&input), |f| match f {
             StreamedFeature::Building(mut b) => {
                 if !b.height_from_osm {
-                    b.height_m = fallback;
+                    b.height_m = heights.height_for(&b);
                 }
                 spread(&b.rings, &encode_polygon(0, &b));
             }
@@ -160,6 +153,11 @@ fn main() {
             w.flush().expect("spill");
         }
     }
+    println!(
+        "passe 2 : hauteurs devinées — {} par médiane locale, {} au repli de l'extrait",
+        heights.local_hits, heights.fallback_hits
+    );
+    drop(heights);
 
     // --------------------------- passe 3 : encodage (et fusion) par bucket
     //

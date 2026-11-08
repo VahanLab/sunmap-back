@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 /// Hauteur de repli ultime, si *aucun* bâtiment de la zone n'a de tag de
-/// hauteur. Sinon on utilise la médiane locale (cf. [`parse_buildings`]).
+/// hauteur. Sinon on utilise la médiane locale (cf. [`LocalHeights`]).
 pub const DEFAULT_BUILDING_HEIGHT_M: f32 = 9.0;
 
 /// Miroirs Overpass, essayés dans l'ordre. L'instance officielle
@@ -298,31 +298,162 @@ pub fn height_from_tags(tags: &HashMap<String, String>) -> Option<f32> {
         .filter(|h| h.is_finite() && *h > 0.0)
 }
 
-/// Comble les hauteurs manquantes par la médiane locale du lot.
-///
-/// Défaut local plutôt que global : ~30 % des bâtiments parisiens n'ont aucun
-/// tag de hauteur, et 9 m (3 étages) sous-estime largement un tissu
-/// haussmannien à 20 m — leurs ombres portées disparaissaient. La médiane des
-/// hauteurs connues du lot s'adapte au quartier.
+/// Comble les hauteurs manquantes par la médiane locale du lot (cf.
+/// [`LocalHeights`]). Renvoie le repli de l'extrait, pour le journal.
 ///
 /// Les bâtiments sans hauteur doivent arriver avec `height_m` à `NaN` et
 /// `height_from_osm` à `false`.
 pub fn fill_missing_heights(buildings: &mut [Building]) -> f32 {
-    let mut known: Vec<f32> = buildings
-        .iter()
-        .filter(|b| b.height_from_osm)
-        .map(|b| b.height_m)
-        .collect();
-    known.sort_by(f32::total_cmp);
-    let fallback = if known.is_empty() {
-        DEFAULT_BUILDING_HEIGHT_M
-    } else {
-        known[known.len() / 2].clamp(6.0, 40.0)
-    };
-    for b in buildings.iter_mut().filter(|b| !b.height_from_osm) {
-        b.height_m = fallback;
+    let mut heights = LocalHeights::default();
+    for b in buildings.iter() {
+        heights.add(b);
     }
-    fallback
+    heights.finish();
+    for b in buildings.iter_mut().filter(|b| !b.height_from_osm) {
+        b.height_m = heights.height_for(b);
+    }
+    heights.fallback()
+}
+
+/// Côté d'une cellule de médiane locale, en mètres.
+pub const LOCAL_HEIGHT_CELL_M: f64 = 250.0;
+/// Hauteurs taggées qu'il faut au moins pour qu'une médiane locale compte ;
+/// en dessous, on élargit aux cellules voisines (3×3, puis 5×5), puis on
+/// retombe sur la médiane de l'extrait.
+pub const LOCAL_HEIGHT_MIN_SAMPLES: usize = 15;
+/// Bornes d'une hauteur devinée : une médiane ne doit ni écraser un bourg
+/// sous 6 m ni bâtir des tours à partir d'un quartier d'affaires.
+const GUESSED_HEIGHT_RANGE_M: (f32, f32) = (6.0, 40.0);
+
+/// Hauteur de repli des bâtiments non taggés : **médiane locale** des
+/// hauteurs taggées autour d'eux.
+///
+/// Une seule médiane par extrait ne marche pas : sur la France entière elle
+/// vaut 9 m (2 étages) — le tissu pavillonnaire, majoritaire en nombre —, et
+/// les ~60 % d'immeubles parisiens sans tag de hauteur sortaient à 2 étages
+/// au lieu de 5 ou 6, avec des ombres portées divisées par deux. Mesuré sur
+/// Paris (validation sur les bâtiments taggés, chacun prédit sans lui) :
+/// erreur moyenne 10,5 m → 5,8 m, étages justes à ±1 de 29 % → 56 % ; en
+/// zone pavillonnaire, rien ne bouge (2,3 → 2,2 m).
+///
+/// Cellules carrées de [`LOCAL_HEIGHT_CELL_M`] (500 m faisait un peu moins
+/// bien), élargies tant qu'elles ont moins de [`LOCAL_HEIGHT_MIN_SAMPLES`]
+/// hauteurs, repli sur la médiane de l'extrait au-delà du 5×5. Le bâtiment
+/// est rattaché à sa cellule par la moyenne des sommets de son anneau
+/// extérieur.
+///
+/// Mémoire : un `f32` par bâtiment taggé — c'est ce qui permet à `tilegen`
+/// de la remplir en passe 1 et de la consulter en passe 2 sans retenir les
+/// géométries.
+#[derive(Default)]
+pub struct LocalHeights {
+    cells: HashMap<(i32, i32), Vec<f32>>,
+    /// Médiane de l'extrait, posée par [`Self::finish`].
+    fallback: Option<f32>,
+    /// Médiane retenue par cellule interrogée (`None` = repli de l'extrait).
+    cache: HashMap<(i32, i32), Option<f32>>,
+    /// Bâtiments comblés par une médiane locale / par le repli de l'extrait.
+    pub local_hits: usize,
+    pub fallback_hits: usize,
+}
+
+impl LocalHeights {
+    /// Retient la hauteur d'un bâtiment taggé ; ignore les autres.
+    pub fn add(&mut self, b: &Building) {
+        if !b.height_from_osm {
+            return;
+        }
+        if let Some((lat, lng)) = anchor(b) {
+            self.cells.entry(cell_of(lat, lng)).or_default().push(b.height_m);
+        }
+    }
+
+    /// Fige la médiane de l'extrait. À appeler une fois tout ajouté.
+    pub fn finish(&mut self) {
+        let mut all: Vec<f32> = self.cells.values().flatten().copied().collect();
+        self.fallback = median(&mut all);
+    }
+
+    /// Médiane de l'extrait, ou [`DEFAULT_BUILDING_HEIGHT_M`] si rien n'y est
+    /// taggé.
+    pub fn fallback(&self) -> f32 {
+        self.fallback.unwrap_or(DEFAULT_BUILDING_HEIGHT_M)
+    }
+
+    /// Nombre de bâtiments taggés retenus.
+    pub fn tagged(&self) -> usize {
+        self.cells.values().map(Vec::len).sum()
+    }
+
+    /// Hauteur à donner à un bâtiment non taggé.
+    pub fn height_for(&mut self, b: &Building) -> f32 {
+        let local = anchor(b).and_then(|(lat, lng)| {
+            let key = cell_of(lat, lng);
+            if let Some(cached) = self.cache.get(&key) {
+                return *cached;
+            }
+            let found = self.local_median(key);
+            self.cache.insert(key, found);
+            found
+        });
+        match local {
+            Some(h) => {
+                self.local_hits += 1;
+                h
+            }
+            None => {
+                self.fallback_hits += 1;
+                self.fallback()
+            }
+        }
+    }
+
+    fn local_median(&self, (cx, cy): (i32, i32)) -> Option<f32> {
+        for r in 0..=2 {
+            let mut v: Vec<f32> = Vec::new();
+            for dx in -r..=r {
+                for dy in -r..=r {
+                    if let Some(list) = self.cells.get(&(cx + dx, cy + dy)) {
+                        v.extend_from_slice(list);
+                    }
+                }
+            }
+            if v.len() >= LOCAL_HEIGHT_MIN_SAMPLES {
+                return median(&mut v);
+            }
+        }
+        None
+    }
+}
+
+/// Médiane bornée à [`GUESSED_HEIGHT_RANGE_M`] ; `None` sur un lot vide.
+fn median(v: &mut [f32]) -> Option<f32> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    let (lo, hi) = GUESSED_HEIGHT_RANGE_M;
+    Some(v[v.len() / 2].clamp(lo, hi))
+}
+
+/// Point de rattachement d'un bâtiment : moyenne des sommets de l'anneau
+/// extérieur — assez juste pour choisir une cellule de 250 m.
+fn anchor(b: &Building) -> Option<(f64, f64)> {
+    let ring = b.rings.first().filter(|r| !r.is_empty())?;
+    let (la, lo) = ring.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0, a.1 + p.1));
+    let n = ring.len() as f64;
+    Some((la / n, lo / n))
+}
+
+/// Cellule de ~[`LOCAL_HEIGHT_CELL_M`] de côté. Les rangées suivent la
+/// latitude ; la largeur des colonnes est corrigée du cosinus de la rangée,
+/// pour des cellules à peu près carrées de l'Andalousie à l'Écosse.
+fn cell_of(lat: f64, lng: f64) -> (i32, i32) {
+    const M_PER_DEG: f64 = 111_320.0;
+    let row = (lat * M_PER_DEG / LOCAL_HEIGHT_CELL_M).floor();
+    let row_lat = (row + 0.5) * LOCAL_HEIGHT_CELL_M / M_PER_DEG;
+    let col = (lng * M_PER_DEG * row_lat.to_radians().cos() / LOCAL_HEIGHT_CELL_M).floor();
+    (col as i32, row as i32)
 }
 
 /// Assemble un bâtiment à partir de ses tags et de ses anneaux déjà résolus.
@@ -765,6 +896,105 @@ mod tests {
     fn aucun_genre_dans_deux_tables() {
         for g in PALM_GENERA {
             assert!(!NEEDLE_GENERA.contains(g), "{g} est dans les deux tables");
+        }
+    }
+
+    // ------------------------------------------------- médiane locale
+
+    /// Carré de ~10 m posé à (lat, lng) ; `height` = `None` pour un non taggé.
+    fn bat(lat: f64, lng: f64, height: Option<f32>) -> Building {
+        let d = 0.00005;
+        Building {
+            osm_id: "way/1".into(),
+            name: None,
+            rings: vec![vec![(lat, lng), (lat + d, lng), (lat + d, lng + d), (lat, lng + d)]],
+            height_m: height.unwrap_or(f32::NAN),
+            height_from_osm: height.is_some(),
+            leaf_type: None,
+        }
+    }
+
+    /// Quartier dense (Javel) et bourg pavillonnaire (Le Vésinet), à ~15 km.
+    const JAVEL: (f64, f64) = (48.8418, 2.2785);
+    const VESINET: (f64, f64) = (48.8900, 2.1350);
+
+    #[test]
+    fn mediane_locale_suit_le_quartier() {
+        let mut lot: Vec<Building> = Vec::new();
+        for i in 0..20 {
+            lot.push(bat(JAVEL.0 + i as f64 * 1e-5, JAVEL.1, Some(21.0)));
+        }
+        // Plus nombreux : ce sont eux qui font la médiane de l'extrait.
+        for i in 0..40 {
+            lot.push(bat(VESINET.0 + i as f64 * 1e-5, VESINET.1, Some(7.0)));
+        }
+        lot.push(bat(JAVEL.0 + 0.0003, JAVEL.1 + 0.0003, None));
+        lot.push(bat(VESINET.0 + 0.0003, VESINET.1 + 0.0003, None));
+        let fallback = fill_missing_heights(&mut lot);
+
+        assert_eq!(fallback, 7.0);
+        assert_eq!(lot[60].height_m, 21.0, "immeuble non taggé de Javel");
+        assert_eq!(lot[61].height_m, 7.0, "pavillon non taggé du Vésinet");
+        assert!(!lot[60].height_from_osm, "la hauteur reste marquée devinée");
+        assert_eq!(lot[0].height_m, 21.0, "une hauteur taggée n'est pas touchée");
+    }
+
+    #[test]
+    fn cellule_clairsemee_elargie_aux_voisines() {
+        let mut h = LocalHeights::default();
+        // Les hauteurs sont dans la cellule d'à côté (~300 m au nord) : la
+        // cellule du bâtiment est vide, le 3×3 les trouve.
+        for i in 0..LOCAL_HEIGHT_MIN_SAMPLES {
+            h.add(&bat(JAVEL.0 + 0.0027 + i as f64 * 1e-5, JAVEL.1, Some(24.0)));
+        }
+        h.finish();
+        assert_eq!(h.height_for(&bat(JAVEL.0, JAVEL.1, None)), 24.0);
+        assert_eq!(h.local_hits, 1);
+    }
+
+    #[test]
+    fn trop_peu_de_hauteurs_autour_repli_extrait() {
+        let mut h = LocalHeights::default();
+        // Quatorze hauteurs ne suffisent pas, même en 5×5.
+        for i in 0..LOCAL_HEIGHT_MIN_SAMPLES - 1 {
+            h.add(&bat(JAVEL.0 + i as f64 * 1e-5, JAVEL.1, Some(24.0)));
+        }
+        // Le reste de l'extrait est loin (> 5 cellules).
+        for i in 0..30 {
+            h.add(&bat(VESINET.0 + i as f64 * 1e-5, VESINET.1, Some(8.0)));
+        }
+        h.finish();
+        assert_eq!(h.fallback(), 8.0);
+        assert_eq!(h.height_for(&bat(JAVEL.0, JAVEL.1, None)), 8.0);
+        assert_eq!(h.fallback_hits, 1);
+    }
+
+    #[test]
+    fn mediane_bornee_et_extrait_sans_tag() {
+        let mut h = LocalHeights::default();
+        for i in 0..LOCAL_HEIGHT_MIN_SAMPLES {
+            h.add(&bat(JAVEL.0 + i as f64 * 1e-5, JAVEL.1, Some(120.0)));
+        }
+        h.finish();
+        assert_eq!(h.height_for(&bat(JAVEL.0, JAVEL.1, None)), 40.0);
+
+        let mut vide = LocalHeights::default();
+        vide.finish();
+        assert_eq!(vide.height_for(&bat(JAVEL.0, JAVEL.1, None)), DEFAULT_BUILDING_HEIGHT_M);
+    }
+
+    #[test]
+    fn cellules_d_environ_250_m_a_toute_latitude() {
+        for lat in [37.0, 48.85, 57.0] {
+            let (c0, r0) = cell_of(lat, 2.0);
+            // ~245 m vers l'est et vers le nord restent à une cellule au plus.
+            let dlng = 245.0 / (111_320.0 * f64::cos(lat.to_radians()));
+            let (c1, _) = cell_of(lat, 2.0 + dlng);
+            let (_, r1) = cell_of(lat + 245.0 / 111_320.0, 2.0);
+            assert!((c1 - c0).abs() <= 1 && (r1 - r0).abs() <= 1, "lat {lat}");
+            // Et ~510 m vers l'est franchissent au moins deux frontières.
+            let (c2, _) = cell_of(lat, 2.0 + dlng * 510.0 / 245.0);
+            assert!(c2 - c0 >= 2, "lat {lat}");
         }
     }
 }

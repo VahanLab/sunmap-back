@@ -165,10 +165,14 @@ Fonctionnalités cibles :
   `way[building:part]` (Simple 3D Buildings) ET `relation[building]` (les
   multipolygones à cour, majoritaires à Paris ; les oublier retirait 41 % des
   casters). Hauteur : `height`, sinon `building:levels × 3 m + 3 m` de
-  toiture, sinon **médiane locale** du quartier (~30 % des bâtiments
-  parisiens n'ont aucun tag ; un défaut global de 9 m les sous-estimait de
-  moitié). Alternatives non retenues pour l'instant : Overture Buildings
-  (GeoParquet, hauteurs ML), tuiles OpenMapTiles (`render_height`).
+  toiture, sinon **médiane locale** des hauteurs taggées dans une cellule
+  de 250 m (élargie au 3×3 puis 5×5 sous 15 hauteurs, repli sur la médiane
+  de l'extrait — `osm::LocalHeights`, appliqué par `tilegen`). ~60 % des
+  bâtiments parisiens n'ont aucun tag ; la médiane unique de l'extrait France
+  (9 m, 2 étages) les sous-estimait de moitié — erreur moyenne mesurée 10,5 m
+  → 5,8 m à Paris, inchangée en pavillonnaire. Alternatives non retenues
+  pour l'instant : Overture Buildings (GeoParquet, hauteurs ML), tuiles
+  OpenMapTiles (`render_height`).
 - **France (arme absolue)** : IGN LiDAR HD open data — MNS/MNT/MNH, dalles
   GeoTIFF 1 km × 1 km au pas de 50 cm. Le MNS = terrain + bâtiments +
   végétation → DSM directe sans fusion. Couverture ~80 % fin 2025, complète
@@ -324,9 +328,12 @@ configuration R2 : **`docs/import-zone.md`**. Format et service des archives :
 `docs/tuiles-pmtiles.md`. À savoir : **les tables géométriques n'existent
 plus** (migration `drop_geometry_tables`) — PostgreSQL ne porte que lieux,
 comptes et contributions, et `VECTOR_TILES=tiles/sunmap.pmtiles` est
-obligatoire au démarrage du serveur. L'archive ne couvre que l'extrait
-donné (plus de base cumulative) : pour plusieurs zones, prendre un extrait
-englobant (ex. `france-latest`). L'import des lieux reste un upsert.
+obligatoire au démarrage du serveur. Les zones **s'accumulent** : chaque
+import fusionne son extrait dans l'archive existante (`tilegen --merge`, le
+nouvel extrait l'emporte à identifiant OSM égal) — la production réunit
+France, Espagne, Italie, Suisse, Royaume-Uni, Belgique, Luxembourg et
+Andorre. Une règle de hauteur changée ne vaut donc que pour les zones
+réimportées depuis. L'import des lieux reste un upsert.
 `--upload` pousse sur Cloudflare R2 (`scripts/r2-upload.py`, variables
 `R2_*` dans `helios-server/.env`). Parité mesurée à la bascule : `/sunlit`
 identique, `/canopy` à ~0,1 % de pixels d'écart (quantification ~0,6 m),
